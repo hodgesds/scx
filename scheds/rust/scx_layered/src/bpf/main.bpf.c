@@ -560,8 +560,11 @@ void BPF_STRUCT_OPS(layered_dispatch, s32 cpu, struct task_struct *prev)
 
 	/* consume preempting layers first */
 	bpf_for(idx, 0, nr_layers)
-		if (layers[idx].preempt && scx_bpf_consume(idx))
+		if (layers[idx].preempt && scx_bpf_consume(idx)) {
+			if (layers[idx].perf > 0)
+				scx_bpf_cpuperf_set(cpu, layers[idx].perf);
 			return;
+		}
 
 	/* consume !open layers second */
 	bpf_for(idx, 0, nr_layers) {
@@ -569,21 +572,30 @@ void BPF_STRUCT_OPS(layered_dispatch, s32 cpu, struct task_struct *prev)
 		struct cpumask *layer_cpumask;
 
 		/* consume matching layers */
-		if (!(layer_cpumask = lookup_layer_cpumask(idx)))
+		if (!(layer_cpumask = lookup_layer_cpumask(idx))) {
+			if (layer->perf > 0)
+				scx_bpf_cpuperf_set(cpu, layer->perf);
 			return;
+		}
 
 		if (bpf_cpumask_test_cpu(cpu, layer_cpumask) ||
 		    (cpu == fallback_cpu && layer->nr_cpus == 0)) {
-			if (scx_bpf_consume(idx))
+			if (scx_bpf_consume(idx)) {
+				if (layer->perf > 0)
+					scx_bpf_cpuperf_set(cpu, layer->perf);
 				return;
+			}
 		}
 	}
 
 	/* consume !preempting open layers */
 	bpf_for(idx, 0, nr_layers) {
 		if (!layers[idx].preempt && layers[idx].open &&
-		    scx_bpf_consume(idx))
+		    scx_bpf_consume(idx)) {
+			if (layers[idx].perf > 0)
+				scx_bpf_cpuperf_set(cpu, layers[idx].perf);
 			return;
+		}
 	}
 }
 
