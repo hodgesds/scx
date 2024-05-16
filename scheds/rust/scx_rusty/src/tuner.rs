@@ -66,22 +66,22 @@ fn calc_util(curr: &procfs::CpuStat, prev: &procfs::CpuStat) -> Result<f64> {
     }
 }
 
-pub struct Tuner {
+pub struct Tuner <'a>{
     pub direct_greedy_mask: Cpumask,
     pub kick_greedy_mask: Cpumask,
     pub fully_utilized: bool,
     pub slice_ns: u64,
     underutil_slice_ns: u64,
     overutil_slice_ns: u64,
-    dom_group: Arc<DomainGroup>,
+    dom_group: Arc<DomainGroup<'a>>,
     direct_greedy_under: f64,
     kick_greedy_under: f64,
     proc_reader: procfs::ProcReader,
     prev_cpu_stats: BTreeMap<u32, procfs::CpuStat>,
 }
 
-impl Tuner {
-    pub fn new(dom_group: Arc<DomainGroup>,
+impl <'a>Tuner <'a>{
+    pub fn new(dom_group: Arc<DomainGroup<'a>>,
                direct_greedy_under: f64,
                kick_greedy_under: f64,
                underutil_slice_ns: u64,

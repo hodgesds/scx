@@ -500,7 +500,7 @@ impl fmt::Display for NumaStat {
 
 pub struct LoadBalancer<'a, 'b> {
     skel: &'a mut BpfSkel<'b>,
-    dom_group: Arc<DomainGroup>,
+    dom_group: Arc<DomainGroup<'a>>,
     skip_kworkers: bool,
 
     infeas_threshold: f64,
@@ -518,7 +518,7 @@ const_assert_eq!(bpf_intf::consts_LB_MAX_WEIGHT % bpf_intf::consts_LB_LOAD_BUCKE
 impl<'a, 'b> LoadBalancer<'a, 'b> {
     pub fn new(
         skel: &'a mut BpfSkel<'b>,
-        dom_group: Arc<DomainGroup>,
+        dom_group: Arc<DomainGroup<'a>>,
         skip_kworkers: bool,
         lb_apply_weight: bool,
         balance_load: bool,

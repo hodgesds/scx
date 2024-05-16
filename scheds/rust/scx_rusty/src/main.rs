@@ -216,7 +216,7 @@ struct Scheduler<'a> {
 
     top: Arc<Topology>,
 
-    dom_group: Arc<DomainGroup>,
+    dom_group: Arc<DomainGroup<'a>>,
 
     proc_reader: procfs::ProcReader,
 
@@ -225,7 +225,7 @@ struct Scheduler<'a> {
 
     nr_lb_data_errors: u64,
 
-    tuner: Tuner,
+    tuner: Tuner<'a>,
 }
 
 impl<'a> Scheduler<'a> {

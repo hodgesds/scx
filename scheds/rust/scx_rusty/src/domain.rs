@@ -11,12 +11,13 @@ use scx_utils::Cpumask;
 use scx_utils::Topology;
 
 #[derive(Clone, Debug)]
-pub struct Domain {
+pub struct Domain<'a> {
     id: usize,
     mask: Cpumask,
+    children: Vec<&'a Domain<'a>>
 }
 
-impl Domain {
+impl <'a> Domain<'a> {
     /// Get the Domain's ID.
     pub fn id(&self) -> usize {
         self.id
@@ -24,32 +25,54 @@ impl Domain {
 
     /// Get a copy of the domain's cpumask.
     pub fn mask(&self) -> Cpumask {
-        self.mask.clone()
+        let mask = self.mask.clone();
+        self.children.iter().for_each(|d| {
+            mask.and(&d.mask());
+        });
+        mask
     }
 
     /// Get a raw slice of the domain's cpumask as a set of one or more u64
     /// variables whose bits represent CPUs in the mask.
     pub fn mask_slice(&self) -> &[u64] {
-        self.mask.as_raw_slice()
+        let mask = &self.mask;
+        self.children.iter().for_each(|d| {
+            mask.and(&d.mask());
+        });
+        mask.as_raw_slice()
     }
 
     /// The number of CPUs in the domain.
     pub fn weight(&self) -> usize {
-        self.mask.weight()
+        let mask = self.mask.clone();
+        self.children.iter().for_each(|d| {
+            mask.and(&d.mask());
+        });
+        mask.weight()
+    }
+
+    /// The children of this domain.
+    pub fn children(&mut self) -> &mut Vec<&'a Domain> {
+        &mut self.children
+    }
+
+    /// The number of children of this domain.
+    pub fn num_children(&self) -> usize {
+        self.children.len()
     }
 }
 
 #[derive(Debug)]
-pub struct DomainGroup {
-    doms: BTreeMap<usize, Domain>,
+pub struct DomainGroup <'a> {
+    doms: BTreeMap<usize, Domain<'a>>,
     cpu_dom_map: BTreeMap<usize, usize>,
     dom_numa_map: BTreeMap<usize, usize>,
     num_numa_nodes: usize,
     span: Cpumask,
 }
 
-impl DomainGroup {
-    pub fn new(top: Arc<Topology>, cpumasks: &[String]) -> Result<Self> {
+impl DomainGroup<'_> {
+    pub fn new<'a>(top: Arc<Topology>, cpumasks: &[String]) -> Result<Self> {
         let mut span = Cpumask::new()?;
         let mut dom_numa_map = BTreeMap::new();
         // Track the domain ID separate from the LLC ID, because LLC IDs can
@@ -62,7 +85,8 @@ impl DomainGroup {
             for mask_str in cpumasks.iter() {
                 let mask = Cpumask::from_str(&mask_str)?;
                 span |= mask.clone();
-                doms.insert(dom_id, Domain { id: dom_id, mask, });
+                let children = Vec::new();
+                doms.insert(dom_id, Domain { id: dom_id, mask, children,});
                 dom_numa_map.insert(dom_id, 0);
                 dom_id += 1;
             }
@@ -73,7 +97,8 @@ impl DomainGroup {
                 for (_, llc) in node.llcs().iter() {
                     let mask = llc.span().clone();
                     span |= mask.clone();
-                    doms.insert(dom_id, Domain { id: dom_id, mask, });
+                    let children = Vec::new();
+                    doms.insert(dom_id, Domain { id: dom_id, mask, children,});
                     dom_numa_map.insert(dom_id, node_id.clone());
                     dom_id += 1;
                 }
