@@ -22,6 +22,16 @@ typedef unsigned long long u64;
 
 #include <scx/ravg.bpf.h>
 
+/* Copied from mm.h */
+#define VM_READ 0x00000001
+#define VM_WRITE 0x00000002
+#define VM_EXEC 0x00000004
+#define VM_SHARED 0x00000080
+
+#define CLONE_PARENT 0x00008000
+#define CLONE_THREAD 0x00010000
+
+
 enum consts {
 	MAX_CPUS_SHIFT		= 9,
 	MAX_CPUS		= 1 << MAX_CPUS_SHIFT,
@@ -97,6 +107,19 @@ enum layer_match_kind {
 	NR_LAYER_MATCH_KINDS,
 };
 
+struct pm_record_header {
+  int type;
+  int len;
+  u32 pid;
+  u32 tid;
+};
+
+struct pm_comm_record {
+  struct pm_record_header header;
+  u32 ppid;
+  char comm[MAX_COMM];
+};
+
 struct layer_match {
 	int		kind;
 	char		cgroup_prefix[MAX_PATH];
@@ -133,6 +156,7 @@ struct layer {
 	unsigned char		cpus[MAX_CPUS_U8];
 	unsigned int		nr_cpus;	// managed from BPF side
 	unsigned int		perf;
+	const char		*name;
 };
 
 #endif /* __INTF_H */

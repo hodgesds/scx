@@ -9,6 +9,7 @@
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
+#include <bpf/usdt.bpf.h>
 
 char _license[] SEC("license") = "GPL";
 
@@ -54,6 +55,11 @@ static inline s32 sibling_cpu(s32 cpu)
 	else
 		return -1;
 }
+
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 512 * 1024 /* 512 KB */);
+} monitor_rb SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -269,6 +275,85 @@ static struct layer *lookup_layer(int idx)
 	}
 	return &layers[idx];
 }
+
+static int lookup_layer_name(const char *layer_name)
+{
+	int idx;
+	struct layer *layer;
+
+	bpf_for(idx, 0, nr_layers) {
+		layer = lookup_layer(idx);
+		if (!layer)
+			return -1;
+
+		if (layer_name == layer->name)
+			return idx;
+	}
+
+	return -1;
+}
+
+SEC("tracepoint/sched/sched_process_exec")
+int tracepoint__sched__sched_process_exec(struct trace_event_raw_sched_process_exec* ctx)
+{
+	 u64 pid_tgid = bpf_get_current_pid_tgid();
+
+	struct pm_comm_record* const record =
+		bpf_ringbuf_reserve(&monitor_rb, sizeof(struct pm_comm_record), 0);
+	if (!record)
+		return 0;
+
+	struct task_struct* task = (struct task_struct*)bpf_get_current_task();
+
+	bpf_get_current_comm(record->comm, MAX_COMM);
+	record->header.pid = pid_tgid >> 32;
+	record->header.tid = pid_tgid;
+	record->ppid = BPF_CORE_READ(task, real_parent, tgid);
+
+	bpf_ringbuf_submit(record, 0);
+
+	bpf_printk("exec\n");
+	return 0;
+}
+
+SEC("usdt")
+int BPF_USDT(kick_layer, const char *target_layer)
+{
+	int idx;
+ 	struct task_struct* p;
+	struct task_ctx *tctx;
+
+ 	idx = lookup_layer_name(target_layer);
+	if (!idx || idx < 0) {
+		bpf_printk("failed to kick to layer %s: layer not found", target_layer);
+		return 0;
+	}
+
+ 	p = (struct task_struct*)bpf_get_current_task_btf();
+	if (!p)
+		return 0;
+
+	tctx = bpf_task_storage_get(&task_ctxs, (struct task_struct*)p, 0, 0);
+	if (!tctx)
+	       	return 0;
+
+	bpf_printk("kicking to layer %s", target_layer);
+	struct layer *layer = &layers[idx];
+	if (!layer)
+		return 0;
+
+	if (tctx->layer >= 0 && tctx->layer <= nr_layers && &layers[tctx->layer].nr_tasks > 0)
+		__sync_fetch_and_add(&layers[tctx->layer].nr_tasks, -1);
+
+	tctx->layer = idx;
+	tctx->refresh_layer = false;
+	tctx->layer_cpus_seq = layer->cpus_seq - 1;
+	// p->scx.dsq_vtime = layer->vtime_now;
+	__sync_fetch_and_add(&layer->nr_tasks, 1);
+
+	return 0;
+}
+
 
 /*
  * Because the layer membership is by the default hierarchy cgroups rather than

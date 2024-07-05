@@ -17,7 +17,10 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::sync::mpsc;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -31,10 +34,12 @@ use clap::Parser;
 use libbpf_rs::skel::OpenSkel;
 use libbpf_rs::skel::Skel;
 use libbpf_rs::skel::SkelBuilder;
+use libbpf_rs::RingBufferBuilder;
 use log::debug;
 use log::info;
 use log::trace;
 use log::warn;
+use plain::Plain;
 use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
@@ -68,6 +73,8 @@ lazy_static::lazy_static! {
     static ref NR_POSSIBLE_CPUS: usize = libbpf_rs::num_possible_cpus().unwrap();
     static ref USAGE_DECAY: f64 = 0.5f64.powf(1.0 / USAGE_HALF_LIFE_F64);
 }
+
+unsafe impl Plain for bpf_intf::pm_comm_record {}
 
 /// scx_layered: A highly configurable multi-layer sched_ext scheduler
 ///
@@ -1427,6 +1434,7 @@ impl<'a, 'b> Scheduler<'a, 'b> {
                     layer.preempt_first.write(*preempt_first);
                     layer.exclusive.write(*exclusive);
                     layer.perf = u32::try_from(*perf)?;
+                    layer.name = layer.name;
                 }
             }
 
@@ -1952,10 +1960,65 @@ impl<'a, 'b> Scheduler<'a, 'b> {
         Ok(())
     }
 
+    fn monitor_usdts(&mut self, shutdown: Arc<AtomicBool>) {
+        let mut rbb = RingBufferBuilder::new();
+        let (tx, rx): (Sender<bpf_intf::pm_comm_record>, Receiver<bpf_intf::pm_comm_record>) =
+            mpsc::channel();
+
+        let mut maps = self.skel.maps_mut();
+        let monitor_rb = maps.monitor_rb();
+
+        rbb.add(&monitor_rb, move |data: &[u8]| {
+                let mut event = bpf_intf::pm_comm_record{
+                    comm: Default::default(),
+                    ppid: 0,
+                    header: bpf_intf::pm_record_header{
+                        type_: 0,
+                        len: 0,
+                        pid: 0,
+                        tid: 0,
+                    }
+                };
+                plain::copy_from_bytes(&mut event, data).expect("Event data buffer was too short");
+
+                tx.send(event).unwrap();
+
+                0
+        }).unwrap();
+        let rb = rbb.build().unwrap();
+
+        thread::spawn(move || loop {
+            let proc = rx.recv();
+            match proc {
+                Ok(p) => {
+                    println!("saw proc: {:?}", p);
+                    // TODO: iterate process mappings and attach any scx_layered USDTs.
+                    // BUG: this doesn't account for the mmaping at the start of the process, the
+                    // options are to add additional events on mmap as the exec'd process loads
+                    // maps into memory or give up and wait after some duration. Right now it
+                    // doesn't do either, but it's racey anyways.
+                }
+                _ => {
+                    continue;
+                }
+            }
+        });
+
+        thread::spawn(move || loop {
+            while !shutdown.load(Ordering::Relaxed) {
+                rb.poll(Duration::MAX).unwrap();
+            }
+
+            rb.consume_raw();
+        });
+    }
+
     fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
         let now = Instant::now();
         let mut next_sched_at = now + self.sched_intv;
         let mut next_monitor_at = now + self.monitor_intv;
+
+        self.monitor_usdts(shutdown.clone());
 
         while !shutdown.load(Ordering::Relaxed) && !uei_exited!(&self.skel, uei) {
             let now = Instant::now();
