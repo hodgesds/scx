@@ -13,12 +13,14 @@ use std::fs;
 use std::io::Read;
 use std::io::Write;
 use std::ops::Sub;
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::RwLock;
+use crossbeam::channel::unbounded;
+use std::sync::Mutex;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -68,6 +70,8 @@ const NR_GSTATS: usize = bpf_intf::global_stat_idx_NR_GSTATS as usize;
 const NR_LSTATS: usize = bpf_intf::layer_stat_idx_NR_LSTATS as usize;
 const NR_LAYER_MATCH_KINDS: usize = bpf_intf::layer_match_kind_NR_LAYER_MATCH_KINDS as usize;
 const CORE_CACHE_LEVEL: u32 = 2;
+const USDT_PROVIDER: &str = "scx_layered";
+const KICK_LAYER_USDT: &str = "kick_layer";
 
 lazy_static::lazy_static! {
     static ref NR_POSSIBLE_CPUS: usize = libbpf_rs::num_possible_cpus().unwrap();
@@ -513,9 +517,10 @@ fn format_bitvec(bitvec: &BitVec) -> String {
     output
 }
 
-fn read_cpu_ctxs(skel: &BpfSkel) -> Result<Vec<bpf_intf::cpu_ctx>> {
+fn read_cpu_ctxs(skel: &Arc<RwLock<BpfSkel>>) -> Result<Vec<bpf_intf::cpu_ctx>> {
+    let _skel = skel.read().unwrap();
     let mut cpu_ctxs = vec![];
-    let cpu_ctxs_vec = skel
+    let cpu_ctxs_vec = _skel
         .maps()
         .cpu_ctxs()
         .lookup_percpu(&0u32.to_ne_bytes(), libbpf_rs::MapFlags::ANY)
@@ -606,9 +611,10 @@ struct Stats {
 }
 
 impl Stats {
-    fn read_layer_loads(skel: &mut BpfSkel, nr_layers: usize) -> (f64, Vec<f64>) {
+    fn read_layer_loads(skel: Arc<RwLock<BpfSkel>>, nr_layers: usize) -> (f64, Vec<f64>) {
+        let _skel = skel.read().unwrap();
         let now_mono = now_monotonic();
-        let layer_loads: Vec<f64> = skel
+        let layer_loads: Vec<f64> = _skel
             .bss()
             .layers
             .iter()
@@ -641,9 +647,10 @@ impl Stats {
         layer_cycles
     }
 
-    fn new(skel: &mut BpfSkel, proc_reader: &procfs::ProcReader) -> Result<Self> {
-        let nr_layers = skel.rodata().nr_layers as usize;
-        let bpf_stats = BpfStats::read(&read_cpu_ctxs(skel)?, nr_layers);
+    fn new(skel: Arc<RwLock<BpfSkel>>, proc_reader: &procfs::ProcReader) -> Result<Self> {
+        let _skel = skel.read().unwrap();
+        let nr_layers = _skel.rodata().nr_layers as usize;
+        let bpf_stats = BpfStats::read(&read_cpu_ctxs(&skel)?, nr_layers);
 
         Ok(Self {
             at: Instant::now(),
@@ -668,14 +675,15 @@ impl Stats {
 
     fn refresh(
         &mut self,
-        skel: &mut BpfSkel,
+        skel: Arc<RwLock<BpfSkel>>,
         proc_reader: &procfs::ProcReader,
         now: Instant,
     ) -> Result<()> {
         let elapsed = now.duration_since(self.at).as_secs_f64() as f64;
-        let cpu_ctxs = read_cpu_ctxs(skel)?;
+        let cpu_ctxs = read_cpu_ctxs(&skel)?;
 
-        let nr_layer_tasks: Vec<usize> = skel
+        let _skel = skel.read().unwrap();
+        let nr_layer_tasks: Vec<usize> = _skel
             .bss()
             .layers
             .iter()
@@ -683,7 +691,7 @@ impl Stats {
             .map(|layer| layer.nr_tasks as usize)
             .collect();
 
-        let (total_load, layer_loads) = Self::read_layer_loads(skel, self.nr_layers);
+        let (total_load, layer_loads) = Self::read_layer_loads(skel.clone(), self.nr_layers);
 
         let cur_layer_cycles = Self::read_layer_cycles(&cpu_ctxs, self.nr_layers);
         let cur_layer_utils: Vec<f64> = cur_layer_cycles
@@ -1328,7 +1336,7 @@ impl OpenMetricsStats {
 }
 
 struct Scheduler<'a, 'b> {
-    skel: BpfSkel<'a>,
+    skel: Arc<RwLock<BpfSkel<'a>>>,
     struct_ops: Option<libbpf_rs::Link>,
     layer_specs: &'b Vec<LayerSpec>,
 
@@ -1349,6 +1357,8 @@ struct Scheduler<'a, 'b> {
 
     om_stats: OpenMetricsStats,
     om_format: bool,
+
+    usdt_links: Arc<RwLock<BTreeMap<u32, Arc<Mutex<libbpf_rs::Link>>>>>,
 }
 
 impl<'a, 'b> Scheduler<'a, 'b> {
@@ -1463,6 +1473,7 @@ impl<'a, 'b> Scheduler<'a, 'b> {
         let mut skel_builder = BpfSkelBuilder::default();
         skel_builder.obj_builder.debug(opts.verbose > 1);
         init_libbpf_logging(None);
+        info!("opening skel");
         let mut skel = scx_ops_open!(skel_builder, layered)?;
 
         // scheduler_tick() got renamed to sched_tick() during v6.10-rc.
@@ -1494,9 +1505,10 @@ impl<'a, 'b> Scheduler<'a, 'b> {
         for cpu in cpu_pool.all_cpus.iter_ones() {
             skel.rodata_mut().all_cpus[cpu / 8] |= 1 << (cpu % 8);
         }
+        info!("initializing layers");
         Self::init_layers(&mut skel, opts, layer_specs)?;
 
-        let mut skel = scx_ops_load!(skel, layered, uei)?;
+        let skel = Arc::new(RwLock::new(scx_ops_load!(skel, layered, uei)?));
 
         let mut layers = vec![];
         for spec in layer_specs.iter() {
@@ -1505,6 +1517,7 @@ impl<'a, 'b> Scheduler<'a, 'b> {
 
         // Other stuff.
         let proc_reader = procfs::ProcReader::new();
+        let sched_stats = Stats::new(skel.clone(), &proc_reader)?;
 
         let mut sched = Self {
             struct_ops: None,
@@ -1517,8 +1530,8 @@ impl<'a, 'b> Scheduler<'a, 'b> {
             cpu_pool,
             layers,
 
-            sched_stats: Stats::new(&mut skel, &proc_reader)?,
-            report_stats: Stats::new(&mut skel, &proc_reader)?,
+            sched_stats: sched_stats,
+            report_stats: Stats::new(skel.clone(), &proc_reader)?,
 
             nr_layer_cpus_min_max: vec![(0, 0); nr_layers],
             processing_dur: Duration::from_millis(0),
@@ -1529,6 +1542,8 @@ impl<'a, 'b> Scheduler<'a, 'b> {
 
             om_stats: OpenMetricsStats::new(),
             om_format: opts.open_metrics_format,
+
+            usdt_links: Arc::new(RwLock::new(BTreeMap::new())),
         };
 
         // XXX If we try to refresh the cpumasks here before attaching, we
@@ -1538,8 +1553,11 @@ impl<'a, 'b> Scheduler<'a, 'b> {
         // huge problem in the interim until we figure it out.
 
         // Attach.
-        sched.struct_ops = Some(scx_ops_attach!(sched.skel, layered)?);
+        info!("attaching struct_ops");
+        let mut lock = sched.skel.write().unwrap();
+        sched.struct_ops = Some(scx_ops_attach!(lock, layered)?);
         info!("Layered Scheduler Attached");
+        drop(lock);
 
         Ok(sched)
     }
@@ -1587,11 +1605,14 @@ impl<'a, 'b> Scheduler<'a, 'b> {
                         self.no_load_frac_limit,
                     )? != 0
                     {
+                        let mut _skel = self.skel.write().unwrap();
+                        let mut layer = _skel.bss_mut().layers[idx];
                         Self::update_bpf_layer_cpumask(
                             &self.layers[idx],
-                            &mut self.skel.bss_mut().layers[idx],
+                            &mut layer,
                         );
                         updated = true;
+                        drop(_skel);
                     }
                 }
                 _ => {}
@@ -1602,8 +1623,9 @@ impl<'a, 'b> Scheduler<'a, 'b> {
             let available_cpus = self.cpu_pool.available_cpus();
             let nr_available_cpus = available_cpus.count_ones();
             for idx in 0..self.layers.len() {
+                let mut _skel = self.skel.write().unwrap();
                 let layer = &mut self.layers[idx];
-                let bpf_layer = &mut self.skel.bss_mut().layers[idx];
+                let bpf_layer = &mut _skel.bss_mut().layers[idx];
                 match &layer.kind {
                     LayerKind::Open { .. } => {
                         layer.cpus.copy_from_bitslice(&available_cpus);
@@ -1612,9 +1634,11 @@ impl<'a, 'b> Scheduler<'a, 'b> {
                     }
                     _ => {}
                 }
+                drop(_skel);
             }
 
-            self.skel.bss_mut().fallback_cpu = self.cpu_pool.fallback_cpu as u32;
+            let mut _skel = self.skel.write().unwrap();
+            _skel.bss_mut().fallback_cpu = self.cpu_pool.fallback_cpu as u32;
 
             for (lidx, layer) in self.layers.iter().enumerate() {
                 self.nr_layer_cpus_min_max[lidx] = (
@@ -1630,7 +1654,7 @@ impl<'a, 'b> Scheduler<'a, 'b> {
     fn step(&mut self) -> Result<()> {
         let started_at = Instant::now();
         self.sched_stats
-            .refresh(&mut self.skel, &self.proc_reader, started_at)?;
+            .refresh(self.skel.clone(), &self.proc_reader, started_at)?;
 
         self.refresh_cpumasks()?;
 
@@ -1641,7 +1665,7 @@ impl<'a, 'b> Scheduler<'a, 'b> {
     fn report(&mut self) -> Result<()> {
         let started_at = Instant::now();
         self.report_stats
-            .refresh(&mut self.skel, &self.proc_reader, started_at)?;
+            .refresh(self.skel.clone(), &self.proc_reader, started_at)?;
         let stats = &self.report_stats;
 
         let processing_dur = self.processing_dur - self.prev_processing_dur;
@@ -1961,11 +1985,13 @@ impl<'a, 'b> Scheduler<'a, 'b> {
     }
 
     fn monitor_usdts(&mut self, shutdown: Arc<AtomicBool>) {
+        thread::scope(|s| {
         let mut rbb = RingBufferBuilder::new();
-        let (tx, rx): (Sender<bpf_intf::pm_comm_record>, Receiver<bpf_intf::pm_comm_record>) =
-            mpsc::channel();
+        let (tx, rx) = unbounded();
 
-        let mut maps = self.skel.maps_mut();
+        let skel = self.skel.clone();
+        let mut _skel = skel.write().unwrap();
+        let mut maps = _skel.maps_mut();
         let monitor_rb = maps.monitor_rb();
 
         rbb.add(&monitor_rb, move |data: &[u8]| {
@@ -1985,31 +2011,68 @@ impl<'a, 'b> Scheduler<'a, 'b> {
 
                 0
         }).unwrap();
+
         let rb = rbb.build().unwrap();
+        drop(_skel);
 
-        thread::spawn(move || loop {
-            let proc = rx.recv();
-            match proc {
-                Ok(p) => {
-                    println!("saw proc: {:?}", p);
-                    // TODO: iterate process mappings and attach any scx_layered USDTs.
-                    // BUG: this doesn't account for the mmaping at the start of the process, the
-                    // options are to add additional events on mmap as the exec'd process loads
-                    // maps into memory or give up and wait after some duration. Right now it
-                    // doesn't do either, but it's racey anyways.
-                }
-                _ => {
-                    continue;
-                }
-            }
-        });
+        let _shutdown = shutdown.clone();
+        s.spawn(move || {
+            info!(
+                "monitoring for usdts"
+            );
+            let skel = self.skel.clone();
+            let links = self.usdt_links.clone();
+            while !_shutdown.load(Ordering::Relaxed) {
+                let proc = rx.recv();
+                match proc {
+                    Ok(p) => {
+                        // info!("saw proc: {:?}", p);
 
-        thread::spawn(move || loop {
+                         // TODO: iterate process mappings and attach any scx_layered USDTs.
+                         // BUG: this doesn't account for the mmaping at the start of the process, the
+                         // options are to add additional events on mmap as the exec'd process loads
+                         // maps into memory or give up and wait after some duration. Right now it
+                         // doesn't do either, but it's racey anyways.
+                         let mut _skel = skel.write().unwrap();
+                         let mut progs = _skel.progs_mut();
+
+                         let prog = progs.kick_layer();
+                         let path_str = format!("/proc/{}/exe", p.header.pid);
+                         let binary_path = Path::new(&path_str);
+
+                         let result = prog.attach_usdt(
+                             p.header.pid.try_into().unwrap(),
+                             binary_path,
+                             USDT_PROVIDER,
+                             KICK_LAYER_USDT,
+                         );
+                         drop(_skel);
+
+                         match result {
+                             Ok(link) => {
+                                 info!("attached usdt for {:?}", p);
+                                 let mut map = links.write().unwrap();
+                                 map.insert(p.header.pid, Arc::new(Mutex::new(link)));
+                             }
+                             _ => {
+                                 // info!("failed to find link")
+                             }
+                         }
+                    }
+                    _ => {
+                        continue;
+                    }
+                }
+        }});
+
+        thread::spawn(move || {
             while !shutdown.load(Ordering::Relaxed) {
                 rb.poll(Duration::MAX).unwrap();
             }
 
             rb.consume_raw();
+            drop(rb);
+        });
         });
     }
 
@@ -2018,9 +2081,11 @@ impl<'a, 'b> Scheduler<'a, 'b> {
         let mut next_sched_at = now + self.sched_intv;
         let mut next_monitor_at = now + self.monitor_intv;
 
+        info!("setting up usdt monitor");
         self.monitor_usdts(shutdown.clone());
 
-        while !shutdown.load(Ordering::Relaxed) && !uei_exited!(&self.skel, uei) {
+        info!("starting scheduler");
+        while !shutdown.load(Ordering::Relaxed) && !uei_exited!(&self.skel.read().unwrap(), uei) {
             let now = Instant::now();
 
             if now >= next_sched_at {
@@ -2045,7 +2110,7 @@ impl<'a, 'b> Scheduler<'a, 'b> {
         }
 
         self.struct_ops.take();
-        uei_report!(&self.skel, uei)
+        uei_report!(&self.skel.read().unwrap(), uei)
     }
 }
 
@@ -2054,6 +2119,14 @@ impl<'a, 'b> Drop for Scheduler<'a, 'b> {
         if let Some(struct_ops) = self.struct_ops.take() {
             drop(struct_ops);
         }
+        // Here we must make sure to drop all the USDT links or resources could be held open for
+        // the process causing leaks.
+        let mut map = self.usdt_links.write().unwrap();
+        for (_, link_mu) in map.iter() {
+            let link = link_mu.lock().unwrap();
+            link.detach();
+        }
+        map.clear();
     }
 }
 

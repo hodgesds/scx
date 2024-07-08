@@ -312,7 +312,6 @@ int tracepoint__sched__sched_process_exec(struct trace_event_raw_sched_process_e
 
 	bpf_ringbuf_submit(record, 0);
 
-	bpf_printk("exec\n");
 	return 0;
 }
 
