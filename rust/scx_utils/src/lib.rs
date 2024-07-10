@@ -55,6 +55,7 @@ pub mod compat;
 
 mod libbpf_logger;
 pub use libbpf_logger::init_libbpf_logging;
+pub use libbpf_logger::disable_libbpf_logging;
 
 pub mod ravg;
 

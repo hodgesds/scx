@@ -29,6 +29,7 @@ static u32 preempt_cursor;
 
 #define dbg(fmt, args...)	do { if (debug) bpf_printk(fmt, ##args); } while (0)
 #define trace(fmt, args...)	do { if (debug > 1) bpf_printk(fmt, ##args); } while (0)
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 #include "util.bpf.c"
 
@@ -286,7 +287,7 @@ static int lookup_layer_name(const char *layer_name)
 		if (!layer)
 			return -1;
 
-		if (layer_name == layer->name)
+		if (match_prefix(layer->name, layer_name, sizeof(layer->name)))
 			return idx;
 	}
 
@@ -311,44 +312,6 @@ int tracepoint__sched__sched_process_exec(struct trace_event_raw_sched_process_e
 	record->ppid = BPF_CORE_READ(task, real_parent, tgid);
 
 	bpf_ringbuf_submit(record, 0);
-
-	return 0;
-}
-
-SEC("usdt")
-int BPF_USDT(kick_layer, const char *target_layer)
-{
-	int idx;
- 	struct task_struct* p;
-	struct task_ctx *tctx;
-
- 	idx = lookup_layer_name(target_layer);
-	if (!idx || idx < 0) {
-		bpf_printk("failed to kick to layer %s: layer not found", target_layer);
-		return 0;
-	}
-
- 	p = (struct task_struct*)bpf_get_current_task_btf();
-	if (!p)
-		return 0;
-
-	tctx = bpf_task_storage_get(&task_ctxs, (struct task_struct*)p, 0, 0);
-	if (!tctx)
-	       	return 0;
-
-	bpf_printk("kicking to layer %s", target_layer);
-	struct layer *layer = &layers[idx];
-	if (!layer)
-		return 0;
-
-	if (tctx->layer >= 0 && tctx->layer <= nr_layers && &layers[tctx->layer].nr_tasks > 0)
-		__sync_fetch_and_add(&layers[tctx->layer].nr_tasks, -1);
-
-	tctx->layer = idx;
-	tctx->refresh_layer = false;
-	tctx->layer_cpus_seq = layer->cpus_seq - 1;
-	// p->scx.dsq_vtime = layer->vtime_now;
-	__sync_fetch_and_add(&layer->nr_tasks, 1);
 
 	return 0;
 }
@@ -911,7 +874,7 @@ void BPF_STRUCT_OPS(layered_dispatch, s32 cpu, struct task_struct *prev)
 	scx_bpf_consume(LO_FALLBACK_DSQ);
 }
 
-static bool match_one(struct layer_match *match, struct task_struct *p, const char *cgrp_path)
+static bool match_one(struct layer_match *match, struct task_struct *p, const char *cgrp_path, bool skip_errors)
 {
 	switch (match->kind) {
 	case MATCH_CGROUP_PREFIX: {
@@ -935,18 +898,22 @@ static bool match_one(struct layer_match *match, struct task_struct *p, const ch
 	case MATCH_NICE_EQUALS:
 		return prio_to_nice((s32)p->static_prio) == match->nice;
 	default:
-		scx_bpf_error("invalid match kind %d", match->kind);
+		if (!skip_errors)
+			scx_bpf_error("invalid match kind %d", match->kind);
+
 		return false;
 	}
 }
 
-static bool match_layer(struct layer *layer, struct task_struct *p, const char *cgrp_path)
+static bool match_layer(struct layer *layer, struct task_struct *p, const char *cgrp_path, bool skip_errors)
 {
 	u32 nr_match_ors = layer->nr_match_ors;
 	u64 or_idx, and_idx;
 
 	if (nr_match_ors > MAX_LAYER_MATCH_ORS) {
-		scx_bpf_error("too many ORs");
+		if (!skip_errors)
+			scx_bpf_error("too many ORs");
+
 		return false;
 	}
 
@@ -960,7 +927,9 @@ static bool match_layer(struct layer *layer, struct task_struct *p, const char *
 		ands = &layer->matches[or_idx];
 
 		if (ands->nr_match_ands > NR_LAYER_MATCH_KINDS) {
-			scx_bpf_error("too many ANDs");
+			if (!skip_errors)
+				scx_bpf_error("too many ANDs");
+
 			return false;
 		}
 
@@ -972,7 +941,7 @@ static bool match_layer(struct layer *layer, struct task_struct *p, const char *
 				return false; /* can't happen */
 			match = &ands->matches[and_idx];
 
-			if (!match_one(match, p, cgrp_path)) {
+			if (!match_one(match, p, cgrp_path, skip_errors)) {
 				matched = false;
 				break;
 			}
@@ -985,7 +954,7 @@ static bool match_layer(struct layer *layer, struct task_struct *p, const char *
 	return false;
 }
 
-static void maybe_refresh_layer(struct task_struct *p, struct task_ctx *tctx)
+static void maybe_refresh_layer(struct task_struct *p, struct task_ctx *tctx, bool skip_match_check)
 {
 	const char *cgrp_path;
 	bool matched = false;
@@ -995,17 +964,26 @@ static void maybe_refresh_layer(struct task_struct *p, struct task_ctx *tctx)
 		return;
 	tctx->refresh_layer = false;
 
-	if (!(cgrp_path = format_cgrp_path(p->cgroups->dfl_cgrp)))
+	if (!(cgrp_path = format_cgrp_path(p->cgroups->dfl_cgrp, skip_errors)))
 		return;
 
-	if (tctx->layer >= 0 && tctx->layer < nr_layers)
-		__sync_fetch_and_add(&layers[tctx->layer].nr_tasks, -1);
+	if (!skip_match_check) {
+		if (tctx->layer >= 0 && tctx->layer < nr_layers)
+			__sync_fetch_and_add(&layers[tctx->layer].nr_tasks, -1);
 
-	bpf_for(idx, 0, nr_layers) {
-		if (match_layer(&layers[idx], p, cgrp_path)) {
-			matched = true;
-			break;
+		bpf_for(idx, 0, nr_layers) {
+			if (match_layer(&layers[idx], p, cgrp_path, skip_errors)) {
+				matched = true;
+				break;
+			}
 		}
+	} else {
+		// If skipping the match the layer still needs to be validated.
+		if (!(tctx->layer >= 0 && tctx->layer < nr_layers))
+			return;
+
+		idx = tctx->layer;
+		matched = true;
 	}
 
 	if (matched) {
@@ -1024,8 +1002,18 @@ static void maybe_refresh_layer(struct task_struct *p, struct task_ctx *tctx)
 		 * Revisit if high frequency dynamic layer switching
 		 * needs to be supported.
 		 */
-		p->scx.dsq_vtime = layer->vtime_now;
+		if (!skip_match_check)
+			p->scx.dsq_vtime = layer->vtime_now;
 	} else {
+		/*
+		 * The scx_bpf_error kfunc can't be called from a USDT bpf
+		 * program, which requires updating the the kfunc declaration.
+		 * So for now just bail out and the task and the error will
+		 * occur on the the next scheduling cycle.
+		 */
+		if (skip_match_check)
+			return;
+
 		scx_bpf_error("[%s]%d didn't match any layer", p->comm, p->pid);
 	}
 
@@ -1043,7 +1031,7 @@ void BPF_STRUCT_OPS(layered_runnable, struct task_struct *p, u64 enq_flags)
 		return;
 
 	tctx->runnable_at = now;
-	maybe_refresh_layer(p, tctx);
+	maybe_refresh_layer(p, tctx, false);
 	adj_load(tctx->layer, p->scx.weight, now);
 }
 
@@ -1068,6 +1056,21 @@ void BPF_STRUCT_OPS(layered_running, struct task_struct *p)
 	cctx->current_preempt = layer->preempt;
 	cctx->current_exclusive = layer->exclusive;
 	tctx->running_at = bpf_ktime_get_ns();
+
+	if (tctx->layer >=0 && tctx->layer <= nr_layers) {
+		struct layer * layer = lookup_layer(tctx->layer);
+		if (layer) {
+			const char *usdt = "usdt_0";
+			if (match_prefix(layer->name, usdt, 6))
+				bpf_printk("runnable in layer usdt_0");
+
+			const char *usdt1 = "usdt_1";
+			if (match_prefix(layer->name, usdt1, 6))
+				bpf_printk("runnable in layer usdt_1");
+		}
+	} else {
+		bpf_printk("unknown layer");
+	}
 
 	/*
 	 * If this CPU is transitioning from running an exclusive task to a
@@ -1486,3 +1489,46 @@ SCX_OPS_DEFINE(layered,
 	       .exit			= (void *)layered_exit,
 	       .flags			= SCX_OPS_ENQ_LAST,
 	       .name			= "layered");
+
+
+SEC("usdt")
+int BPF_USDT(kick_layer, const char *target_layer)
+{
+	int idx;
+ 	struct task_struct* p;
+	struct task_ctx *tctx;
+	char layer_name[MAX_LAYER_NAME];
+
+	if (!bpf_probe_read_user_str(layer_name, MAX_LAYER_NAME, target_layer))
+		return 0;
+
+ 	idx = lookup_layer_name(layer_name);
+	if (idx < 0 || idx > nr_layers) {
+		return 0;
+	}
+
+ 	p = (struct task_struct*)bpf_get_current_task_btf();
+	if (!p)
+		return 0;
+
+	tctx = bpf_task_storage_get(&task_ctxs, (struct task_struct*)p, 0, 0);
+	if (!tctx)
+	       	return 0;
+
+	struct layer *layer = &layers[idx];
+	if (!layer)
+		return 0;
+
+	// Decrement old layer count since this is occuring out of normal
+	// scheduling hooks.
+	if (tctx->layer >=0 && tctx->layer < nr_layers)
+		__sync_fetch_and_add(&layers[tctx->layer].nr_tasks, -1);
+
+	tctx->refresh_layer = true;
+	tctx->layer = idx;
+
+	maybe_refresh_layer(p, tctx, true);
+
+	return 0;
+}
+

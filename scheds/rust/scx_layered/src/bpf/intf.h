@@ -41,6 +41,7 @@ enum consts {
 	MAX_COMM		= 16,
 	MAX_LAYER_MATCH_ORS	= 32,
 	MAX_LAYERS		= 16,
+	MAX_LAYER_NAME		= 64,
 	USAGE_HALF_LIFE		= 100000000,	/* 100ms */
 
 	HI_FALLBACK_DSQ		= MAX_LAYERS,
@@ -156,7 +157,7 @@ struct layer {
 	unsigned char		cpus[MAX_CPUS_U8];
 	unsigned int		nr_cpus;	// managed from BPF side
 	unsigned int		perf;
-	const char		*name;
+	char			name[MAX_COMM];
 };
 
 #endif /* __INTF_H */

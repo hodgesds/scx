@@ -10,10 +10,12 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::ffi::CString;
 use std::fs;
+use std::io;
 use std::io::Read;
 use std::io::Write;
 use std::ops::Sub;
 use std::path::Path;
+use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::AtomicU64;
@@ -39,6 +41,7 @@ use libbpf_rs::skel::SkelBuilder;
 use libbpf_rs::RingBufferBuilder;
 use log::debug;
 use log::info;
+use log::error;
 use log::trace;
 use log::warn;
 use plain::Plain;
@@ -48,6 +51,7 @@ use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
 use scx_utils::compat;
 use scx_utils::init_libbpf_logging;
+use scx_utils::disable_libbpf_logging;
 use scx_utils::ravg::ravg_read;
 use scx_utils::scx_ops_attach;
 use scx_utils::scx_ops_load;
@@ -64,6 +68,7 @@ const MAX_PATH: usize = bpf_intf::consts_MAX_PATH as usize;
 const MAX_COMM: usize = bpf_intf::consts_MAX_COMM as usize;
 const MAX_LAYER_MATCH_ORS: usize = bpf_intf::consts_MAX_LAYER_MATCH_ORS as usize;
 const MAX_LAYERS: usize = bpf_intf::consts_MAX_LAYERS as usize;
+const MAX_LAYER_NAME: usize = bpf_intf::consts_MAX_LAYER_NAME as usize;
 const USAGE_HALF_LIFE: u32 = bpf_intf::consts_USAGE_HALF_LIFE;
 const USAGE_HALF_LIFE_F64: f64 = USAGE_HALF_LIFE as f64 / 1_000_000_000.0;
 const NR_GSTATS: usize = bpf_intf::global_stat_idx_NR_GSTATS as usize;
@@ -331,6 +336,10 @@ struct Opts {
 
     /// Layer specification. See --help.
     specs: Vec<String>,
+
+    /// Enable thread tagging with USDTs. 
+    #[clap(short = 'u', long, action = clap::ArgAction::SetTrue)]
+    usdt_tagging: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -935,6 +944,9 @@ struct Layer {
 
 impl Layer {
     fn new(cpu_pool: &mut CpuPool, name: &str, kind: LayerKind) -> Result<Self> {
+        if name.len() > MAX_LAYER_NAME {
+            bail!("Max layer name is {:?}, got: {:?}", MAX_LAYER_NAME, name);
+        }
         match &kind {
             LayerKind::Confined {
                 cpus_range,
@@ -1358,6 +1370,7 @@ struct Scheduler<'a, 'b> {
     om_stats: OpenMetricsStats,
     om_format: bool,
 
+    monitor_usdts: bool,
     usdt_links: Arc<RwLock<BTreeMap<u32, Arc<Mutex<libbpf_rs::Link>>>>>,
 }
 
@@ -1368,6 +1381,7 @@ impl<'a, 'b> Scheduler<'a, 'b> {
 
         for (spec_i, spec) in specs.iter().enumerate() {
             let layer = &mut skel.bss_mut().layers[spec_i];
+            copy_into_cstr(&mut layer.name, spec.name.as_str());
 
             for (or_i, or) in spec.matches.iter().enumerate() {
                 for (and_i, and) in or.iter().enumerate() {
@@ -1543,6 +1557,7 @@ impl<'a, 'b> Scheduler<'a, 'b> {
             om_stats: OpenMetricsStats::new(),
             om_format: opts.open_metrics_format,
 
+            monitor_usdts: opts.usdt_tagging,
             usdt_links: Arc::new(RwLock::new(BTreeMap::new())),
         };
 
@@ -1984,133 +1999,209 @@ impl<'a, 'b> Scheduler<'a, 'b> {
         Ok(())
     }
 
-    fn monitor_usdts(&mut self, shutdown: Arc<AtomicBool>) {
-        thread::scope(|s| {
-        let mut rbb = RingBufferBuilder::new();
-        let (tx, rx) = unbounded();
+    // fn monitor_usdts(&mut self, s: &thread::Scope, shutdown: Arc<AtomicBool>) {
+    //     info!("setting up USDT monitor");
 
-        let skel = self.skel.clone();
-        let mut _skel = skel.write().unwrap();
-        let mut maps = _skel.maps_mut();
-        let monitor_rb = maps.monitor_rb();
+    //         let mut rbb = RingBufferBuilder::new();
+    //         let (tx, rx) = unbounded();
 
-        rbb.add(&monitor_rb, move |data: &[u8]| {
-                let mut event = bpf_intf::pm_comm_record{
-                    comm: Default::default(),
-                    ppid: 0,
-                    header: bpf_intf::pm_record_header{
-                        type_: 0,
-                        len: 0,
-                        pid: 0,
-                        tid: 0,
-                    }
-                };
-                plain::copy_from_bytes(&mut event, data).expect("Event data buffer was too short");
+    //         let skel = self.skel.clone();
+    //         let mut _skel = skel.write().unwrap();
+    //         let mut maps = _skel.maps_mut();
+    //         let monitor_rb = maps.monitor_rb();
 
-                tx.send(event).unwrap();
+    //         rbb.add(&monitor_rb, move |data: &[u8]| {
+    //                 let mut event = bpf_intf::pm_comm_record{
+    //                     comm: Default::default(),
+    //                     ppid: 0,
+    //                     header: bpf_intf::pm_record_header{
+    //                         type_: 0,
+    //                         len: 0,
+    //                         pid: 0,
+    //                         tid: 0,
+    //                     }
+    //                 };
+    //                 plain::copy_from_bytes(&mut event, data).expect("Event data buffer was too short");
 
-                0
-        }).unwrap();
+    //                 tx.send(event).unwrap();
 
-        let rb = rbb.build().unwrap();
-        drop(_skel);
+    //                 0
+    //         }).unwrap();
 
-        let _shutdown = shutdown.clone();
-        s.spawn(move || {
-            info!(
-                "monitoring for usdts"
-            );
+    //         let rb = rbb.build().unwrap();
+    //         drop(_skel);
+    //         drop(skel);
+
+    //         let _shutdown = shutdown.clone();
+    //         s.spawn(move || {
+    //             info!(
+    //                 "monitoring for usdts"
+    //             );
+    //             while !_shutdown.load(Ordering::Relaxed) {
+    //                 let proc = rx.recv();
+    //                 match proc {
+    //                     Ok(p) => {
+    //                         // info!("saw proc: {:?}", p);
+    //                         let skel = self.skel.clone();
+    //                         let links = self.usdt_links.clone();
+
+    //                          let mut _skel = skel.write().unwrap();
+    //                          let mut progs = _skel.progs_mut();
+
+    //                          let prog = progs.kick_layer();
+    //                          let path_str = format!("/proc/{}/exe", p.header.pid);
+    //                          let binary_path = Path::new(&path_str);
+
+    //                          let result = prog.attach_usdt(
+    //                              p.header.pid.try_into().unwrap(),
+    //                              binary_path,
+    //                              USDT_PROVIDER,
+    //                              KICK_LAYER_USDT,
+    //                          );
+    //                          drop(_skel);
+
+    //                          match result {
+    //                              Ok(link) => {
+    //                                  info!("attached usdt for {:?}", p);
+    //                                  let mut map = links.write().unwrap();
+    //                                  map.insert(p.header.pid, Arc::new(Mutex::new(link)));
+    //                              }
+    //                              _ => {
+    //                              }
+    //                          }
+    //                     }
+    //                     _ => {
+    //                         continue;
+    //                     }
+    //                 }
+    //             }
+    //         });
+
+    //         s.spawn(move || {
+    //             while !shutdown.load(Ordering::Relaxed) {
+    //                 rb.poll(Duration::MAX).unwrap();
+    //             }
+
+    //             rb.consume_raw();
+    //             drop(rb);
+    //         });
+
+    // }
+
+    fn ascii_digits_to_i32(&mut self, digits: &[u8]) -> Option<i32> {
+        let mut result = 0i32;
+        for digit in digits {
+            let value = digit.wrapping_sub(b'0');
+            if value <= 9 {
+                result = result * 10 + value as i32;
+            } else {
+                return None;
+            }
+        }
+        Some(result)
+    }
+
+    fn usdt_discovery(&mut self) {
+        info!("doing USDT discovery");
+        // let mut threads = Vec::new();
+        // threads.push(s.spawn(|| {
+            // Do initial discovery of all running processes and attach any USDT thread tagging
+            // processes.
+
             let skel = self.skel.clone();
             let links = self.usdt_links.clone();
-            while !_shutdown.load(Ordering::Relaxed) {
-                let proc = rx.recv();
-                match proc {
-                    Ok(p) => {
-                        // info!("saw proc: {:?}", p);
 
-                         // TODO: iterate process mappings and attach any scx_layered USDTs.
-                         // BUG: this doesn't account for the mmaping at the start of the process, the
-                         // options are to add additional events on mmap as the exec'd process loads
-                         // maps into memory or give up and wait after some duration. Right now it
-                         // doesn't do either, but it's racey anyways.
-                         let mut _skel = skel.write().unwrap();
-                         let mut progs = _skel.progs_mut();
-
-                         let prog = progs.kick_layer();
-                         let path_str = format!("/proc/{}/exe", p.header.pid);
-                         let binary_path = Path::new(&path_str);
-
-                         let result = prog.attach_usdt(
-                             p.header.pid.try_into().unwrap(),
-                             binary_path,
-                             USDT_PROVIDER,
-                             KICK_LAYER_USDT,
-                         );
-                         drop(_skel);
-
-                         match result {
-                             Ok(link) => {
-                                 info!("attached usdt for {:?}", p);
-                                 let mut map = links.write().unwrap();
-                                 map.insert(p.header.pid, Arc::new(Mutex::new(link)));
-                             }
-                             _ => {
-                                 // info!("failed to find link")
-                             }
-                         }
-                    }
-                    _ => {
-                        continue;
-                    }
-                }
-        }});
-
-        thread::spawn(move || {
-            while !shutdown.load(Ordering::Relaxed) {
-                rb.poll(Duration::MAX).unwrap();
+            let entries = fs::read_dir("/proc").unwrap()
+                    .collect::<Result<Vec<_>, io::Error>>();
+            if !entries.is_ok() {
+                return;
             }
+            let entries = entries.unwrap();
 
-            rb.consume_raw();
-            drop(rb);
-        });
-        });
+            info!("Doing USDT discovery on {} pids", entries.len());
+            for entry in entries {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+
+                let pid = match self.ascii_digits_to_i32(entry.file_name().as_bytes()) {
+                    Some(pid) => pid,
+                    None => continue,
+                };
+
+                 let mut _skel = skel.write().unwrap();
+                 let mut progs = _skel.progs_mut();
+
+                 let prog = progs.kick_layer();
+                 let path_str = format!("/proc/{}/exe", pid);
+                 let binary_path = Path::new(&path_str);
+
+                 let result = prog.attach_usdt(
+                     pid.try_into().unwrap(),
+                     binary_path,
+                     USDT_PROVIDER,
+                     KICK_LAYER_USDT,
+                 );
+                 drop(_skel);
+
+                 match result {
+                     Ok(link) => {
+                         info!("attached kick_layer USDT for {:?}", pid);
+                         let mut map = links.write().unwrap();
+                         map.insert(pid.try_into().unwrap(), Arc::new(Mutex::new(link)));
+                     }
+                     _ => { }
+                 }
+            }
+        // }));
+
     }
 
     fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
-        let now = Instant::now();
-        let mut next_sched_at = now + self.sched_intv;
-        let mut next_monitor_at = now + self.monitor_intv;
-
-        info!("setting up usdt monitor");
-        self.monitor_usdts(shutdown.clone());
-
-        info!("starting scheduler");
-        while !shutdown.load(Ordering::Relaxed) && !uei_exited!(&self.skel.read().unwrap(), uei) {
+        let result = thread::scope(|s| {
             let now = Instant::now();
+            let mut next_sched_at = now + self.sched_intv;
+            let mut next_monitor_at = now + self.monitor_intv;
 
-            if now >= next_sched_at {
-                self.step()?;
-                while next_sched_at < now {
-                    next_sched_at += self.sched_intv;
-                }
+            // let mut threads = Vec::new();
+            if self.monitor_usdts {
+                // threads.push(self.monitor_usdts(s, shutdown.clone()));
+                self.usdt_discovery();
+                disable_libbpf_logging();
             }
 
-            if now >= next_monitor_at {
-                self.report()?;
-                while next_monitor_at < now {
-                    next_monitor_at += self.monitor_intv;
+            while !shutdown.load(Ordering::Relaxed) && !uei_exited!(&self.skel.read().unwrap(), uei) {
+                let now = Instant::now();
+
+                if now >= next_sched_at {
+                    self.step()?;
+                    while next_sched_at < now {
+                        next_sched_at += self.sched_intv;
+                    }
                 }
+
+                if now >= next_monitor_at {
+                    self.report()?;
+                    while next_monitor_at < now {
+                        next_monitor_at += self.monitor_intv;
+                    }
+                }
+
+                std::thread::sleep(
+                    next_sched_at
+                        .min(next_monitor_at)
+                        .duration_since(Instant::now()),
+                );
             }
 
-            std::thread::sleep(
-                next_sched_at
-                    .min(next_monitor_at)
-                    .duration_since(Instant::now()),
-            );
-        }
+            self.struct_ops.take();
+            let res = uei_report!(&self.skel.read().unwrap(), uei);
+            // drop(threads);
+            res
+        });
 
-        self.struct_ops.take();
-        uei_report!(&self.skel.read().unwrap(), uei)
+        Ok(result?)
     }
 }
 
@@ -2119,12 +2210,24 @@ impl<'a, 'b> Drop for Scheduler<'a, 'b> {
         if let Some(struct_ops) = self.struct_ops.take() {
             drop(struct_ops);
         }
-        // Here we must make sure to drop all the USDT links or resources could be held open for
-        // the process causing leaks.
+
+        // Here we must make sure to drop all the USDT links or resources could leak.
         let mut map = self.usdt_links.write().unwrap();
+        let mut errors = Vec::new();
+
         for (_, link_mu) in map.iter() {
             let link = link_mu.lock().unwrap();
-            link.detach();
+            let err = link.detach();
+            match err {
+                Err(e) => {
+                    errors.push(e)
+                },
+                _ => {}
+            }
+        }
+
+        if errors.len() > 0 {
+            error!("Failed to detach {} USDTs: {:?}", errors.len(), errors);
         }
         map.clear();
     }

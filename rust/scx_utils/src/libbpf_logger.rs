@@ -18,3 +18,9 @@ pub fn init_libbpf_logging(
 ) {
     set_print(Some((level.unwrap_or(PrintLevel::Debug), print_to_log)));
 }
+
+fn nop_log(_level: PrintLevel, _msg: String) {}
+
+pub fn disable_libbpf_logging() {
+    set_print(Some((PrintLevel::Warn, nop_log)));
+}
