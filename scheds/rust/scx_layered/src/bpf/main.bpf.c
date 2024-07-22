@@ -837,6 +837,19 @@ void BPF_STRUCT_OPS(layered_dispatch, s32 cpu, struct task_struct *prev)
 	scx_bpf_consume(LO_FALLBACK_DSQ);
 }
 
+static bool match_env_var(struct task_struct *p, const char *env_var_key)
+{
+	char *dst = NULL;
+	if (!env_var_key)
+		return false;
+
+	get_env_var_from_task(p, env_var_key, sizeof(env_var_key), dst);
+	if (!dst)
+		return false;
+
+	return match_prefix(env_var_key, dst, ENV_KEY_SIZE);
+}
+
 static bool match_one(struct layer_match *match, struct task_struct *p, const char *cgrp_path)
 {
 	switch (match->kind) {
@@ -860,6 +873,8 @@ static bool match_one(struct layer_match *match, struct task_struct *p, const ch
 		return prio_to_nice((s32)p->static_prio) < match->nice;
 	case MATCH_NICE_EQUALS:
 		return prio_to_nice((s32)p->static_prio) == match->nice;
+	case MATCH_ENV_EQUALS:
+		return match_env_var(p, match->env_var);
 	default:
 		scx_bpf_error("invalid match kind %d", match->kind);
 		return false;

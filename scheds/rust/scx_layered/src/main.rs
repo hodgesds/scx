@@ -58,6 +58,7 @@ const USAGE_HALF_LIFE: u32 = bpf_intf::consts_USAGE_HALF_LIFE;
 const USAGE_HALF_LIFE_F64: f64 = USAGE_HALF_LIFE as f64 / 1_000_000_000.0;
 const NR_GSTATS: usize = bpf_intf::global_stat_idx_NR_GSTATS as usize;
 const NR_LSTATS: usize = bpf_intf::layer_stat_idx_NR_LSTATS as usize;
+const ENV_KEY_SIZE: usize = bpf_intf::consts_ENV_KEY_SIZE as usize;
 const NR_LAYER_MATCH_KINDS: usize = bpf_intf::layer_match_kind_NR_LAYER_MATCH_KINDS as usize;
 const CORE_CACHE_LEVEL: u32 = 2;
 
@@ -122,6 +123,9 @@ lazy_static::lazy_static! {
 ///
 /// - NiceEquals: Matches if the task's nice value is exactly equal to
 ///   the pattern.
+///
+/// - EnvEquals: Matches if the task's environment variable contains the 
+///   key.
 ///
 /// While there are complexity limitations as the matches are performed in
 /// BPF, it is straightforward to add more types of matches.
@@ -327,6 +331,7 @@ enum LayerMatch {
     NiceAbove(i32),
     NiceBelow(i32),
     NiceEquals(i32),
+    EnvEquals(String),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1189,6 +1194,10 @@ impl<'a, 'b> Scheduler<'a, 'b> {
                             mt.kind = bpf_intf::layer_match_kind_MATCH_NICE_EQUALS as i32;
                             mt.nice = *nice;
                         }
+                        LayerMatch::EnvEquals(env) => {
+                            mt.kind = bpf_intf::layer_match_kind_MATCH_ENV_EQUALS as i32;
+                            copy_into_cstr(&mut mt.env_var, env.as_str());
+                        }
                     }
                 }
                 layer.matches[or_i].nr_match_ands = or.len() as i32;
@@ -1906,17 +1915,22 @@ fn verify_layer_specs(specs: &[LayerSpec]) -> Result<()> {
                 match one {
                     LayerMatch::CgroupPrefix(prefix) => {
                         if prefix.len() > MAX_PATH {
-                            bail!("Spec {:?} has too long a cgroup prefix", spec.name);
+                            bail!("Spec {:?} has too long of a cgroup prefix", spec.name);
                         }
                     }
                     LayerMatch::CommPrefix(prefix) => {
                         if prefix.len() > MAX_COMM {
-                            bail!("Spec {:?} has too long a comm prefix", spec.name);
+                            bail!("Spec {:?} has too long of a comm prefix", spec.name);
                         }
                     }
                     LayerMatch::PcommPrefix(prefix) => {
                         if prefix.len() > MAX_COMM {
-                            bail!("Spec {:?} has too long a process name prefix", spec.name);
+                            bail!("Spec {:?} has too long of a process name prefix", spec.name);
+                        }
+                    }
+                    LayerMatch::EnvEquals(env) => {
+                        if env.len() > ENV_KEY_SIZE {
+                            bail!("Spec {:?} has too long of a enviornment variable", spec.name);
                         }
                     }
                     _ => {}

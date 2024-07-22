@@ -29,6 +29,12 @@ enum consts {
 	MAX_TASKS		= 131072,
 	MAX_PATH		= 4096,
 	MAX_COMM		= 16,
+	MAX_ENV_SIZE		= 8192,
+	ENV_KEY_SIZE		= 32,
+	ENV_VAL_SIZE		= 128,
+	ENV_SIZE_MASK		= 0x1fff,
+	ENV_KEY_SIZE_MASK	= 0x1f,
+	ENV_VAL_SIZE_MASK	= 0x7f,
 	MAX_LAYER_MATCH_ORS	= 32,
 	MAX_LAYERS		= 16,
 	USAGE_HALF_LIFE		= 100000000,	/* 100ms */
@@ -93,6 +99,7 @@ enum layer_match_kind {
 	MATCH_NICE_ABOVE,
 	MATCH_NICE_BELOW,
 	MATCH_NICE_EQUALS,
+	MATCH_ENV_EQUALS,
 
 	NR_LAYER_MATCH_KINDS,
 };
@@ -103,6 +110,7 @@ struct layer_match {
 	char		comm_prefix[MAX_COMM];
 	char		pcomm_prefix[MAX_COMM];
 	int		nice;
+	char		env_var[ENV_KEY_SIZE];
 };
 
 struct layer_match_ands {
