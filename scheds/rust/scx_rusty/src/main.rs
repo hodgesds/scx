@@ -207,6 +207,11 @@ struct Opts {
     /// Enable the Prometheus endpoint for metrics on port 9000.
     #[clap(long, action = clap::ArgAction::SetTrue)]
     enable_prometheus: bool,
+
+    /// Enables frequency scaling through uclamp. Requires a kernel built 
+    /// with CONFIG_UCLAMP_TASK enabled.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    enable_uclamp: bool,
 }
 
 fn read_total_cpu(reader: &procfs::ProcReader) -> Result<procfs::CpuStat> {
@@ -393,6 +398,7 @@ impl<'a> Scheduler<'a> {
         skel.rodata_mut().greedy_threshold_x_numa = opts.greedy_threshold_x_numa;
         skel.rodata_mut().direct_greedy_numa = opts.direct_greedy_numa;
         skel.rodata_mut().mempolicy_affinity = opts.mempolicy_affinity;
+        skel.rodata_mut().enable_uclamp = opts.enable_uclamp;
         skel.rodata_mut().debug = opts.verbose as u32;
 
         // Attach.

@@ -71,6 +71,7 @@ const volatile bool kthreads_local;
 const volatile bool fifo_sched;
 const volatile bool direct_greedy_numa;
 const volatile bool mempolicy_affinity;
+const volatile bool enable_uclamp;
 const volatile u32 greedy_threshold;
 const volatile u32 greedy_threshold_x_numa;
 const volatile u32 debug;
