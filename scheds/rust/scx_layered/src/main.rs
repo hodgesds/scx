@@ -886,12 +886,55 @@ impl CpuPool {
         }
     }
 
-    fn alloc_cpus<'a>(&'a mut self, cpus: &BitVec) -> Option<&'a BitVec> {
+    fn alloc_cpus<'a>(&'a mut self, cpus: &BitVec, layer_id: usize, num_layers: usize) -> Option<&'a BitVec> {
         let cores = self.cpus_to_cores(cpus).ok()?;
-        for core in cores.iter_ones() {
-            self.available_cores.set(core, false);
-            self.update_fallback_cpu();
-            return Some(&self.core_cpus[core]);
+        // TODO: This algorithm doesn't take into account layer sizes, open layers, and limits and assumes equal
+        // size layers.
+        //
+        // For layer core selection divide the number of cores  by the number of layers to get an
+        // offset. Use the offset as a starting point in the bitmask of cores. We want to select
+        // cores as far away from other layers as possible so even layers select from the start of
+        // the mask and grow upwards, and odd layers grow downwards.
+
+        let num_cores = cores.len();
+        let mut offset = (num_cores / num_layers) * layer_id;
+        let grow_up: bool = (layer_id & 1) == 0;
+        if !grow_up {
+            if layer_id == 1 {
+                // First layer starts at last core
+                offset = num_cores;
+            } else {
+                offset = num_cores - offset;
+            }
+        }
+        let mut core_idx = 0;
+
+        for idx in 0..num_cores - 1 {
+            if grow_up {
+                core_idx = offset + idx;
+                if core_idx >= num_cores {
+                    core_idx = core_idx - num_cores;
+                }
+            } else {
+                let offset_idx: isize = offset as isize - idx as isize;
+                if offset_idx < 0 {
+                    core_idx = (num_cores - core_idx) as usize;
+                } else {
+                    core_idx = offset_idx as usize;
+                }
+            }
+            info!("checking core {:?} for layer-{:?} with id {} offset {}", core_idx, layer_id, idx, offset);
+            match cores.get(core_idx) {
+                Some(core) => {
+                    if !*core {
+                        continue;
+                    }
+                    self.available_cores.set(core_idx, false);
+                    self.update_fallback_cpu();
+                    return Some(&self.core_cpus[core_idx]);
+                }
+                _ => continue,
+            }
         }
         None
     }
@@ -962,6 +1005,7 @@ impl CpuPool {
 struct Layer {
     name: String,
     kind: LayerKind,
+    id: usize,
 
     nr_cpus: usize,
     cpus: BitVec,
@@ -969,7 +1013,7 @@ struct Layer {
 }
 
 impl Layer {
-    fn new(cpu_pool: &CpuPool, name: &str, kind: LayerKind, topo: &Topology) -> Result<Self> {
+    fn new(cpu_pool: &CpuPool, name: &str, id: usize, kind: LayerKind, topo: &Topology) -> Result<Self> {
         let mut cpus = bitvec![0; cpu_pool.nr_cpus];
         cpus.fill(false);
         let mut allowed_cpus = bitvec![0; cpu_pool.nr_cpus];
@@ -1049,6 +1093,7 @@ impl Layer {
         Ok(Self {
             name: name.into(),
             kind,
+            id: id,
 
             nr_cpus: 0,
             cpus: cpus,
@@ -1059,6 +1104,7 @@ impl Layer {
     fn grow_confined_or_grouped(
         &mut self,
         cpu_pool: &mut CpuPool,
+        num_layers: usize,
         (cpus_min, cpus_max): (usize, usize),
         (_util_low, util_high): (f64, f64),
         (layer_load, total_load): (f64, f64),
@@ -1094,7 +1140,7 @@ impl Layer {
         }
 
         let available_cpus = cpu_pool.available_cpus_in_mask(&self.allowed_cpus);
-        let new_cpus = match cpu_pool.alloc_cpus(&available_cpus).clone() {
+        let new_cpus = match cpu_pool.alloc_cpus(&available_cpus, self.id, num_layers).clone() {
             Some(ret) => ret.clone(),
             None => {
                 trace!("layer-{} can't grow, no CPUs", &self.name);
@@ -1193,6 +1239,7 @@ impl Layer {
     fn resize_confined_or_grouped(
         &mut self,
         cpu_pool: &mut CpuPool,
+        num_layers: usize,
         cpus_range: Option<(usize, usize)>,
         util_range: (f64, f64),
         load: (f64, f64),
@@ -1204,6 +1251,7 @@ impl Layer {
 
         while self.grow_confined_or_grouped(
             cpu_pool,
+            num_layers,
             cpus_range,
             util_range,
             load,
@@ -1446,8 +1494,8 @@ impl<'a, 'b> Scheduler<'a, 'b> {
         let mut skel = scx_ops_load!(skel, layered, uei)?;
 
         let mut layers = vec![];
-        for spec in layer_specs.iter() {
-            layers.push(Layer::new(&cpu_pool, &spec.name, spec.kind.clone(), &topo)?);
+        for (i, spec) in layer_specs.iter().enumerate() {
+            layers.push(Layer::new(&cpu_pool, &spec.name, i, spec.kind.clone(), &topo)?);
         }
 
         // Other stuff.
@@ -1504,6 +1552,7 @@ impl<'a, 'b> Scheduler<'a, 'b> {
 
     fn refresh_cpumasks(&mut self) -> Result<()> {
         let mut updated = false;
+        let num_layers = self.layers.len();
 
         for idx in 0..self.layers.len() {
             match self.layers[idx].kind {
@@ -1527,6 +1576,7 @@ impl<'a, 'b> Scheduler<'a, 'b> {
                     );
                     if self.layers[idx].resize_confined_or_grouped(
                         &mut self.cpu_pool,
+                        num_layers,
                         cpus_range,
                         util_range,
                         load,
