@@ -58,6 +58,9 @@ static inline bool match_prefix(const char *prefix, const char *str, u32 max_len
 {
 	int c;
 
+	if (!prefix || !str || max_len > MAX_PATH)
+		return false;
+
 	bpf_for(c, 0, max_len) {
 		if (prefix[c] == '\0')
 			return true;
