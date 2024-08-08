@@ -986,18 +986,18 @@ static __noinline bool match_one(struct layer_match *match, struct task_struct *
 
 	switch (match->kind) {
 	case MATCH_CGROUP_PREFIX: {
-		return match_prefix(match->cgroup_prefix, cgrp_path, MAX_PATH) == 0;
+		return match_prefix(match->cgroup_prefix, cgrp_path, MAX_PATH);
 	}
 	case MATCH_COMM_PREFIX: {
 		char comm[MAX_COMM];
 		memcpy(comm, p->comm, MAX_COMM);
-		return match_prefix(match->comm_prefix, comm, MAX_COMM) == 0;
+		return match_prefix(match->comm_prefix, comm, MAX_COMM);
 	}
 	case MATCH_PCOMM_PREFIX: {
 		char pcomm[MAX_COMM];
 
 		memcpy(pcomm, p->group_leader->comm, MAX_COMM);
-		return match_prefix(match->pcomm_prefix, pcomm, MAX_COMM) == 0;
+		return match_prefix(match->pcomm_prefix, pcomm, MAX_COMM);
 	}
 	case MATCH_NICE_ABOVE:
 		return prio_to_nice((s32)p->static_prio) > match->nice;

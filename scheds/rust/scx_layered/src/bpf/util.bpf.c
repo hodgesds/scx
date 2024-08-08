@@ -54,21 +54,21 @@ static char *format_cgrp_path(struct cgroup *cgrp)
 	return path;
 }
 
-int match_prefix(const char *prefix, const char *str, u32 max_len)
+static bool match_prefix(const char *prefix, const char *str, u32 max_len)
 {
 	int c;
 	const char *p, *s;
 
 	if (!prefix || !str)
-		return -EINVAL;
+		return false;
 
 	bpf_for(c, 0, max_len) {
 		p = MEMBER_VPTR(prefix, [c]);
 		if (p == '\0')
-			return 0;
+			return true;
 		s = MEMBER_VPTR(str, [c]);
 		if (s != p)
-			return -ENOENT;
+			return false;
 	}
-	return -ENOENT;
+	return false;
 }
