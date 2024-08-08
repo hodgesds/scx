@@ -979,25 +979,25 @@ void BPF_STRUCT_OPS(layered_dispatch, s32 cpu, struct task_struct *prev)
 	scx_bpf_consume(LO_FALLBACK_DSQ);
 }
 
-static bool match_one(struct layer_match *match, struct task_struct *p, const char *cgrp_path)
+static __noinline bool match_one(struct layer_match *match, struct task_struct *p, const char *cgrp_path)
 {
 	bool result = false;
 	const struct cred *cred;
 
 	switch (match->kind) {
 	case MATCH_CGROUP_PREFIX: {
-		return match_prefix(match->cgroup_prefix, cgrp_path, MAX_PATH);
+		return match_prefix(match->cgroup_prefix, cgrp_path, MAX_PATH) == 0;
 	}
 	case MATCH_COMM_PREFIX: {
 		char comm[MAX_COMM];
 		memcpy(comm, p->comm, MAX_COMM);
-		return match_prefix(match->comm_prefix, comm, MAX_COMM);
+		return match_prefix(match->comm_prefix, comm, MAX_COMM) == 0;
 	}
 	case MATCH_PCOMM_PREFIX: {
 		char pcomm[MAX_COMM];
 
 		memcpy(pcomm, p->group_leader->comm, MAX_COMM);
-		return match_prefix(match->pcomm_prefix, pcomm, MAX_COMM);
+		return match_prefix(match->pcomm_prefix, pcomm, MAX_COMM) == 0;
 	}
 	case MATCH_NICE_ABOVE:
 		return prio_to_nice((s32)p->static_prio) > match->nice;
@@ -1020,7 +1020,6 @@ static bool match_one(struct layer_match *match, struct task_struct *p, const ch
 		bpf_rcu_read_unlock();
 		return result;
 	default:
-		// scx_bpf_error("invalid match kind %d", match->kind);
 		return result;
 	}
 }
