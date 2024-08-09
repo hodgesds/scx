@@ -102,6 +102,7 @@ struct node_ctx {
 
 enum layer_match_kind {
 	MATCH_CGROUP_PREFIX,
+	MATCH_CGROUP_GLOB,
 	MATCH_COMM_PREFIX,
 	MATCH_PCOMM_PREFIX,
 	MATCH_NICE_ABOVE,
@@ -119,6 +120,7 @@ enum layer_match_kind {
 struct layer_match {
 	int		kind;
 	char		cgroup_prefix[MAX_PATH];
+	char            cgroup_glob[MAX_PATH];
 	char		comm_prefix[MAX_COMM];
 	char		pcomm_prefix[MAX_COMM];
 	int		nice;

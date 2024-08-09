@@ -10,6 +10,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
+
 char _license[] SEC("license") = "GPL";
 
 const volatile u32 debug = 0;
@@ -38,6 +39,15 @@ static u32 preempt_cursor;
 #include "util.bpf.c"
 
 UEI_DEFINE(uei);
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARENA);
+	// __uint(map_flags, BPF_F_MMAPABLE);
+	__uint(max_entries, MAX_CPUS*2); /* number of pages */
+} arena SEC(".maps");
+
+#include <scx/bpf_arena_alloc.bpf.h>
+#include <scx/bpf_arena_strsearch.bpf.h>
 
 static inline bool vtime_before(u64 a, u64 b)
 {
@@ -989,6 +999,23 @@ static __noinline bool match_one(struct layer_match *match,
 	switch (match->kind) {
 	case MATCH_CGROUP_PREFIX: {
 		return match_prefix(match->cgroup_prefix, cgrp_path, MAX_PATH);
+	}
+	case MATCH_CGROUP_GLOB: {
+		// char __arena *cgrp_glob_arena = (char __arena*)bpf_alloc(MAX_PATH);
+		// char __arena *cgrp_path_arena = (char __arena*)bpf_alloc(MAX_PATH);
+		char __arena *cgrp_glob_arena;
+		char __arena *cgrp_path_arena;
+		cast_kern(cgrp_glob_arena);
+		cast_kern(cgrp_path_arena);
+	       	cgrp_glob_arena = (__arena void *)bpf_arena_alloc_pages(&arena, NULL, MAX_PATH, NUMA_NO_NODE, 0);
+		cgrp_path_arena = (__arena void *)bpf_arena_alloc_pages(&arena, NULL, MAX_PATH, NUMA_NO_NODE, 0);
+
+		arena_strcpy(cgrp_glob_arena, match->cgroup_glob);
+		arena_strcpy(cgrp_path_arena, cgrp_path);
+		result = glob_match(cgrp_glob_arena, cgrp_path_arena);
+		bpf_free(cgrp_glob_arena);
+		bpf_free(cgrp_path_arena);
+		return result;
 	}
 	case MATCH_COMM_PREFIX: {
 		char comm[MAX_COMM];

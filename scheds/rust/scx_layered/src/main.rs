@@ -187,6 +187,9 @@ lazy_static::lazy_static! {
 ///   which are under that particular cgroup while "TOP/CHILD" also matches
 ///   tasks under "TOP/CHILD0/" or "TOP/CHILD1/".
 ///
+/// - CgroupGlob: Glob matches on the cgroup that the task belongs
+///   to.
+///
 /// - CommPrefix: Matches the task's comm prefix.
 ///
 /// - PcommPrefix: Matches the task's thread group leader's comm prefix.
@@ -435,6 +438,7 @@ struct Opts {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum LayerMatch {
     CgroupPrefix(String),
+    CgroupGlob(String),
     CommPrefix(String),
     PcommPrefix(String),
     NiceAbove(i32),
@@ -1462,6 +1466,10 @@ impl<'a, 'b> Scheduler<'a, 'b> {
                             mt.kind = bpf_intf::layer_match_kind_MATCH_CGROUP_PREFIX as i32;
                             copy_into_cstr(&mut mt.cgroup_prefix, prefix.as_str());
                         }
+			LayerMatch::CgroupGlob(glob) => {
+			    mt.kind = bpf_intf::layer_match_kind_MATCH_CGROUP_GLOB as i32;
+			    copy_into_cstr(&mut mt.cgroup_glob, glob.as_str());
+			}
                         LayerMatch::CommPrefix(prefix) => {
                             mt.kind = bpf_intf::layer_match_kind_MATCH_COMM_PREFIX as i32;
                             copy_into_cstr(&mut mt.comm_prefix, prefix.as_str());
@@ -1942,6 +1950,11 @@ fn verify_layer_specs(specs: &[LayerSpec]) -> Result<()> {
                     LayerMatch::CgroupPrefix(prefix) => {
                         if prefix.len() > MAX_PATH {
                             bail!("Spec {:?} has too long a cgroup prefix", spec.name);
+                        }
+                    }
+                    LayerMatch::CgroupGlob(glob) => {
+                        if glob.len() > MAX_PATH {
+                            bail!("Spec {:?} has too long a cgroup glob", spec.name);
                         }
                     }
                     LayerMatch::CommPrefix(prefix) => {
