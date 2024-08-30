@@ -233,6 +233,23 @@ static struct cpumask *lookup_layer_cpumask(int idx)
 	}
 }
 
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, u32);
+	__type(value, int);
+	__uint(max_entries, MAX_GPU_PIDS);
+} gpu_pids SEC(".maps");
+
+static int *gpu_pid_cpu(u32 pid)
+{
+	int *cpu;
+
+	cpu = bpf_map_lookup_elem(&gpu_pids, &pid);
+
+	return cpu;
+}
+
+
 static void refresh_cpumasks(int idx)
 {
 	struct layer_cpumask_wrapper *cpumaskw;
@@ -997,6 +1014,28 @@ static __noinline bool match_one(struct layer_match *match,
 	}
 	case MATCH_PCOMM_PREFIX: {
 		char pcomm[MAX_COMM];
+
+		memcpy(pcomm, p->group_leader->comm, MAX_COMM);
+		return match_prefix(match->pcomm_prefix, pcomm, MAX_COMM);
+	}
+	case MATCH_GPU_COMM_PREFIX: {
+		int *gpu_pid_cpu;
+		char comm[MAX_COMM];
+
+		gpu_pid_cpu = gpu_pid_cpu(p->pid);
+		if (!gpu_pid_cpu || gpu_pid_cpu < 0 || gpu_pid_cpu > MAX_CPUS)
+			return false;
+
+		memcpy(comm, p->comm, MAX_COMM);
+		return match_prefix(match->comm_prefix, comm, MAX_COMM);
+	}
+	case MATCH_GPU_PCOMM_PREFIX: {
+		int *gpu_pid_cpu;
+		char pcomm[MAX_COMM];
+
+		gpu_pid_cpu = gpu_pid_cpu(p->pid);
+		if (!gpu_pid_cpu || gpu_pid_cpu < 0 || gpu_pid_cpu > MAX_CPUS)
+			return false;
 
 		memcpy(pcomm, p->group_leader->comm, MAX_COMM);
 		return match_prefix(match->pcomm_prefix, pcomm, MAX_COMM);

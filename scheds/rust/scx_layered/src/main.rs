@@ -210,6 +210,10 @@ lazy_static::lazy_static! {
 ///
 /// - TGIDEquals: Matches if the task's tgid matches the value.
 ///
+/// - GpuCommPrefix: Matches the task's comm prefix for a task on the GPU.
+///
+/// - GpuPcommPrefix: Matches the task's thread group leader's comm prefix on the GPU.
+///
 /// While there are complexity limitations as the matches are performed in
 /// BPF, it is straightforward to add more types of matches.
 ///
@@ -437,6 +441,8 @@ enum LayerMatch {
     CgroupPrefix(String),
     CommPrefix(String),
     PcommPrefix(String),
+    GpuCommPrefix(String),
+    GpuPcommPrefix(String),
     NiceAbove(i32),
     NiceBelow(i32),
     NiceEquals(i32),
@@ -1502,6 +1508,14 @@ impl<'a, 'b> Scheduler<'a, 'b> {
                             mt.kind = bpf_intf::layer_match_kind_MATCH_TGID_EQUALS as i32;
                             mt.tgid = *tgid;
                         }
+                        LayerMatch::GpuCommPrefix(prefix) => {
+                            mt.kind = bpf_intf::layer_match_kind_MATCH_COMM_PREFIX as i32;
+                            copy_into_cstr(&mut mt.gpu_comm_prefix, prefix.as_str());
+                        }
+                        LayerMatch::GpuPcommPrefix(prefix) => {
+                            mt.kind = bpf_intf::layer_match_kind_MATCH_GPU_PCOMM_PREFIX as i32;
+                            copy_into_cstr(&mut mt.gpu_pcomm_prefix, prefix.as_str());
+                        }
                     }
                 }
                 layer.matches[or_i].nr_match_ands = or.len() as i32;
@@ -1950,6 +1964,16 @@ fn verify_layer_specs(specs: &[LayerSpec]) -> Result<()> {
                         }
                     }
                     LayerMatch::PcommPrefix(prefix) => {
+                        if prefix.len() > MAX_COMM {
+                            bail!("Spec {:?} has too long a process name prefix", spec.name);
+                        }
+                    }
+                    LayerMatch::GpuCommPrefix(prefix) => {
+                        if prefix.len() > MAX_COMM {
+                            bail!("Spec {:?} has too long a comm prefix", spec.name);
+                        }
+                    }
+                    LayerMatch::GpuPcommPrefix(prefix) => {
                         if prefix.len() > MAX_COMM {
                             bail!("Spec {:?} has too long a process name prefix", spec.name);
                         }

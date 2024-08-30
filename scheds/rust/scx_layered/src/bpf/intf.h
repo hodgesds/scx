@@ -33,6 +33,7 @@ enum consts {
 	MAX_COMM		= 16,
 	MAX_LAYER_MATCH_ORS	= 32,
 	MAX_LAYERS		= 16,
+	MAX_GPU_PIDS		= 128,
 	USAGE_HALF_LIFE		= 100000000,	/* 100ms */
 
 	HI_FALLBACK_DSQ		= MAX_LAYERS * MAX_DOMS,
@@ -112,6 +113,8 @@ enum layer_match_kind {
 	MATCH_PID_EQUALS,
 	MATCH_PPID_EQUALS,
 	MATCH_TGID_EQUALS,
+	MATCH_GPU_COMM_PREFIX,
+	MATCH_GPU_PCOMM_PREFIX,
 
 	NR_LAYER_MATCH_KINDS,
 };
@@ -121,6 +124,8 @@ struct layer_match {
 	char		cgroup_prefix[MAX_PATH];
 	char		comm_prefix[MAX_COMM];
 	char		pcomm_prefix[MAX_COMM];
+	char		gpu_comm_prefix[MAX_COMM];
+	char		gpu_pcomm_prefix[MAX_COMM];
 	int		nice;
 	u32		user_id;
 	u32		group_id;
