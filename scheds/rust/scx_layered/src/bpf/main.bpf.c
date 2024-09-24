@@ -277,6 +277,8 @@ static void adj_load(u32 layer_idx, s64 adj, u64 now)
 
 struct layer_cpumask_wrapper {
 	struct bpf_cpumask __kptr *cpumask;
+	struct bpf_cpumask __kptr *llc_cpumasks[MAX_DOMS];
+	struct bpf_cpumask __kptr *node_cpumasks[MAX_NUMA_NODES];
 };
 
 struct {
@@ -301,6 +303,7 @@ static struct cpumask *lookup_layer_cpumask(int idx)
 
 static void refresh_cpumasks(int idx)
 {
+	struct cpu_ctx *cctx;
 	struct layer_cpumask_wrapper *cpumaskw;
 	struct layer *layer;
 	int cpu, total = 0;
@@ -320,7 +323,14 @@ static void refresh_cpumasks(int idx)
 			 * cpumaskw->cpumask might be NULL in the loop.
 			 */
 			barrier_var(cpumaskw);
-			if (!cpumaskw || !cpumaskw->cpumask) {
+			if (!cpumaskw || !cpumaskw->cpumask ||
+			    !(cctx = lookup_cpu_ctx(-1))) {
+				scx_bpf_error("can't happen");
+				return;
+			}
+
+			if (cctx->cache_idx > nr_llcs ||
+			    cctx->node_idx > nr_nodes) {
 				scx_bpf_error("can't happen");
 				return;
 			}
@@ -328,8 +338,16 @@ static void refresh_cpumasks(int idx)
 			if (*u8_ptr & (1 << (cpu % 8))) {
 				bpf_cpumask_set_cpu(cpu, cpumaskw->cpumask);
 				total++;
+				bpf_cpumask_set_cpu(cpu,
+						    cpumaskw->llc_cpumasks[cctx->cache_idx]);
+				bpf_cpumask_set_cpu(cpu,
+						    cpumaskw->node_cpumasks[cctx->node_idx]);
 			} else {
 				bpf_cpumask_clear_cpu(cpu, cpumaskw->cpumask);
+				bpf_cpumask_clear_cpu(cpu,
+						      cpumaskw->llc_cpumasks[cctx->cache_idx]);
+				bpf_cpumask_clear_cpu(cpu,
+						      cpumaskw->node_cpumasks[cctx->node_idx]);
 			}
 		} else {
 			scx_bpf_error("can't happen");
@@ -1863,6 +1881,8 @@ void BPF_STRUCT_OPS(layered_dump, struct scx_dump_ctx *dctx)
 s32 BPF_STRUCT_OPS_SLEEPABLE(layered_init)
 {
 	struct bpf_cpumask *cpumask;
+	struct cache_ctx *cachec;
+	struct node_ctx *nodec;
 	int i, j, k, nr_online_cpus, ret;
 
 	ret = scx_bpf_create_dsq(LO_FALLBACK_DSQ, -1);
@@ -2023,6 +2043,19 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(layered_init)
 				return ret;
 		} else {
 			bpf_for(j, 0, nr_llcs) {
+				if (!(cachec = lookup_cache_ctx(j)))
+					return -ENOENT;
+
+				cpumask = bpf_cpumask_create();
+				if (!cpumask)
+					return -ENOMEM;
+
+				bpf_cpumask_copy(cpumask, cachec->cpumask);
+
+				cpumask = bpf_kptr_xchg(&cpumaskw->llc_cpumasks[j], cpumask);
+				if (cpumask)
+					bpf_cpumask_release(cpumask);
+
 				int node_id = llc_node_id(i);
 				dbg("creating dsq %llu for layer %d on node %d",
 				    llc_dsq_id, i, node_id);
@@ -2030,6 +2063,20 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(layered_init)
 				if (ret < 0)
 					return ret;
 				llc_dsq_id++;
+			}
+			bpf_for(j, 0, nr_nodes) {
+				if (!(nodec = lookup_node_ctx(j)))
+					return -ENOENT;
+
+				cpumask = bpf_cpumask_create();
+				if (!cpumask)
+					return -ENOMEM;
+
+				bpf_cpumask_copy(cpumask, nodec->cpumask);
+
+				cpumask = bpf_kptr_xchg(&cpumaskw->node_cpumasks[j], cpumask);
+				if (cpumask)
+					bpf_cpumask_release(cpumask);
 			}
 		}
 	}
