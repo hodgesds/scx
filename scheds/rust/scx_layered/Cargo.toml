@@ -31,3 +31,4 @@ scx_utils = { path = "../../../rust/scx_utils", version = "1.0.4" }
 
 [features]
 enable_backtrace = []
+gpu-topology = ["scx_utils/gpu-topology"]
