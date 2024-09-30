@@ -22,6 +22,11 @@ use std::thread::ThreadId;
 use std::time::Duration;
 use std::time::Instant;
 
+#[cfg(feature = "gpu-topology")]
+use nvml_wrapper::Nvml;
+#[cfg(feature = "gpu-topology")]
+use nvml_wrapper::bitmasks::InitFlags;
+
 use ::fb_procfs as procfs;
 use anyhow::anyhow;
 use anyhow::bail;
@@ -424,6 +429,10 @@ struct Opts {
     /// Enable cross NUMA preemption.
     #[clap(long)]
     xnuma_preemption: bool,
+
+    /// Enable GPU topology.
+    #[clap(long)]
+    gpu_topology: bool,
 
     /// Write example layer specifications into the file and exit.
     #[clap(short = 'e', long)]
@@ -1670,6 +1679,11 @@ struct Scheduler<'a, 'b> {
     cpu_pool: CpuPool,
     layers: Vec<Layer>,
 
+    #[cfg(feature = "gpu-topology")]
+    gpu_topology: bool,
+    #[cfg(feature = "gpu-topology")]
+    nvml: Option<Nvml>,
+
     proc_reader: procfs::ProcReader,
     sched_stats: Stats,
 
@@ -1940,6 +1954,11 @@ impl<'a, 'b> Scheduler<'a, 'b> {
             cpu_pool,
             layers,
 
+            #[cfg(feature = "gpu-topology")]
+            gpu_topology: opts.gpu_topology,
+            #[cfg(feature = "gpu-topology")]
+            nvml: if opts.gpu_topology { Some(Nvml::init_with_flags(InitFlags::NO_GPUS)?) } else { None },
+
             sched_stats: Stats::new(&mut skel, &proc_reader)?,
 
             nr_layer_cpus_ranges: vec![(0, 0); nr_layers],
@@ -1965,6 +1984,17 @@ impl<'a, 'b> Scheduler<'a, 'b> {
             }
         }
         bpf_layer.refresh_cpus = 1;
+    }
+
+    #[cfg(feature = "gpu-topology")]
+    fn _update_gpumasks(&mut self) {
+    }
+
+    fn update_gpumasks(&mut self) {
+        if self.gpu_topology {
+            #[cfg(feature = "gpu-topology")]
+            self._update_gpumasks();
+        }
     }
 
     fn refresh_cpumasks(&mut self) -> Result<()> {

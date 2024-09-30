@@ -19,6 +19,7 @@ lazy_static = "1.4"
 libbpf-rs = "0.24.1"
 libc = "0.2.137"
 log = "0.4.17"
+nvml-wrapper = { version = "0.10.0", optional = true }
 scx_stats = { path = "../../../rust/scx_stats", version = "1.0.4" }
 scx_stats_derive = { path = "../../../rust/scx_stats/scx_stats_derive", version = "1.0.4" }
 scx_utils = { path = "../../../rust/scx_utils", version = "1.0.4" }
@@ -31,4 +32,4 @@ scx_utils = { path = "../../../rust/scx_utils", version = "1.0.4" }
 
 [features]
 enable_backtrace = []
-gpu-topology = ["scx_utils/gpu-topology"]
+gpu-topology = ["scx_utils/gpu-topology", "dep:nvml-wrapper"]

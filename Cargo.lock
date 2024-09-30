@@ -1724,6 +1724,7 @@ dependencies = [
  "libbpf-rs",
  "libc",
  "log",
+ "nvml-wrapper",
  "scx_stats",
  "scx_stats_derive",
  "scx_utils",
