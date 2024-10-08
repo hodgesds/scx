@@ -6,6 +6,15 @@ use nvml_wrapper::enum_wrappers::device::Clock;
 use nvml_wrapper::Nvml;
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+
+// global state if gpu pids are being monitored.
+static MONITORING_GPU_PIDS: AtomicBool = AtomicBool::new(false);
+
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialOrd, PartialEq)]
 pub enum GpuIndex {
@@ -76,4 +85,50 @@ pub fn create_gpus() -> BTreeMap<usize, Vec<Gpu>> {
     };
 
     gpus
+}
+
+fn update_monitor_pid_map(nvml: &Nvml) {
+    let nvidia_gpu_count = nvml.device_count().unwrap();
+    for i in 0..nvidia_gpu_count {
+        let Ok(nvidia_gpu) = nvml.device_by_index(i) else {
+            continue;
+        };
+        let Ok(compute_procs) = nvidia_gpu.running_compute_processes() else {
+            continue;
+        };
+    }
+    // TODO: iterate over the bpf map and remove any processes not in the compute processes and
+    // update any missing processes with appropriate metadata.
+}
+
+/// Monitors NVIDIA GPUs and updates the bpf mapping of tasks to GPU metadata.
+pub fn monitor_gpu_pids(interval: Duration, stop_flag: Arc<AtomicBool>) -> JoinHandle<()> {
+    // TODO: This function needs to be passed a reference to the gpu pid metadata map.
+    let handle = thread::spawn(move || {
+        let Ok(nvml) = Nvml::init_with_flags(InitFlags::NO_GPUS) else {
+            return;
+        };
+        let result = MONITORING_GPU_PIDS.compare_exchange(true, false, Ordering::Acquire, Ordering::Relaxed);
+        match result {
+            Ok(set) =>  {
+                if !set {
+                    // TODO: error handling
+                    return;
+                }
+            }
+            Err(_) => {
+                // TODO: error handling
+                return;
+            }
+        }
+        loop {
+            if stop_flag.load(Ordering::Relaxed) {
+                break;
+            }
+            thread::sleep(interval);
+            update_monitor_pid_map(&nvml);
+        }
+        MONITORING_GPU_PIDS.store(false, Ordering::Relaxed);
+    });
+    handle
 }
