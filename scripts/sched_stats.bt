@@ -1,0 +1,41 @@
+#!/usr/bin/env bpftrace
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+
+// This software may be used and distributed according to the terms of the
+// GNU General Public License version 2.
+
+rawtracepoint:sched_switch
+{
+	$task = (struct task_struct *)arg1;
+
+	if ($task->scx.dsq->id >= 0) {
+		@dsq_wait_max[$task->scx.dsq->id] = max($task->stats.wait_max);
+		@dsq_sleep_max[$task->scx.dsq->id] = max($task->stats.sleep_max);
+		@dsq_block_max[$task->scx.dsq->id] = max($task->stats.block_max);
+		@dsq_exec_max[$task->scx.dsq->id] = max($task->stats.exec_max);
+		@dsq_slice_max[$task->scx.dsq->id] = max($task->stats.slice_max);
+
+		@dsq_mig_cold[$task->scx.dsq->id] = hist($task->stats.nr_migrations_cold);
+		@dsq_wake[$task->scx.dsq->id] = hist($task->stats.nr_wakeups);
+		@dsq_wake_local[$task->scx.dsq->id] = hist($task->stats.nr_wakeups_local);
+		@dsq_wake_remote[$task->scx.dsq->id] = hist($task->stats.nr_wakeups_remote);
+		@dsq_wake_affine[$task->scx.dsq->id] = hist($task->stats.nr_wakeups_affine);
+		@dsq_wake_idle[$task->scx.dsq->id] = hist($task->stats.nr_wakeups_idle);
+	}
+}
+
+interval:s:1 {
+	if ($1 > 0) {
+		$scx_ops = kaddr("scx_ops");
+		$ops = (struct sched_ext_ops*)$scx_ops;
+		printf("scheduler: %s\n", $ops->name);
+	}
+	print(@dsq_wait_max);
+	print(@dsq_sleep_max);
+	print(@dsq_block_max);
+	print(@dsq_exec_max);
+	print(@dsq_slice_max);
+
+	print(@dsq_mig_cold);
+	print(@dsq_wake);
+}
