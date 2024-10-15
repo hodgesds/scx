@@ -40,6 +40,7 @@ const volatile u32 layer_iteration_order[MAX_LAYERS];
 
 private(all_cpumask) struct bpf_cpumask __kptr *all_cpumask;
 private(big_cpumask) struct bpf_cpumask __kptr *big_cpumask;
+private(big_cpumask) struct bpf_cpumask __kptr *allocated_cpumask;
 struct layer layers[MAX_LAYERS];
 u32 fallback_cpu;
 static u32 preempt_cursor;
@@ -335,9 +336,13 @@ static void refresh_cpumasks(int idx)
 
 			if (*u8_ptr & (1 << (cpu % 8))) {
 				bpf_cpumask_set_cpu(cpu, cpumaskw->cpumask);
+				if (allocated_cpumask)
+					bpf_cpumask_set_cpu(cpu, allocated_cpumask);
 				total++;
 			} else {
 				bpf_cpumask_clear_cpu(cpu, cpumaskw->cpumask);
+				if (allocated_cpumask)
+					bpf_cpumask_set_cpu(cpu, allocated_cpumask);
 			}
 		} else {
 			scx_bpf_error("can't happen");
@@ -1332,6 +1337,10 @@ void BPF_STRUCT_OPS(layered_dispatch, s32 cpu, struct task_struct *prev)
 	}
 
 	u32 my_llc_id = cpu_to_llc_id(cpu);
+	if (allocated_cpumask &&
+	    bpf_cpumask_weight(allocated_cpumask) == nr_possible_cpus) {
+		trace("XXX gotta keep em saturated");
+	}
 
 	/* consume preempting layers first */
 	bpf_for(idx, 0, nr_layers) {
@@ -1889,7 +1898,7 @@ void BPF_STRUCT_OPS(layered_set_cpumask, struct task_struct *p,
 	}
 
 	tctx->all_cpus_allowed =
-		bpf_cpumask_subset((const struct cpumask *)all_cpumask, cpumask);
+		bpf_cpumask_subset(cast_mask(all_cpumask), cpumask);
 }
 
 void BPF_STRUCT_OPS(layered_cpu_release, s32 cpu,
@@ -1934,7 +1943,7 @@ s32 BPF_STRUCT_OPS(layered_init_task, struct task_struct *p,
 
 	if (all_cpumask)
 		tctx->all_cpus_allowed =
-			bpf_cpumask_subset((const struct cpumask *)all_cpumask, p->cpus_ptr);
+			bpf_cpumask_subset(cast_mask(all_cpumask), p->cpus_ptr);
 	else
 		scx_bpf_error("missing all_cpumask");
 
@@ -2052,7 +2061,7 @@ void BPF_STRUCT_OPS(layered_dump, struct scx_dump_ctx *dctx)
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(layered_init)
 {
-	struct bpf_cpumask *cpumask, *tmp_big_cpumask;
+	struct bpf_cpumask *cpumask, *tmp_big_cpumask, *tmp_alloc_cpumask;
 	struct cpu_ctx *cctx;
 	int i, j, k, nr_online_cpus, ret;
 
@@ -2070,6 +2079,13 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(layered_init)
 		return -ENOMEM;
 	}
 
+	tmp_alloc_cpumask = bpf_cpumask_create();
+	if (!tmp_alloc_cpumask) {
+		bpf_cpumask_release(cpumask);
+		bpf_cpumask_release(tmp_big_cpumask);
+		return -ENOMEM;
+	}
+
 	nr_online_cpus = 0;
 	bpf_for(i, 0, nr_possible_cpus) {
 		const volatile u8 *u8_ptr;
@@ -2077,6 +2093,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(layered_init)
 		if (!(cctx = lookup_cpu_ctx(i))) {
 			bpf_cpumask_release(cpumask);
 			bpf_cpumask_release(tmp_big_cpumask);
+			bpf_cpumask_release(tmp_alloc_cpumask);
 			return -ENOMEM;
 		}
 		cctx->layer_idx = MAX_LAYERS;
@@ -2100,6 +2117,11 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(layered_init)
 	tmp_big_cpumask = bpf_kptr_xchg(&big_cpumask, tmp_big_cpumask);
 	if (tmp_big_cpumask)
 		bpf_cpumask_release(tmp_big_cpumask);
+
+	tmp_alloc_cpumask = bpf_kptr_xchg(&allocated_cpumask, tmp_alloc_cpumask);
+	if (tmp_alloc_cpumask)
+		bpf_cpumask_release(tmp_alloc_cpumask);
+
 
 	bpf_for(i, 0, nr_nodes) {
 		ret = create_node(i);
