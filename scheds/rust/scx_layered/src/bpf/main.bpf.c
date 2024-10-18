@@ -48,6 +48,7 @@ static u32 preempt_cursor;
 #define trace(fmt, args...)	do { if (debug > 1) bpf_printk(fmt, ##args); } while (0)
 
 #include "util.bpf.c"
+#include "token_bucket.bpf.c"
 
 UEI_DEFINE(uei);
 
