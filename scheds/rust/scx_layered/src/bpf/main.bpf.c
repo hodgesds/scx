@@ -38,6 +38,7 @@ const volatile s32 __sibling_cpu[MAX_CPUS];
 const volatile unsigned char all_cpus[MAX_CPUS_U8];
 const volatile u32 layer_iteration_order[MAX_LAYERS];
 
+
 private(all_cpumask) struct bpf_cpumask __kptr *all_cpumask;
 private(big_cpumask) struct bpf_cpumask __kptr *big_cpumask;
 struct layer layers[MAX_LAYERS];
@@ -157,6 +158,19 @@ static int llc_iter_cpu_offset(int idx, s32 cpu)
 static u64 cpu_hi_fallback_dsq_id(s32 cpu)
 {
 	return llc_hi_fallback_dsq_id(cpu_to_llc_id(cpu));
+}
+
+static u32 layer_cpu_bucket_id(u32 layer_idx, s32 cpu)
+{
+	u32 cur_cpu;
+
+	if (cpu < 0) {
+		cur_cpu = bpf_get_smp_processor_id();
+	} else {
+		cur_cpu = (u32)cpu;
+	}
+
+	return layer_idx * cur_cpu;
 }
 
 struct {
@@ -354,6 +368,7 @@ static bool refresh_cpumasks(int idx)
 	trace("LAYER[%d] now has %d cpus, seq=%llu", idx, layer->nr_cpus, layer->cpus_seq);
 	return total > 0;
 }
+
 
 SEC("fentry")
 int BPF_PROG(sched_tick_fentry)
@@ -2054,6 +2069,9 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(layered_init)
 	struct bpf_cpumask *cpumask, *tmp_big_cpumask;
 	struct cpu_ctx *cctx;
 	int i, j, k, nr_online_cpus, ret;
+	u32 bucket_id, layer_weight_sum = 0;
+	u64 bucket_capacity, bucket_rate;
+
 
 	ret = scx_bpf_create_dsq(LO_FALLBACK_DSQ, -1);
 	if (ret < 0)
@@ -2067,6 +2085,11 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(layered_init)
 	if (!tmp_big_cpumask) {
 		bpf_cpumask_release(cpumask);
 		return -ENOMEM;
+	}
+
+	bpf_for(j, 0, nr_layers) {
+		struct layer *layer = &layers[j];
+		layer_weight_sum += layer->weight;
 	}
 
 	nr_online_cpus = 0;
@@ -2089,6 +2112,16 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(layered_init)
 			}
 		} else {
 			return -EINVAL;
+		}
+
+		bpf_for(j, 0, nr_layers) {
+			struct layer *layer = &layers[j];
+			bucket_id = layer_cpu_bucket_id(layer->idx, i);
+			bucket_rate = ((layer_weight_sum * token_bucket_refresh_intvl_ns) / layer->slice_ns) / layer->weight;
+			bucket_capacity = bucket_rate * 10;
+			trace("initializing per cpu bucket rate: %llu capacity: %llu",
+			      bucket_rate, bucket_capacity);
+			initialize_cpu_bucket(i, (u32)layer->idx, bucket_capacity, bucket_rate);
 		}
 	}
 
@@ -2242,6 +2275,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(layered_init)
 			}
 		}
 	}
+
+	start_token_buckets(PER_CPU_REFRESH_TIMER);
 
 	return 0;
 }
