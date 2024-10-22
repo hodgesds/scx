@@ -1,0 +1,52 @@
+#!/usr/bin/env -S bpftrace --unsafe -q
+
+/*
+ * This test asserts that the affinty for the traced process increments over
+ * the number of cpus. For example traced pid <123> should call
+ * sched_setaffinity 0, 1, 2, 3 on a four core system.
+ */
+
+BEGIN
+{
+	@bpftrace_pid = pid;
+	@sig = 0;
+
+	if ($1 == 0) {
+		// exit 137
+		@sig = 9;
+	}
+	@last_cpu = -1;
+	print(("bpftrace monitoring pid", $1, "signal", @sig));
+}
+
+profile:hz:1
+{
+	@counts[cpu] = @counts[cpu] + 1;
+	if (@counts[cpu] == 15) {
+		// exit 0
+		@sig = 15;
+	}
+}
+
+rawtracepoint:sched_switch
+{
+	$task = (struct task_struct *)arg1;
+	if ($task->pid != $1) {
+		return;
+	}
+
+	if (@last_cpu > 0 && @last_cpu != cpu && @last_cpu - 1 != cpu) {
+		@sig = 9;
+	}
+	@last_cpu = cpu;
+}
+
+kprobe:__x64_sys_* / @bpftrace_pid == pid / {
+	if (@sig > 0) {
+		signal(@sig);
+	}
+}
+
+interval:s:1 {
+	print(("bpftrace monitoring pid", $1, "signal", @sig));
+}

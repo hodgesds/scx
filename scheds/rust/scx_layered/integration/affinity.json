@@ -1,0 +1,34 @@
+[
+  {
+    "name": "affinity",
+    "comment": "affinity",
+    "matches": [
+      [
+        {
+          "CommPrefix": "affinity_test"
+        }
+      ]
+    ],
+    "kind": {
+      "Confined": {
+        "util_range": [
+          0.4,
+          0.9
+        ]
+      }
+    }
+  },
+  {
+    "name": "reset",
+    "comment": "the rest",
+    "matches":[[]],
+    "kind": {
+      "Grouped": {
+        "util_range": [
+          0.05,
+          0.60
+        ]
+      }
+    }
+  }
+]
