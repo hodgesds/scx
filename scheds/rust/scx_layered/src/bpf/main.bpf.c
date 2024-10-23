@@ -50,7 +50,7 @@ static u32 preempt_cursor;
 #define trace(fmt, args...)	do { if (debug > 1) bpf_printk(fmt, ##args); } while (0)
 
 #include "util.bpf.c"
-
+#include "cost.bpf.c"
 
 UEI_DEFINE(uei);
 
@@ -2075,6 +2075,8 @@ static bool layered_monitor(void)
 static bool run_timer_cb(int key)
 {
 	switch (key) {
+	case LAYER_BUDGET_HANDLER:
+		return refresh_budgets();
 	case LAYERED_MONITOR:
 		return layered_monitor();
 	case NOOP_TIMER:
@@ -2085,6 +2087,7 @@ static bool run_timer_cb(int key)
 }
 
 struct layered_timer layered_timers[MAX_TIMERS] = {
+	{1LLU * NSEC_PER_SEC, CLOCK_BOOTTIME, 0},
 	{15LLU * NSEC_PER_SEC, CLOCK_BOOTTIME, 0},
 	{0LLU, CLOCK_BOOTTIME, 0},
 };
@@ -2286,7 +2289,9 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(layered_init)
 			}
 		}
 	}
-	start_layered_timers();
+	ret = start_layered_timers();
+	if (ret < 0)
+		return ret;
 
 	return 0;
 }
