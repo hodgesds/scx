@@ -254,7 +254,7 @@ int has_budget(struct cost *costc, struct layer *layer)
 		return 0;
 	}
 
-	s64 budget = *MEMBER_VPTR(*costc, .budget[layer_id]);
+	s64 budget = costc->budget[layer_id];
 	u64 layer_slice_ns = layer->slice_ns > 0 ? layer->slice_ns : slice_ns;
 
 	if (budget > layer_slice_ns)
