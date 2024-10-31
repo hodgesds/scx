@@ -15,6 +15,7 @@ struct cost {
 	u32		idx;
 	bool		overflow;
 	bool		has_parent;
+	bool		drain_fallback;
 };
 
 
@@ -217,6 +218,12 @@ static int record_cpu_cost(struct cost *costc, u32 layer_id, s64 amount)
 	__sync_fetch_and_sub(&costc->budget[layer_id], amount);
 
 	if (costc->budget[layer_id] <= 0) {
+		/*
+		 * If a layer has ran out of budget we set the flag to also
+		 * make sure to to drain any fallback dsqs since fallback dsqs
+		 * don't have weights.
+		 */
+		costc->drain_fallback = true;
 		if (costc->has_parent) {
 			s64 budget = acquire_budget(costc, layer_id,
 						    costc->capacity[layer_id] + amount);

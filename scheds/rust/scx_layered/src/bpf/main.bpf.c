@@ -1213,12 +1213,12 @@ void layered_dispatch_no_topo(s32 cpu, struct task_struct *prev)
 {
 	struct cpu_ctx *cctx, *sib_cctx;
 	struct layer *layer;
-	struct cost *cost;
+	struct cost *costc;
 	u64 dsq_id;
 	u32 idx, layer_idx;
 	s32 sib = sibling_cpu(cpu);
 
-	if (!(cctx = lookup_cpu_ctx(-1)) || !(cost = lookup_cpu_cost(cpu)))
+	if (!(cctx = lookup_cpu_ctx(-1)) || !(costc = lookup_cpu_cost(cpu)))
 		return;
 
 	/*
@@ -1247,15 +1247,25 @@ void layered_dispatch_no_topo(s32 cpu, struct task_struct *prev)
 		return;
 	}
 
+	if (costc->drain_fallback) {
+		dsq_id = cpu_hi_fallback_dsq_id(cpu);
+		if (scx_bpf_consume(dsq_id)) {
+			costc->drain_fallback = false;
+			return;
+		}
+		scx_bpf_consume(LO_FALLBACK_DSQ);
+		costc->drain_fallback = false;
+	}
+
 	/* consume preempting layers first */
 	bpf_for(idx, 0, nr_layers) {
-		layer_idx = rotate_layer_id(cost->pref_layer, idx);
+		layer_idx = rotate_layer_id(costc->pref_layer, idx);
 		if (layer_idx >= nr_layers) {
 			scx_bpf_error("can't happen");
 			return;
 		}
 		layer = MEMBER_VPTR(layers, [layer_idx]);
-		if (has_budget(cost, layer) == 0)
+		if (has_budget(costc, layer) == 0)
 			continue;
 		if (layer->preempt && scx_bpf_consume(layer_idx))
 			return;
@@ -1267,13 +1277,13 @@ void layered_dispatch_no_topo(s32 cpu, struct task_struct *prev)
 
 	/* consume !open layers second */
 	bpf_for(idx, 0, nr_layers) {
-		layer_idx = rotate_layer_id(cost->pref_layer, idx);
+		layer_idx = rotate_layer_id(costc->pref_layer, idx);
 		if (layer_idx >= nr_layers) {
 			scx_bpf_error("can't happen");
 			return;
 		}
 		layer = MEMBER_VPTR(layers, [layer_idx]);
-		if (has_budget(cost, layer) == 0)
+		if (has_budget(costc, layer) == 0)
 			continue;
 		struct cpumask *layer_cpumask;
 
@@ -1290,13 +1300,13 @@ void layered_dispatch_no_topo(s32 cpu, struct task_struct *prev)
 
 	/* consume !preempting open layers */
 	bpf_for(idx, 0, nr_layers) {
-		layer_idx = rotate_layer_id(cost->pref_layer, idx);
+		layer_idx = rotate_layer_id(costc->pref_layer, idx);
 		if (layer_idx >= nr_layers) {
 			scx_bpf_error("can't happen");
 			return;
 		}
 		layer = MEMBER_VPTR(layers, [layer_idx]);
-		if (has_budget(cost, layer) == 0)
+		if (has_budget(costc, layer) == 0)
 			continue;
 		if (!layer->preempt && layers->open &&
 		    scx_bpf_consume(layer_idx))
@@ -1442,6 +1452,16 @@ void BPF_STRUCT_OPS(layered_dispatch, s32 cpu, struct task_struct *prev)
 	    sib_cctx->current_exclusive) {
 		gstat_inc(GSTAT_EXCL_IDLE, cctx);
 		return;
+	}
+
+	if (costc->drain_fallback) {
+		dsq_id = cpu_hi_fallback_dsq_id(cpu);
+		if (scx_bpf_consume(dsq_id)) {
+			costc->drain_fallback = false;
+			return;
+		}
+		scx_bpf_consume(LO_FALLBACK_DSQ);
+		costc->drain_fallback = false;
 	}
 
 	u32 my_llc_id = cpu_to_llc_id(cpu);
