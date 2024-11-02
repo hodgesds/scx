@@ -425,6 +425,10 @@ struct Opts {
     #[clap(long)]
     xnuma_preemption: bool,
 
+    /// Dispatch to local LLCs first
+    #[clap(long)]
+    dispatch_local_llc: bool,
+
     /// Disable monitor
     #[clap(long)]
     monitor_disable: bool,
@@ -1489,6 +1493,7 @@ impl<'a> Scheduler<'a> {
         skel.maps.rodata_data.has_little_cores = topo.has_little_cores();
         skel.maps.rodata_data.disable_topology = disable_topology;
         skel.maps.rodata_data.xnuma_preemption = opts.xnuma_preemption;
+        skel.maps.rodata_data.dispatch_local_llc = opts.dispatch_local_llc;
         if opts.monitor_disable {
             skel.maps.rodata_data.monitor_disable = opts.monitor_disable;
         }
