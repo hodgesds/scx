@@ -122,7 +122,8 @@ static struct cost *initialize_cost(u32 cost_idx, u32 parent_idx,
 /*
  * Initializes a budget.
  */
-static void initialize_budget(struct cost *costc, u32 budget_id, s64 capacity)
+static __noinline void initialize_budget(struct cost *costc, u32 budget_id,
+					 s64 capacity)
 {
 	if (budget_id >= MAX_GLOBAL_BUDGETS) {
 		scx_bpf_error("invalid budget id %d", budget_id);
@@ -338,7 +339,7 @@ static void initialize_budgets(u64 refresh_intvl_ns)
 			return;
 		}
 
-		layer_weight_dur = (layer->weight * ((u64)refresh_intvl_ns * slice_ns * nr_possible_cpus)) /
+		layer_weight_dur = (layer->weight * ((u64)refresh_intvl_ns)) /
 				    layer_weight_sum;
 		initialize_budget(global_costc, layer_id, (s64)layer_weight_dur);
 		trace("COST GLOBAL[%d][%s] budget %lld",
@@ -353,7 +354,7 @@ static void initialize_budgets(u64 refresh_intvl_ns)
 				scx_bpf_error("failed to cpu budget: %d", cpu);
 				return;
 			}
-			layer_weight_dur = (layer->weight * slice_ns * refresh_intvl_ns) /
+			layer_weight_dur = (layer->weight * refresh_intvl_ns) /
 					    layer_weight_sum;
 			initialize_budget(costc, layer_id, (s64)layer_weight_dur);
 			if (cpu == 0)
@@ -366,7 +367,7 @@ static void initialize_budgets(u64 refresh_intvl_ns)
 	 * XXX: since any task from any layer can get kicked to the fallback
 	 * DSQ we use the default slice to calculate the default budget.
 	 */
-	layer_weight_dur = (LO_FALLBACK_DSQ_WEIGHT * slice_ns * refresh_intvl_ns * nr_possible_cpus) /
+	layer_weight_dur = (LO_FALLBACK_DSQ_WEIGHT * slice_ns * refresh_intvl_ns) /
 			    layer_weight_sum;
 	initialize_budget(global_costc, fallback_dsq_cost_id(LO_FALLBACK_DSQ),
 			  (s64)layer_weight_dur);
@@ -375,7 +376,7 @@ static void initialize_budgets(u64 refresh_intvl_ns)
 		dsq_id = llc_hi_fallback_dsq_id(llc_id);
 		budget_id = fallback_dsq_cost_id(dsq_id);
 
-		layer_weight_dur = (HI_FALLBACK_DSQ_WEIGHT * slice_ns * refresh_intvl_ns * nr_possible_cpus) /
+		layer_weight_dur = (HI_FALLBACK_DSQ_WEIGHT * slice_ns * refresh_intvl_ns) /
 				    layer_weight_sum;
 		initialize_budget(global_costc, budget_id, (s64)layer_weight_dur);
 
@@ -389,13 +390,13 @@ static void initialize_budgets(u64 refresh_intvl_ns)
 			// On first iteration always setup the lo fallback dsq budget.
 			if (llc_id == 0) {
 				budget_id = fallback_dsq_cost_id(LO_FALLBACK_DSQ);
-				layer_weight_dur = (LO_FALLBACK_DSQ_WEIGHT * slice_ns * refresh_intvl_ns) /
+				layer_weight_dur = (LO_FALLBACK_DSQ_WEIGHT * refresh_intvl_ns) /
 						    layer_weight_sum;
 				initialize_budget(costc, budget_id,
 						  (s64)layer_weight_dur);
 			}
 
-			layer_weight_dur = (HI_FALLBACK_DSQ_WEIGHT * slice_ns * refresh_intvl_ns) /
+			layer_weight_dur = (HI_FALLBACK_DSQ_WEIGHT * refresh_intvl_ns) /
 					    layer_weight_sum;
 			initialize_budget(costc, budget_id, (s64)layer_weight_dur);
 			if (cpu == 0 && llc_id == 0 && budget_id < MAX_GLOBAL_BUDGETS)
