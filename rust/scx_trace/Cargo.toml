@@ -1,0 +1,18 @@
+[package]
+name = "scx_trace"
+version = "1.0.7"
+edition = "2021"
+authors = ["Daniel Hodges <hodges.daniel.scott@gmail.com>"]
+license = "GPL-2.0-only"
+repository = "https://github.com/sched-ext/scx"
+description = "Tracing for sched_ext schedulers"
+
+[dependencies]
+protobuf = "3.7.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+scx_utils = { path = "../scx_utils", version = "1.0.7" }
+
+[build-dependencies]
+protobuf-codegen = "3.7.1"
+scx_utils = { path = "../scx_utils", version = "1.0.7" }
