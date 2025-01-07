@@ -3,6 +3,7 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2.
 
+use rand::Rng;
 use ratatui::style::{Color, Style};
 use serde::{Deserialize, Serialize};
 
@@ -15,6 +16,15 @@ pub enum AppTheme {
     MidnightGreen,
     /// IAmBlue
     IAmBlue,
+    // Random colors
+    Random,
+}
+
+/// Returns a random Color.
+fn rand_color() -> Color {
+    let mut rng = rand::thread_rng();
+    let rand_n: u8 = rng.gen_range(0..=255);
+    Color::Indexed(rand_n)
 }
 
 impl AppTheme {
@@ -24,6 +34,7 @@ impl AppTheme {
             AppTheme::MidnightGreen => Color::Green,
             AppTheme::IAmBlue => Color::Blue,
             AppTheme::Default => Color::White,
+            AppTheme::Random => rand_color(),
         }
     }
 
@@ -32,6 +43,7 @@ impl AppTheme {
         match self {
             AppTheme::MidnightGreen => Style::default().fg(Color::White),
             AppTheme::IAmBlue => Style::default().fg(Color::Blue),
+            AppTheme::Random => Style::default().fg(rand_color()),
             AppTheme::Default => Style::default().fg(Color::Green),
         }
     }
@@ -41,6 +53,7 @@ impl AppTheme {
         match self {
             AppTheme::MidnightGreen => Style::default().fg(Color::Green),
             AppTheme::IAmBlue => Style::default().fg(Color::Cyan),
+            AppTheme::Random => Style::default().fg(rand_color()),
             AppTheme::Default => Style::default().fg(Color::White),
         }
     }
@@ -50,6 +63,7 @@ impl AppTheme {
         match self {
             AppTheme::MidnightGreen => Color::Green,
             AppTheme::IAmBlue => Color::Blue,
+            AppTheme::Random => rand_color(),
             AppTheme::Default => Color::Green,
         }
     }
@@ -59,6 +73,7 @@ impl AppTheme {
         match self {
             AppTheme::MidnightGreen => Color::Green,
             AppTheme::IAmBlue => Color::Red,
+            AppTheme::Random => rand_color(),
             AppTheme::Default => Color::Red,
         }
     }
@@ -68,6 +83,7 @@ impl AppTheme {
         match self {
             AppTheme::MidnightGreen => Color::Red,
             AppTheme::IAmBlue => Color::White,
+            AppTheme::Random => rand_color(),
             AppTheme::Default => Color::Red,
         }
     }
@@ -77,6 +93,7 @@ impl AppTheme {
         match self {
             AppTheme::MidnightGreen => Style::default().fg(Color::Green),
             AppTheme::IAmBlue => Style::default().fg(Color::Blue),
+            AppTheme::Random => Style::default().fg(rand_color()),
             AppTheme::Default => Style::default().fg(Color::Yellow),
         }
     }
@@ -86,6 +103,7 @@ impl AppTheme {
         match self {
             AppTheme::Default => AppTheme::MidnightGreen,
             AppTheme::MidnightGreen => AppTheme::IAmBlue,
+            AppTheme::IAmBlue => AppTheme::Random,
             _ => AppTheme::Default,
         }
     }
