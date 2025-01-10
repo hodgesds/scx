@@ -7,6 +7,7 @@ use anyhow::Result;
 use clap::Parser;
 use libbpf_rs::skel::OpenSkel;
 use libbpf_rs::skel::SkelBuilder;
+use libbpf_rs::ProgramInput;
 use libbpf_rs::RingBufferBuilder;
 use scxtop::bpf_intf::*;
 use scxtop::bpf_skel::types::bpf_event;
@@ -67,7 +68,14 @@ async fn run() -> Result<()> {
         builder.obj_builder.debug(true);
     }
     let open_skel = builder.open(&mut open_object)?;
-    let skel = open_skel.load()?;
+    let mut skel = open_skel.load()?;
+
+    // Alloc arenas
+    let input = ProgramInput {
+        ..Default::default()
+    };
+    let prog = &mut skel.progs.alloc_arenas;
+    let _ = prog.test_run(input);
 
     let mut links = Vec::new();
     // Attach probes

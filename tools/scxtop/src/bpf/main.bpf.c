@@ -9,8 +9,10 @@
 #endif
 #define LSP_INC
 #include "../../../include/scx/common.bpf.h"
+#include "../../../include/scx/sdt_task.h"
 #else
 #include <scx/common.bpf.h>
+#include <lib/sdt_task.h>
 #endif
 
 #include "intf.h"
@@ -27,6 +29,20 @@ struct bpf_event _event = {0};
 bool enable_bpf_events = true;
 u32 sample_rate = 128;
 
+
+struct timer_wrapper {
+	struct bpf_timer timer;
+	u64	tptr;
+	s32	pid;
+	int	key;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, MAX_TIMERS);
+	__type(key, int);
+	__type(value, struct timer_wrapper);
+} scxtop_timers SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -48,6 +64,54 @@ struct {
 	__uint(map_flags, 0);
 } task_data SEC(".maps");
 
+static void alloc_task_ctx_cb(void *map, int key, struct timer_wrapper *timerw)
+{
+	struct task_struct *p, *p_map;
+	struct task_ctx *tctx;
+
+	p = bpf_task_from_pid(timerw->pid);
+	if (!p)
+		return;
+
+	/*
+	 * XXX Passing a trusted pointer as a key to the map turns it into a
+	 * scalar for the verifier, preventing us from using it further. Make
+	 * a temporary copy of our struct task_struct to pass it to the map.
+	 */
+	p_map = p;
+
+	tctx = (struct task_ctx*)sdt_task_alloc(p_map);
+	if (!tctx)
+		sdt_task_free(p_map);
+	bpf_task_release(p);
+}
+
+SEC("iter.s/task")
+int BPF_PROG(alloc_arenas)
+{
+	struct timer_wrapper *timerw;
+	int err;
+
+	err = sdt_task_init(sizeof(struct task_ctx));
+	sdt_arena_verify();
+
+	int key = ALLOC_TASK_CTX;
+	timerw = bpf_map_lookup_elem(&scxtop_timers, &key);
+	if (!timerw)
+		return 0;
+
+	err = bpf_timer_init(&timerw->timer,
+			     &scxtop_timers,
+			     CLOCK_BOOTTIME);
+	if (err < 0)
+		return 0;
+
+	err = bpf_timer_set_callback(&timerw->timer, alloc_task_ctx_cb);
+	if (err < 0)
+		return 0;
+
+	return 0;
+}
 
 static __always_inline u64 t_to_tptr(struct task_struct *p)
 {
@@ -63,29 +127,25 @@ static __always_inline u64 t_to_tptr(struct task_struct *p)
 
 static struct task_ctx *try_lookup_task_ctx(struct task_struct *p)
 {
-	struct task_ctx *tctx;
-	u64 tptr;
+ 	struct task_ctx *tctx;
 
 	if (!p)
 		return NULL;
 
-	tptr = t_to_tptr(p);
-	if (tptr == 0)
-		return NULL;
-
-	tctx = bpf_map_lookup_elem(&task_data, &tptr);
+	tctx = (struct task_ctx*)sdt_task_data(p);
 	if (!tctx) {
-		struct task_ctx new_tctx;
-		new_tctx.dsq_id = 0;
-		new_tctx.dsq_vtime = 0;
-		new_tctx.slice_ns = 0;
-		new_tctx.last_run_ns = 0;
+		struct timer_wrapper *timerw;
+		int key = ALLOC_TASK_CTX;
 
-		if (!bpf_map_update_elem(&task_data, &tptr, &new_tctx, BPF_ANY))
+		timerw = bpf_map_lookup_elem(&scxtop_timers, &key);
+		if (!timerw)
 			return NULL;
 
-		tctx = bpf_map_lookup_elem(&task_data, &tptr);
+		timerw->tptr = t_to_tptr(p);
+		timerw->pid = p->pid;
+		bpf_timer_start(&timerw->timer, 0, 0);
 	}
+
 	return tctx;
 }
 

@@ -13,6 +13,16 @@ typedef unsigned long long u64;
 #endif
 #include <stdbool.h>
 
+enum scxtop_consts {
+	// kernel definitions
+	CLOCK_BOOTTIME		= 7,
+};
+
+enum scxtop_timer_callbacks {
+	ALLOC_TASK_CTX,
+	MAX_TIMERS,
+};
+
 enum event_type {
 	CPU_PERF_SET,
 	SCHED_REG,
