@@ -43,6 +43,7 @@ impl Default for KeyMap {
         bindings.insert(Key::Char('u'), Action::ToggleUncoreFreq);
         bindings.insert(Key::Char('L'), Action::ToggleLocalization);
         bindings.insert(Key::Char('P'), Action::ToggleHwPressure);
+        bindings.insert(Key::Char('p'), Action::TogglePower);
         bindings.insert(Key::Char('h'), Action::SetState(AppState::Help));
         bindings.insert(Key::Char('?'), Action::SetState(AppState::Help));
         bindings.insert(Key::Char('l'), Action::SetState(AppState::Llc));

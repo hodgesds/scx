@@ -10,6 +10,7 @@ use crate::bpf_stats::BpfStats;
 use crate::config::get_config_path;
 use crate::config::Config;
 use crate::format_hz;
+use crate::msr::{read_msr, PowerUnit, MSR_AMD_RAPL_POWER_UNIT, MSR_PKG_ENERGY_STATUS};
 use crate::read_file_string;
 use crate::AppState;
 use crate::AppTheme;
@@ -34,6 +35,7 @@ use anyhow::Result;
 use glob::glob;
 use libbpf_rs::Link;
 use libbpf_rs::ProgramInput;
+use libc::{self, sched_getcpu};
 use num_format::{SystemLocale, ToFormattedString};
 use protobuf::Message;
 use ratatui::prelude::Constraint;
@@ -88,6 +90,8 @@ pub struct App<'a> {
     large_core_count: bool,
     collect_cpu_freq: bool,
     collect_uncore_freq: bool,
+    collect_power: bool,
+    power_unit: PowerUnit,
     event_scroll_state: ScrollbarState,
     event_scroll: u16,
 
@@ -218,6 +222,8 @@ impl<'a> App<'a> {
             topo,
             collect_cpu_freq: true,
             collect_uncore_freq: true,
+            collect_power: true,
+            power_unit: PowerUnit::default()?,
             cpu_data,
             llc_data,
             node_data,
@@ -436,6 +442,10 @@ impl<'a> App<'a> {
         Ok(())
     }
 
+    fn read_pkg_power(&self, cpu: i32) -> Result<u64> {
+        Ok(read_msr(cpu, MSR_PKG_ENERGY_STATUS.into())?)
+    }
+
     /// Runs callbacks to update application state on tick.
     fn on_tick(&mut self) -> Result<()> {
         // always grab updated stats
@@ -462,12 +472,19 @@ impl<'a> App<'a> {
             });
         };
         // Add entry for nodes
-        for node in self.topo.nodes.keys() {
+        for (node_id, node) in &self.topo.nodes {
             let node_data = self
                 .node_data
-                .entry(*node)
-                .or_insert(NodeData::new(*node, self.max_cpu_events));
+                .entry(*node_id)
+                .or_insert(NodeData::new(node.id, self.max_cpu_events));
             node_data.add_event_data(self.active_event.event_name(), 0);
+            if self.collect_power {
+                // TODO: this probably shouldn't use the same CPU.
+                let cpu = node.all_cpus.keys().next().cloned().unwrap();
+                // let node_power = self.read_pkg_power(cpu as i32)?;
+                let node_power = read_msr(cpu as i32, MSR_AMD_RAPL_POWER_UNIT)?;
+                node_data.add_event_data("power", node_power);
+            }
         }
         // Add entry for llcs
         for llc in self.topo.all_llcs.keys() {
@@ -1566,6 +1583,27 @@ impl<'a> App<'a> {
                             .style(self.theme().text_important_color())
                             .left_aligned(),
                         )
+                        .title_bottom(
+                            Line::from(format!(
+                                "power {}",
+                                if self.collect_power {
+                                    format!(
+                                        "{}",
+                                        self.node_data
+                                            .get(&node.id)
+                                            .unwrap()
+                                            .event_data_immut("power")
+                                            .last()
+                                            .copied()
+                                            .unwrap_or(0_u64)
+                                    )
+                                } else {
+                                    "".to_string()
+                                }
+                            ))
+                            .style(self.theme().text_important_color())
+                            .left_aligned(),
+                        )
                         .border_type(BorderType::Rounded)
                         .style(self.theme().border_style());
 
@@ -1684,6 +1722,27 @@ impl<'a> App<'a> {
                             } else {
                                 "".to_string()
                             })
+                            .style(self.theme().text_important_color())
+                            .left_aligned(),
+                        )
+                        .title_bottom(
+                            Line::from(format!(
+                                "power {}",
+                                if self.collect_power {
+                                    format!(
+                                        "{}",
+                                        self.node_data
+                                            .get(&node.id)
+                                            .unwrap()
+                                            .event_data_immut("power")
+                                            .last()
+                                            .copied()
+                                            .unwrap_or(0_u64)
+                                    )
+                                } else {
+                                    "".to_string()
+                                }
+                            ))
                             .style(self.theme().text_important_color())
                             .left_aligned(),
                         )
@@ -1850,6 +1909,16 @@ impl<'a> App<'a> {
                         .active_keymap
                         .action_keys_string(Action::ToggleUncoreFreq),
                     self.collect_uncore_freq
+                ),
+                Style::default(),
+            )),
+            Line::from(Span::styled(
+                format!(
+                    "{}: Enable power info ({})",
+                    self.config
+                        .active_keymap
+                        .action_keys_string(Action::TogglePower),
+                    self.collect_power
                 ),
                 Style::default(),
             )),
@@ -2530,6 +2599,7 @@ impl<'a> App<'a> {
             Action::ToggleUncoreFreq => self.collect_uncore_freq = !self.collect_uncore_freq,
             Action::ToggleLocalization => self.localize = !self.localize,
             Action::ToggleHwPressure => self.hw_pressure = !self.hw_pressure,
+            Action::TogglePower => self.collect_power = !self.collect_power,
             Action::IncBpfSampleRate => {
                 let sample_rate = self.skel.maps.data_data.sample_rate;
                 if sample_rate == 0 {

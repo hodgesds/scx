@@ -14,6 +14,7 @@ pub mod edm;
 mod event_data;
 mod keymap;
 mod llc_data;
+pub mod msr;
 mod node_data;
 mod perf_event;
 mod perfetto_trace;
@@ -273,6 +274,7 @@ pub enum Action {
     ToggleLocalization,
     ToggleHwPressure,
     ToggleUncoreFreq,
+    TogglePower,
     Up,
     None,
 }
