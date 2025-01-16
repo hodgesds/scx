@@ -10,6 +10,7 @@ mod cpu_data;
 mod event_data;
 mod keymap;
 mod llc_data;
+pub mod msr;
 mod node_data;
 mod perf_event;
 mod perfetto_trace;
@@ -163,6 +164,7 @@ pub enum Action {
     NextViewState,
     RecordTrace,
     ToggleCpuFreq,
+    TogglePower,
     ToggleUncoreFreq,
     TickRateChange {
         tick_rate_ms: u64,

@@ -6,6 +6,7 @@
 use crate::available_perf_events;
 use crate::bpf_skel::BpfSkel;
 use crate::format_hz;
+use crate::msr::{read_msr, PowerUnit, MSR_PKG_ENERGY_STATUS};
 use crate::read_file_string;
 use crate::Action;
 use crate::AppState;
@@ -26,6 +27,7 @@ use crate::SCHED_NAME_PATH;
 use anyhow::Result;
 use glob::glob;
 use protobuf::Message;
+use libc::{self, sched_getcpu};
 use ratatui::prelude::Constraint;
 use ratatui::{
     layout::{Alignment, Direction, Layout, Rect},
@@ -78,6 +80,8 @@ pub struct App<'a> {
     large_core_count: bool,
     collect_cpu_freq: bool,
     collect_uncore_freq: bool,
+    collect_power: bool,
+    power_unit: PowerUnit,
     event_scroll_state: ScrollbarState,
     event_scroll: u16,
 
@@ -191,6 +195,8 @@ impl<'a> App<'a> {
             topo,
             collect_cpu_freq: true,
             collect_uncore_freq: true,
+            collect_power: true,
+            power_unit: PowerUnit::default()?,
             cpu_data,
             llc_data,
             node_data,
@@ -390,6 +396,15 @@ impl<'a> App<'a> {
     /// Handles when scheduler stats are received.
     fn on_sched_stats(&mut self, stats_raw: String) {
         self.sched_stats_raw = stats_raw;
+
+    fn read_pkg_power(&self, cpu: i32) -> Result<u64> {
+        // https://github.com/amd/amd_energy
+        // unsafe {
+        //     let cpu = sched_getcpu();
+        // }
+        //
+        // let offset = MSR_PKG_ENERGY_STATUS.into();
+        Ok(read_msr(cpu, MSR_PKG_ENERGY_STATUS.into())?)
     }
 
     /// Runs callbacks to update application state on tick.
@@ -436,12 +451,19 @@ impl<'a> App<'a> {
             _ => {}
         }
         // Add entry for nodes
-        for node in self.topo.nodes.keys() {
+        for (node_id, node) in &self.topo.nodes {
             let node_data = self
                 .node_data
-                .entry(*node)
-                .or_insert(NodeData::new(*node, self.max_cpu_events));
+                .entry(*node_id)
+                .or_insert(NodeData::new(*node_id, self.max_cpu_events));
             node_data.add_event_data(self.active_event.event.clone(), 0);
+            if !self.collect_power {
+                continue;
+            }
+            // let cpu = node.all_cpus.keys().next().unwrap();
+            // // let node_power = self.read_pkg_power(*cpu as i32)?;
+            // let node_power = read_msr(*cpu as i32, MSR_PKG_ENERGY_STATUS.into())?;
+            // node_data.add_event_data("power".to_string(), node_power);
         }
         // Add entry for llcs
         for llc in self.topo.all_llcs.keys() {
@@ -1637,6 +1659,14 @@ impl<'a> App<'a> {
             )),
             Line::from(Span::styled(
                 format!(
+                    "{}: Enable power info ({})",
+                    self.keymap.action_keys_string(Action::TogglePower),
+                    self.collect_power
+                ),
+                Style::default(),
+            )),
+            Line::from(Span::styled(
+                format!(
                     "{}: show CPU event menu ({})",
                     self.keymap.action_keys_string(Action::SetState {
                         state: AppState::Event
@@ -2116,6 +2146,7 @@ impl<'a> App<'a> {
             }
             Action::ToggleCpuFreq => self.collect_cpu_freq = !self.collect_cpu_freq,
             Action::ToggleUncoreFreq => self.collect_uncore_freq = !self.collect_uncore_freq,
+            Action::TogglePower => self.collect_power = !self.collect_power,
             Action::IncBpfSampleRate => {
                 let sample_rate = self.skel.maps.data_data.sample_rate;
                 if sample_rate == 0 {
