@@ -2281,6 +2281,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "scx_p2dq"
+version = "1.0.8"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "crossbeam",
+ "ctrlc",
+ "fb_procfs",
+ "libbpf-rs 0.25.0-beta.1",
+ "libc",
+ "log",
+ "ordered-float",
+ "scx_stats",
+ "scx_stats_derive",
+ "scx_utils",
+ "serde",
+ "simplelog",
+ "sorted-vec",
+ "static_assertions",
+]
+
+[[package]]
 name = "scx_rlfifo"
 version = "1.0.8"
 dependencies = [
