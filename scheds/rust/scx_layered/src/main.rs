@@ -12,6 +12,7 @@ use std::fs;
 use std::io::Write;
 use std::mem::MaybeUninit;
 use std::ops::Sub;
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -87,6 +88,7 @@ const NR_LSTATS: usize = bpf_intf::layer_stat_id_NR_LSTATS as usize;
 const NR_LLC_LSTATS: usize = bpf_intf::llc_layer_stat_id_NR_LLC_LSTATS as usize;
 
 const NR_LAYER_MATCH_KINDS: usize = bpf_intf::layer_match_kind_NR_LAYER_MATCH_KINDS as usize;
+const BPFFS_USER_CTX_MOUNT: &str = "/sys/fs/bpf/scx_task_storage";
 
 lazy_static! {
     static ref USAGE_DECAY: f64 = 0.5f64.powf(1.0 / USAGE_HALF_LIFE_F64);
@@ -513,6 +515,10 @@ struct Opts {
     /// Run with example layer specifications (useful for e.g. CI pipelines)
     #[clap(long)]
     run_example: bool,
+
+    /// BPFFS mount for task local context
+    #[clap(long, default_value= BPFFS_USER_CTX_MOUNT)]
+    task_ctx_mount: Option<String>,
 
     /// ***DEPRECATED *** Enables iteration over local LLCs first for
     /// dispatch.
@@ -1755,6 +1761,21 @@ impl<'a> Scheduler<'a> {
 
         Self::init_layers(&mut skel, &layer_specs, &topo)?;
         Self::init_nodes(&mut skel, opts, &topo);
+
+        // pin userspace task ctx with bpffs
+        if opts.task_ctx_mount.is_some() {
+            let path_str = opts
+                .task_ctx_mount
+                .clone()
+                .unwrap_or(BPFFS_USER_CTX_MOUNT.to_string());
+            let pin_path = Path::new(&path_str);
+
+            if pin_path.exists() {
+                let _ = skel.maps.task_local_ctxs.reuse_pinned_map(pin_path)?;
+            } else {
+                let _ = skel.maps.task_local_ctxs.set_pin_path(pin_path)?;
+            }
+        }
 
         let mut skel = scx_ops_load!(skel, layered, uei)?;
 

@@ -143,6 +143,23 @@ static __always_inline bool is_scheduler_task(struct task_struct *p)
 }
 
 struct {
+	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__type(key, int);
+	__type(value, struct task_local_ctx);
+} task_local_ctxs SEC(".maps");
+
+static struct task_local_ctx *lookup_task_local_ctx(struct task_struct *p)
+{
+	struct task_local_ctx *task_localc;
+
+	task_localc = bpf_task_storage_get(&task_local_ctxs, p, 0, 0);
+
+	return task_localc;
+}
+
+
+struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__type(key, u32);
 	__type(value, struct cpu_ctx);
@@ -405,6 +422,7 @@ struct task_ctx {
 	u64			runtime_avg;
 	u64			dsq_id;
 	u32			llc_id;
+	u64			task_local_gen;
 
 	/* for llcc->queue_runtime */
 	u32			qrt_layer_id;
@@ -1909,13 +1927,21 @@ err:
 	return -EINVAL;
 }
 
-static void maybe_refresh_layer(struct task_struct *p, struct task_ctx *taskc)
+static void maybe_refresh_layer(struct task_struct *p, struct task_ctx *taskc,
+				struct task_local_ctx *task_localc)
 {
 	const char *cgrp_path;
 	bool matched = false;
 	u64 layer_id;	// XXX - int makes verifier unhappy
 	pid_t pid = p->pid;
 
+	if (task_localc) {
+		if (task_localc->gen_id == taskc->task_local_gen)
+			return;
+		taskc->task_local_gen = task_localc->gen_id;
+		taskc->layer_id = task_localc->override_layer_id;
+		return;
+	}
 	if (!taskc->refresh_layer)
 		return;
 	taskc->refresh_layer = false;
@@ -2132,13 +2158,16 @@ void on_wakeup(struct task_struct *p, struct task_ctx *taskc)
 void BPF_STRUCT_OPS(layered_runnable, struct task_struct *p, u64 enq_flags)
 {
 	struct task_ctx *taskc;
+	struct task_local_ctx *task_localc;
 	u64 now = scx_bpf_now();
 
 	if (!(taskc = lookup_task_ctx(p)))
 		return;
 
+	task_localc = lookup_task_local_ctx(p);
+
 	taskc->runnable_at = now;
-	maybe_refresh_layer(p, taskc);
+	maybe_refresh_layer(p, taskc, task_localc);
 
 	if (enq_flags & SCX_ENQ_WAKEUP)
 		on_wakeup(p, taskc);

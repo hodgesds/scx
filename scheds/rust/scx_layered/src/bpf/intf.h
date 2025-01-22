@@ -226,6 +226,11 @@ struct node_ctx {
 	u64			llc_mask;
 };
 
+struct task_local_ctx {
+	u64			gen_id;
+	u32			override_layer_id;
+};
+
 enum layer_match_kind {
 	MATCH_CGROUP_PREFIX,
 	MATCH_COMM_PREFIX,
