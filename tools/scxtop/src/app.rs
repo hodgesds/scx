@@ -1556,8 +1556,7 @@ impl<'a> App<'a> {
     }
 
     /// Renders the help TUI.
-    fn render_help(&mut self, frame: &mut Frame) -> Result<()> {
-        let area = frame.area();
+    fn render_help(&mut self, frame: &mut Frame, area: Rect) -> Result<()> {
         let theme = self.theme();
         let text = vec![
             Line::from(Span::styled(
@@ -1604,6 +1603,14 @@ impl<'a> App<'a> {
                     "{}: increase tick rate ({}ms)",
                     self.keymap.action_keys_string(Action::IncTickRate),
                     self.tick_rate_ms
+                ),
+                Style::default(),
+            )),
+            Line::from(Span::styled(
+                format!(
+                    "{}: disable bpf sampling ({})",
+                    self.keymap.action_keys_string(Action::DisableBPF),
+                    !self.skel.maps.data_data.enable_bpf_events
                 ),
                 Style::default(),
             )),
@@ -1822,7 +1829,7 @@ impl<'a> App<'a> {
     /// Renders the application to the frame.
     pub fn render(&mut self, frame: &mut Frame) -> Result<()> {
         match self.state {
-            AppState::Help => self.render_help(frame),
+            AppState::Help => self.render_help(frame, frame.area()),
             AppState::Event => self.render_event_list(frame),
             AppState::Node => self.render_node(frame),
             AppState::Llc => self.render_llc(frame),
@@ -2121,6 +2128,10 @@ impl<'a> App<'a> {
             }
             Action::ToggleCpuFreq => self.collect_cpu_freq = !self.collect_cpu_freq,
             Action::ToggleUncoreFreq => self.collect_uncore_freq = !self.collect_uncore_freq,
+            Action::DisableBPF => {
+                self.skel.maps.data_data.enable_bpf_events =
+                    !self.skel.maps.data_data.enable_bpf_events;
+            }
             Action::IncBpfSampleRate => {
                 let sample_rate = self.skel.maps.data_data.sample_rate;
                 if sample_rate == 0 {

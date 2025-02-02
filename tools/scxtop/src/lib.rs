@@ -169,6 +169,7 @@ pub enum Action {
     },
     IncTickRate,
     DecTickRate,
+    DisableBPF,
     IncBpfSampleRate,
     DecBpfSampleRate,
     None,

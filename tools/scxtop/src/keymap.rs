@@ -77,6 +77,7 @@ impl KeyMap {
             },
         );
         bindings.insert(Key::Char('a'), Action::RecordTrace);
+        bindings.insert(Key::Char('b'), Action::DisableBPF);
         bindings.insert(Key::Char('P'), Action::RecordTrace);
         bindings.insert(Key::Char('x'), Action::ClearEvent);
         bindings.insert(Key::Char('j'), Action::PrevEvent);
