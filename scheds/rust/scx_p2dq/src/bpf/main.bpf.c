@@ -410,14 +410,16 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *taskc,
 		}
 	}
 
-	if (!llcx->cpumask)
-		goto out_put_cpumask;
+	if (interactive) {
+		if (!llcx->cpumask)
+			goto out_put_cpumask;
 
-	// Next try in the local LLC.
-	cpu = scx_bpf_pick_idle_cpu(cast_mask(llcx->cpumask), 0);
-	if (cpu < nr_cpus && cpu >= 0) {
-		*is_idle = true;
-		goto out_put_cpumask;
+		// Next try in the local LLC.
+		cpu = scx_bpf_pick_idle_cpu(cast_mask(llcx->cpumask), 0);
+		if (cpu < nr_cpus && cpu >= 0) {
+			*is_idle = true;
+			goto out_put_cpumask;
+		}
 	}
 
 	if (!nodec->cpumask)
@@ -449,7 +451,7 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *taskc,
 out_put_cpumask:
 	scx_bpf_put_cpumask(idle_cpumask);
 	scx_bpf_put_cpumask(idle_smtmask);
-	if (cpu >= nr_cpus || cpu < 0)
+	if (cpu > nr_cpus || cpu < 0)
 		cpu = prev_cpu;
 
 	return cpu;
@@ -521,7 +523,7 @@ void BPF_STRUCT_OPS(p2dq_enqueue, struct task_struct *p __arg_trusted, u64 enq_f
 	 * behind other threads which is necessary for forward progress
 	 * guarantee as we depend on the BPF timer which may run from ksoftirqd.
 	 */
-	if ((p->flags & PF_KTHREAD) && (p->nr_cpus_allowed < nr_cpus) && kthreads_local) {
+	if ((kthreads_local && p->flags & PF_KTHREAD) && p->nr_cpus_allowed < nr_cpus) {
 		stat_inc(P2DQ_STAT_DIRECT);
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_ns,
 				   enq_flags | SCX_ENQ_PREEMPT);
@@ -1007,5 +1009,6 @@ SCX_OPS_DEFINE(p2dq,
 	       .init_task		= (void *)p2dq_init_task,
 	       .init			= (void *)p2dq_init,
 	       .exit			= (void *)p2dq_exit,
+	       .flags			= SCX_OPS_KEEP_BUILTIN_IDLE,
 	       .timeout_ms		= 20000,
 	       .name			= "p2dq");
