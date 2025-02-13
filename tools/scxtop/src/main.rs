@@ -21,8 +21,8 @@ use scxtop::APP;
 use scxtop::SCHED_NAME_PATH;
 use scxtop::STATS_SOCKET_PATH;
 use scxtop::{
-    Action, SchedCpuPerfSetAction, SchedSwitchAction, SchedWakeupAction, SchedWakingAction,
-    SoftIRQAction,
+    Action, IPIAction, SchedCpuPerfSetAction, SchedSwitchAction, SchedWakeupAction,
+    SchedWakingAction, SoftIRQAction,
 };
 use std::mem::MaybeUninit;
 use std::sync::atomic::Ordering;
@@ -158,6 +158,16 @@ async fn main() -> Result<()> {
                 });
                 tx.send(action).ok();
             }
+            #[allow(non_upper_case_globals)]
+            event_type_IPI => unsafe {
+                let action = Action::IPI(IPIAction {
+                    ts: event.ts,
+                    cpu: event.cpu,
+                    pid: event.event.ipi.pid,
+                    target_cpu: event.event.ipi.target_cpu,
+                });
+                tx.send(action).ok();
+            },
             #[allow(non_upper_case_globals)]
             event_type_SOFTIRQ => unsafe {
                 let action = Action::SoftIRQ(SoftIRQAction {
