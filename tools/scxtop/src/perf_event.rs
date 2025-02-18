@@ -17,6 +17,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
 
+use skim::prelude::*;
+
 #[allow(dead_code)]
 const PERF_SAMPLE_ID: u64 = 1 << 16;
 #[allow(dead_code)]
@@ -93,6 +95,16 @@ impl Drop for PerfEvent {
                 close(self.fd as i32);
             }
         }
+    }
+}
+
+impl SkimItem for PerfEvent {
+    fn text(&self) -> Cow<str> {
+        Cow::Borrowed(&self.event)
+    }
+
+    fn preview(&self, _context: PreviewContext) -> ItemPreview {
+        ItemPreview::Text(format!("{}:{}", self.subsystem.clone(), self.event.clone()))
     }
 }
 
