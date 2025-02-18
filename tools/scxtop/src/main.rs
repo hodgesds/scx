@@ -17,7 +17,7 @@ use scxtop::APP;
 use scxtop::SCHED_NAME_PATH;
 use scxtop::STATS_SOCKET_PATH;
 use scxtop::{
-    Action, IPIAction, RecordTraceAction, SchedCpuPerfSetAction, SchedSwitchAction,
+    Action, IPIAction, LlcMissAction, RecordTraceAction, SchedCpuPerfSetAction, SchedSwitchAction,
     SchedWakeupAction, SchedWakingAction, SoftIRQAction,
 };
 
@@ -211,6 +211,15 @@ async fn main() -> Result<()> {
                 let action = Action::SchedCpuPerfSet(SchedCpuPerfSetAction {
                     cpu: event.cpu,
                     perf: unsafe { event.event.perf.perf },
+                });
+                tx.send(action).ok();
+            }
+            #[allow(non_upper_case_globals)]
+            event_type_LLC_MISS => {
+                let action = Action::LlcMiss(LlcMissAction {
+                    ts: event.ts,
+                    cpu: event.cpu,
+                    pid: unsafe { event.event.llc_miss.pid },
                 });
                 tx.send(action).ok();
             }

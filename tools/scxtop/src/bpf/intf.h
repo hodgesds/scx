@@ -26,6 +26,7 @@ enum stat_id {
 enum event_type {
 	CPU_PERF_SET,
 	IPI,
+	LLC_MISS,
 	SCHED_REG,
 	SCHED_SWITCH,
 	SCHED_UNREG,
@@ -80,12 +81,17 @@ struct ipi_event {
 	u32		target_cpu;
 };
 
+struct llc_miss_event {
+	u32		pid;
+};
+
 struct bpf_event {
 	int		type;
 	u64		ts;
 	u32		cpu;
 	union {
 		struct	ipi_event ipi;
+		struct	llc_miss_event llc_miss;
 		struct	sched_switch_event sched_switch;
 		struct	set_perf_event perf;
 		struct	softirq_event softirq;

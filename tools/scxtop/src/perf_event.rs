@@ -80,9 +80,9 @@ pub fn perf_event_config(subsystem: &str, event: &str) -> Result<u64> {
 pub struct PerfEvent {
     pub subsystem: String,
     pub event: String,
-    pub cpu: usize,
-    fd: usize,
-    freq: usize,
+    pub cpu: i32,
+    pub fd: usize,
+    pub freq: usize,
 }
 
 impl Drop for PerfEvent {
@@ -98,7 +98,7 @@ impl Drop for PerfEvent {
 
 impl PerfEvent {
     /// Creates a PerfEvent.
-    pub fn new(subsystem: String, event: String, cpu: usize) -> Self {
+    pub fn new(subsystem: String, event: String, cpu: i32) -> Self {
         Self {
             subsystem,
             event,
@@ -235,8 +235,7 @@ impl PerfEvent {
         attrs.set_inherit(if process_id == -1 { 1 } else { 0 });
         attrs.set_pinned(1);
 
-        let result =
-            unsafe { perf::perf_event_open(&mut attrs, process_id, self.cpu as i32, -1, 0) };
+        let result = unsafe { perf::perf_event_open(&mut attrs, process_id, self.cpu, -1, 0) };
 
         if result < 0 {
             return Err(anyhow!("failed to open perf event: {}", result));

@@ -15,7 +15,8 @@ use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
-    Action, IPIAction, SchedSwitchAction, SchedWakeupAction, SchedWakingAction, SoftIRQAction,
+    Action, IPIAction, LlcMissAction, SchedSwitchAction, SchedWakeupAction, SchedWakingAction,
+    SoftIRQAction,
 };
 
 use crate::protos_gen::perfetto_scx::counter_descriptor::Unit::UNIT_COUNT;
@@ -46,6 +47,9 @@ pub struct PerfettoTraceManager<'a> {
     dsq_nr_queued_events: BTreeMap<u64, Vec<TrackEvent>>,
     dsq_nr_queued_trusted_packet_seq_uuid: u32,
     dsq_uuids: BTreeMap<u64, u64>,
+    cpu_llc_misses_uuids: BTreeMap<u32, u64>,
+    cpu_llc_misses_events: BTreeMap<u32, Vec<TrackEvent>>,
+    cpu_llc_misses_trusted_packet_seq_uuid: u32,
 }
 
 impl<'a> PerfettoTraceManager<'a> {
@@ -61,6 +65,7 @@ impl<'a> PerfettoTraceManager<'a> {
         let trace = Trace::new();
         let dsq_lat_trusted_packet_seq_uuid = rng.next_u32();
         let dsq_nr_queued_trusted_packet_seq_uuid = rng.next_u32();
+        let cpu_llc_misses_trusted_packet_seq_uuid = rng.next_u32();
 
         Self {
             trace,
@@ -74,6 +79,9 @@ impl<'a> PerfettoTraceManager<'a> {
             dsq_lat_trusted_packet_seq_uuid,
             dsq_nr_queued_events: BTreeMap::new(),
             dsq_nr_queued_trusted_packet_seq_uuid,
+            cpu_llc_misses_uuids: BTreeMap::new(),
+            cpu_llc_misses_events: BTreeMap::new(),
+            cpu_llc_misses_trusted_packet_seq_uuid,
         }
     }
 
@@ -88,6 +96,9 @@ impl<'a> PerfettoTraceManager<'a> {
         self.ftrace_events.clear();
         self.dsq_lat_events.clear();
         self.dsq_uuids.clear();
+        self.dsq_nr_queued_events.clear();
+        self.cpu_llc_misses_uuids.clear();
+        self.cpu_llc_misses_events.clear();
     }
 
     /// Returns the trace file.
@@ -130,6 +141,24 @@ impl<'a> PerfettoTraceManager<'a> {
             descs.push(desc);
 
             desc_map.insert(*dsq_uuid, descs);
+        }
+
+        // Next add LLC misses
+        for (cpu, cpu_uuid) in &self.cpu_llc_misses_uuids {
+            let mut descs = vec![];
+            let mut desc = TrackDescriptor::new();
+            desc.set_uuid(*cpu_uuid);
+            desc.set_name(format!("CPU {} LLC misses", *cpu));
+            desc.set_static_name(format!("DSQ {} LLC misses", *cpu));
+
+            let mut counter_desc = CounterDescriptor::new();
+            counter_desc.set_unit_name(format!("CPU {} LLC misses", *cpu));
+            counter_desc.set_unit(UNIT_COUNT);
+            counter_desc.set_is_incremental(false);
+            desc.counter = Some(counter_desc).into();
+            descs.push(desc);
+
+            desc_map.insert(*cpu_uuid, descs);
         }
 
         desc_map
@@ -176,6 +205,22 @@ impl<'a> PerfettoTraceManager<'a> {
                     packet.set_track_event(dsq_lat_event);
                     packet
                         .set_trusted_packet_sequence_id(self.dsq_nr_queued_trusted_packet_seq_uuid);
+                    packet.set_timestamp(ts);
+                    self.trace.packet.push(packet);
+                }
+            }
+        }
+
+        // llc misses events
+        for cpu in &trace_cpus {
+            if let Some(events) = self.cpu_llc_misses_events.remove(cpu) {
+                for event in events {
+                    let ts: u64 = event.timestamp_absolute_us() as u64 / 1_000;
+                    let mut packet = TracePacket::new();
+                    packet.set_track_event(event);
+                    packet.set_trusted_packet_sequence_id(
+                        self.cpu_llc_misses_trusted_packet_seq_uuid,
+                    );
                     packet.set_timestamp(ts);
                     self.trace.packet.push(packet);
                 }
@@ -310,6 +355,28 @@ impl<'a> PerfettoTraceManager<'a> {
 
             ftrace_event
         });
+    }
+
+    /// Adds events for LLC misses.
+    pub fn on_llc_miss(&mut self, action: &LlcMissAction) {
+        let uuid = self
+            .cpu_llc_misses_uuids
+            .entry(action.cpu)
+            .or_insert_with(|| self.rng.next_u64());
+
+        self.cpu_llc_misses_events
+            .entry(action.cpu)
+            .or_default()
+            .push({
+                let mut event = TrackEvent::new();
+                let ts: i64 = (action.ts).try_into().unwrap();
+                event.set_type(TrackEventType::TYPE_COUNTER);
+                event.set_track_uuid(*uuid);
+                event.set_counter_value(1);
+                event.set_timestamp_absolute_us(ts / 1000);
+
+                event
+            });
     }
 
     /// Adds events for the sched_switch event.

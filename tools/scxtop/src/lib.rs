@@ -161,6 +161,13 @@ pub struct IPIAction {
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct LlcMissAction {
+    pub ts: u64,
+    pub cpu: u32,
+    pub pid: u32,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Action {
     Tick,
     Increment,
@@ -168,6 +175,7 @@ pub enum Action {
     Quit,
     Help,
     IPI(IPIAction),
+    LlcMiss(LlcMissAction),
     Event,
     ClearEvent,
     NextEvent,

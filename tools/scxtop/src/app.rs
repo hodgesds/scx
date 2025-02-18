@@ -23,7 +23,7 @@ use crate::APP;
 use crate::LICENSE;
 use crate::SCHED_NAME_PATH;
 use crate::{
-    Action, IPIAction, RecordTraceAction, SchedCpuPerfSetAction, SchedSwitchAction,
+    Action, IPIAction, LlcMissAction, RecordTraceAction, SchedCpuPerfSetAction, SchedSwitchAction,
     SchedWakeupAction, SchedWakingAction, SoftIRQAction,
 };
 
@@ -143,7 +143,11 @@ impl<'a> App<'a> {
             .map(|event| event.event.clone())
             .collect::<Vec<String>>();
         for cpu in topo.all_cpus.values() {
-            let mut event = PerfEvent::new("hw".to_string(), "cycles".to_string(), cpu.id);
+            let mut event = PerfEvent::new(
+                "hw".to_string(),
+                "cycles".to_string(),
+                cpu.id.try_into().unwrap(),
+            );
             event.attach(process_id)?;
             active_perf_events.insert(cpu.id, event);
             let mut data =
@@ -262,6 +266,14 @@ impl<'a> App<'a> {
         self.active_perf_events.clear();
     }
 
+    /// Restarts the active perf event.
+    fn restart_perf_events(&mut self) -> Result<()> {
+        let perf_event = &self.available_events[self.active_hw_event_id].clone();
+
+        self.active_event = perf_event.clone();
+        self.activate_perf_event(perf_event)
+    }
+
     /// Activates the next event.
     fn next_event(&mut self) -> Result<()> {
         self.active_perf_events.clear();
@@ -306,7 +318,7 @@ impl<'a> App<'a> {
             let mut event = PerfEvent::new(
                 perf_event.subsystem.clone(),
                 perf_event.event.clone(),
-                *cpu_id,
+                (*cpu_id).try_into().unwrap(),
             );
             event.attach(self.process_id)?;
             self.active_perf_events.insert(*cpu_id, event);
@@ -1915,17 +1927,34 @@ impl<'a> App<'a> {
             self.skel.progs.on_ipi_send_cpu.attach()?,
         ];
 
+        for cpu in self.topo.all_cpus.keys() {
+            let mut event = PerfEvent::new(
+                "hw".to_string(),
+                "cache-misses".to_string(),
+                (*cpu).try_into().unwrap(),
+            );
+            event.freq = 1;
+            event.attach(-1)?;
+
+            self.trace_links.push(
+                self.skel
+                    .progs
+                    .on_llc_cache_miss
+                    .attach_perf_event(event.fd.try_into().unwrap())?,
+            );
+            self.active_perf_events.insert(*cpu, event);
+        }
+
         Ok(())
     }
 
     /// Records the trace to perfetto output.
     fn record_trace(&mut self) -> Result<()> {
-        self.skel.maps.data_data.sample_rate = self.prev_bpf_sample_rate;
         self.state = self.prev_state.clone();
-        self.trace_manager.stop()?;
         self.trace_links.clear();
-
-        Ok(())
+        self.restart_perf_events()?;
+        self.skel.maps.data_data.sample_rate = self.prev_bpf_sample_rate;
+        self.trace_manager.stop()
     }
 
     /// Starts recording a trace.
@@ -1938,6 +1967,8 @@ impl<'a> App<'a> {
         // set bpf sampling to every event
         self.prev_bpf_sample_rate = self.skel.maps.data_data.sample_rate;
         self.skel.maps.data_data.sample_rate = 1;
+
+        self.stop_perf_events();
         self.attach_trace_progs()?;
 
         Ok(())
@@ -2058,6 +2089,13 @@ impl<'a> App<'a> {
         }
     }
 
+    /// Handles LLC miss events.
+    pub fn on_llc_miss(&mut self, action: &LlcMissAction) {
+        if self.trace_tick > self.trace_tick_warmup {
+            self.trace_manager.on_llc_miss(action);
+        }
+    }
+
     /// Updates the bpf bpf sampling rate.
     pub fn update_bpf_sample_rate(&mut self, sample_rate: u32) {
         self.skel.maps.data_data.sample_rate = sample_rate;
@@ -2128,6 +2166,9 @@ impl<'a> App<'a> {
             }
             Action::IPI(a) => {
                 self.on_ipi(&a);
+            }
+            Action::LlcMiss(a) => {
+                self.on_llc_miss(&a);
             }
             Action::ClearEvent => self.stop_perf_events(),
             Action::ChangeTheme => {

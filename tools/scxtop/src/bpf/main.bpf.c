@@ -676,3 +676,30 @@ int BPF_PROG(on_ipi_send_cpu, u32 cpu, void *callsite, void *callback)
 
 	return 0;
 }
+
+SEC("perf_event")
+int on_llc_cache_miss(void *ctx)
+{
+	struct bpf_event *event;
+	struct task_struct *p;
+
+	if (!enable_bpf_events || !should_sample())
+		return 0;
+
+	if (!(event = try_reserve_event()))
+		return -ENOENT;
+
+	event->type = LLC_MISS;
+	event->cpu = bpf_get_smp_processor_id();
+	event->ts = bpf_ktime_get_ns();
+
+	p = (struct task_struct *)bpf_get_current_task();
+	if (p)
+		event->event.llc_miss.pid = BPF_CORE_READ(p, pid);
+	else
+		event->event.llc_miss.pid = 0;
+
+	bpf_ringbuf_submit(event, 0);
+
+	return 0;
+}
