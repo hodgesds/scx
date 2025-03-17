@@ -49,6 +49,7 @@ use crate::bpf_intf::stat_idx_P2DQ_STAT_GREEDY_IDLE;
 use crate::bpf_intf::stat_idx_P2DQ_STAT_IDLE;
 use crate::bpf_intf::stat_idx_P2DQ_STAT_KEEP;
 use crate::bpf_intf::stat_idx_P2DQ_STAT_LLC_MIGRATION;
+use crate::bpf_intf::stat_idx_P2DQ_STAT_LOCAL_WAKEUP;
 use crate::bpf_intf::stat_idx_P2DQ_STAT_NODE_MIGRATION;
 use crate::bpf_intf::stat_idx_P2DQ_STAT_SELECT_PICK2;
 
@@ -306,6 +307,7 @@ impl<'a> Scheduler<'a> {
             dispatch_pick2: stats[stat_idx_P2DQ_STAT_DISPATCH_PICK2 as usize],
             llc_migrations: stats[stat_idx_P2DQ_STAT_LLC_MIGRATION as usize],
             node_migrations: stats[stat_idx_P2DQ_STAT_NODE_MIGRATION as usize],
+            local_wakeup: stats[stat_idx_P2DQ_STAT_LOCAL_WAKEUP as usize],
         }
     }
 

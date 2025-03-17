@@ -420,20 +420,20 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *taskc,
 	 */
 	if (wake_flags & SCX_WAKE_SYNC) {
 		struct task_struct *current = (void *)bpf_get_current_task_btf();
-		if (!current)
-			goto out_put_cpumask;
-
 		struct task_ctx *cur_taskc = lookup_task_ctx_may_fail(current);
-		if (!cur_taskc)
-			goto out_put_cpumask;
+		if (cur_taskc) {
+			// XXX: for some reason this check never passes
+			if (scx_bpf_test_and_clear_cpu_idle(cur_taskc->cpu)) {
+				stat_inc(P2DQ_STAT_LOCAL_WAKEUP);
+				*is_idle = true;
+				goto out_put_cpumask;
+			}
+			// XXX: trick everything to think the task was on the
+			// waker cpu if the waker CPU is still busy.
+			taskc->cpu = cur_taskc->cpu;
+			taskc->llc_id = cur_taskc->llc_id;
+			prev_cpu = cur_taskc->cpu;
 
-		// If the waking task is in the same LLC then use the current
-		// CPU if available.
-		s32 cur_cpu = bpf_get_smp_processor_id();
-		if (llcx->id == cur_taskc->llc_id &&
-		    scx_bpf_test_and_clear_cpu_idle(cur_cpu)) {
-			*is_idle = true;
-			goto out_put_cpumask;
 		}
 	}
 
