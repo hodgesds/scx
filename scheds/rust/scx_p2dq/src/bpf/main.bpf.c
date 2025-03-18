@@ -464,66 +464,54 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *taskc,
 		}
 	}
 
-	// If last CPU is idle then run again
-	if (is_prev_llc_affine &&
-	    bpf_cpumask_test_cpu(prev_cpu, smt_enabled ? idle_smtmask : idle_cpumask) &&
-	    scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
-		cpu = prev_cpu;
-		*is_idle = true;
-		goto out_put_cpumask;
-	}
-
 	if (eager_load_balance && nr_llcs > 1) {
-		llcx = pick_two_llc_ctx(rand_llc_ctx(), rand_llc_ctx(), false);
-		if (!llcx) {
+		if ((llcx = pick_two_llc_ctx(rand_llc_ctx(), rand_llc_ctx(), false)) &&
+		    (cpu = scx_bpf_pick_idle_cpu(cast_mask(llcx->cpumask), 0)) &&
+		    cpu >= 0) {
 			cpu = prev_cpu;
 			goto out_put_cpumask;
 		}
 	}
 
 	if (has_little_cores) {
-		if (!llcx->big_cpumask)
-			goto out_put_cpumask;
-
-		cpu = bpf_cpumask_any_and_distribute(smt_enabled ? idle_smtmask : idle_cpumask,
-						     cast_mask(llcx->big_cpumask));
-		if (cpu < nr_cpus) {
+		// First try big core in the local LLC
+		if (llcx->big_cpumask &&
+		    (cpu = scx_bpf_pick_idle_cpu(cast_mask(llcx->big_cpumask), SCX_PICK_IDLE_CORE)) &&
+		    cpu >= 0) {
 			*is_idle = true;
 			goto out_put_cpumask;
 		}
 
-		if (!nodec->big_cpumask)
-			goto out_put_cpumask;
-
-		/*
-		 * Next try a big core in the local node.
-		 */
-		if (!interactive) {
-			cpu = bpf_cpumask_any_and_distribute(smt_enabled ? idle_smtmask : idle_cpumask,
-							     cast_mask(nodec->big_cpumask));
-			if (cpu < nr_cpus) {
+		// Next try a big core in the local node
+		if (nodec->big_cpumask &&
+		    (cpu = scx_bpf_pick_idle_cpu(cast_mask(nodec->big_cpumask), SCX_PICK_IDLE_CORE)) &&
+		    cpu >= 0) {
 				*is_idle = true;
 				goto out_put_cpumask;
-			}
 		}
-	}
 
-	if (smt_enabled) {
-		if (is_prev_llc_affine &&
-		    bpf_cpumask_test_cpu(prev_cpu, idle_smtmask) &&
-		    scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
-			cpu = prev_cpu;
+		// Idle cores are still better than big SMT
+		if (nodec->cpumask &&
+		    (cpu = scx_bpf_pick_idle_cpu(cast_mask(nodec->cpumask), SCX_PICK_IDLE_CORE)) &&
+		    cpu >= 0) {
 			*is_idle = true;
 			goto out_put_cpumask;
 		}
 	}
 
-	if (!llcx->cpumask)
-		goto out_put_cpumask;
+	// if (smt_enabled &&
+	//     is_prev_llc_affine &&
+	//     bpf_cpumask_test_cpu(prev_cpu, idle_smtmask) &&
+	//     scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+	// 	cpu = prev_cpu;
+	// 	*is_idle = true;
+	// 	goto out_put_cpumask;
+	// }
 
 	// Next try in the local LLC.
-	cpu = scx_bpf_pick_idle_cpu(cast_mask(llcx->cpumask), SCX_PICK_IDLE_CORE);
-	if (cpu >= 0) {
+	if (llcx->cpumask &&
+	    (cpu = scx_bpf_pick_idle_cpu(cast_mask(llcx->cpumask), SCX_PICK_IDLE_CORE)) &&
+	    cpu >= 0) {
 		*is_idle = true;
 		goto out_put_cpumask;
 	}
@@ -545,23 +533,19 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *taskc,
 		}
 	}
 
-	if (!nodec->cpumask)
+	// first try an idle core in the local node
+	if (nodec->cpumask &&
+	    (cpu = scx_bpf_pick_idle_cpu(cast_mask(nodec->cpumask), SCX_PICK_IDLE_CORE)) &&
+	    cpu >= 0) {
+		*is_idle = true;
 		goto out_put_cpumask;
+	}
 
 	if (nr_llcs > 1) {
-		// first try an idle core in the local node
-		cpu = scx_bpf_pick_idle_cpu(cast_mask(nodec->cpumask), SCX_PICK_IDLE_CORE);
-		if (cpu >= 0) {
-			*is_idle = true;
-			goto out_put_cpumask;
-		}
-
 		if (interactive) {
-			if (!nodec->cpumask)
-				goto out_put_cpumask;
-
-			cpu = scx_bpf_pick_idle_cpu(cast_mask(nodec->cpumask), 0);
-			if (cpu >= 0) {
+			if (nodec->cpumask &&
+			    (cpu = scx_bpf_pick_idle_cpu(cast_mask(nodec->cpumask), 0)) &&
+			    cpu >= 0) {
 				*is_idle = true;
 				goto out_put_cpumask;
 			}
@@ -573,17 +557,9 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *taskc,
 			}
 		}
 	} else {
-		cpu = scx_bpf_pick_idle_cpu(cast_mask(nodec->cpumask), SCX_PICK_IDLE_CORE);
-		if (cpu >= 0) {
-			*is_idle = true;
-			goto out_put_cpumask;
-		}
-
-		if (!nodec->cpumask)
-			goto out_put_cpumask;
-
-		cpu = scx_bpf_pick_idle_cpu(cast_mask(nodec->cpumask), 0);
-		if (cpu >= 0) {
+		if (nodec->cpumask &&
+		    (cpu = scx_bpf_pick_idle_cpu(cast_mask(nodec->cpumask), 0)) &&
+		    cpu >= 0) {
 			*is_idle = true;
 			goto out_put_cpumask;
 		}
