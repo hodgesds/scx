@@ -8,12 +8,16 @@ pub mod bpf_intf;
 pub mod stats;
 use stats::Metrics;
 
+use std::fs;
 use std::mem::MaybeUninit;
+use std::path::Path;
+use std::str::FromStr;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
@@ -24,8 +28,10 @@ use libbpf_rs::skel::SkelBuilder;
 use libbpf_rs::MapCore as _;
 use libbpf_rs::OpenObject;
 use log::{debug, info, warn};
+use perf_event_open_sys as perf;
 use scx_stats::prelude::*;
 use scx_utils::build_id;
+use scx_utils::compat::tracefs_mount;
 use scx_utils::import_enums;
 use scx_utils::init_libbpf_logging;
 use scx_utils::pm::{cpu_idle_resume_latency_supported, update_cpu_idle_resume_latency};
@@ -176,6 +182,131 @@ fn dsq_slice_ns(dsq_index: u64, min_slice_us: u64, dsq_shift: u64) -> u64 {
         1000 * (min_slice_us << (dsq_index as u32) << dsq_shift)
     };
     result
+}
+
+/// Reads a file and returns the u64 value from a file.
+pub fn read_file_u64<P: AsRef<Path>>(path: P) -> Result<u64> {
+    let path = path.as_ref();
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read file: {}", path.display()))?;
+
+    let trimmed_contents = contents.trim();
+
+    u64::from_str(trimmed_contents)
+        .with_context(|| format!("Failed to parse u64 from '{}'", contents))
+}
+
+/// Returns the config value for the perf event.
+pub fn perf_event_config(subsystem: &str, event: &str) -> Result<u64> {
+    let path = tracefs_mount()?;
+    let event_path = path.join("events").join(subsystem).join(event).join("id");
+    read_file_u64(event_path)
+}
+
+fn attach_perf_event(cpu: usize, freq: usize, subsystem: String, event: String) -> Result<()> {
+    let mut attrs = perf::bindings::perf_event_attr::default();
+    attrs.size = std::mem::size_of::<perf::bindings::perf_event_attr>() as u32;
+
+    match subsystem.to_lowercase().as_str() {
+        "hw" | "hardware" => {
+            attrs.type_ = perf::bindings::PERF_TYPE_HARDWARE;
+            match event.to_lowercase().as_str() {
+                "branches" | "branch-instructions" => {
+                    attrs.config = perf::bindings::PERF_COUNT_HW_BRANCH_INSTRUCTIONS as u64;
+                }
+                "branch-misses" => {
+                    attrs.config = perf::bindings::PERF_COUNT_HW_BRANCH_MISSES as u64;
+                }
+                "cache-misses" => {
+                    attrs.config = perf::bindings::PERF_COUNT_HW_CACHE_MISSES as u64;
+                }
+                "cache-references" => {
+                    attrs.config = perf::bindings::PERF_COUNT_HW_CACHE_REFERENCES as u64;
+                }
+                "cycles" | "cpu-cycles" | "cpu_cycles" => {
+                    attrs.config = perf::bindings::PERF_COUNT_HW_CPU_CYCLES as u64;
+                }
+                "instructions" | "instr" => {
+                    attrs.config = perf::bindings::PERF_COUNT_HW_INSTRUCTIONS as u64;
+                }
+                "ref-cycles" => {
+                    attrs.config = perf::bindings::PERF_COUNT_HW_REF_CPU_CYCLES as u64;
+                }
+                "stalled-cycles-backend" => {
+                    attrs.config = perf::bindings::PERF_COUNT_HW_STALLED_CYCLES_BACKEND as u64;
+                }
+                "stalled-cycles-frontend" => {
+                    attrs.config = perf::bindings::PERF_COUNT_HW_STALLED_CYCLES_FRONTEND as u64;
+                }
+                "bus-cycles" | "bus_cycles" => {
+                    attrs.config = perf::bindings::PERF_COUNT_HW_BUS_CYCLES as u64;
+                }
+                "l1-dcache-load-misses" => {
+                    attrs.config = perf::bindings::PERF_COUNT_HW_CACHE_RESULT_MISS as u64;
+                }
+                _ => {
+                    return Err(anyhow!("unknown event"));
+                }
+            }
+        }
+        "sw" | "software" => {
+            attrs.type_ = perf::bindings::PERF_TYPE_SOFTWARE;
+            match event.to_lowercase().as_str() {
+                "cs" | "context-switches" => {
+                    attrs.config = perf::bindings::PERF_COUNT_SW_CONTEXT_SWITCHES as u64;
+                }
+                "page-faults" | "faults" => {
+                    attrs.config = perf::bindings::PERF_COUNT_SW_PAGE_FAULTS as u64;
+                }
+                "minor-faults" => {
+                    attrs.config = perf::bindings::PERF_COUNT_SW_PAGE_FAULTS_MIN as u64;
+                }
+                "major-faults" => {
+                    attrs.config = perf::bindings::PERF_COUNT_SW_PAGE_FAULTS_MAJ as u64;
+                }
+                "migrations" | "cpu-migrations" => {
+                    attrs.config = perf::bindings::PERF_COUNT_SW_CPU_MIGRATIONS as u64;
+                }
+                _ => {
+                    return Err(anyhow!("unknown event"));
+                }
+            }
+        }
+        _ => {
+            // if self.use_config {
+            //     attrs.type_ = self.event_type;
+            //     attrs.config = self.config
+            // } else {
+            // Not a hardware or software event so get the event type.
+            let config = perf_event_config(&subsystem, &event)?;
+            attrs.type_ = perf::bindings::PERF_TYPE_TRACEPOINT;
+            attrs.config = config as u64;
+            // }
+        }
+    }
+
+    attrs.set_freq(
+        freq.try_into()
+            .expect("Failed to set freq on perf_event_attr"),
+    );
+    attrs.set_disabled(0);
+    attrs.set_exclude_kernel(0);
+    attrs.set_exclude_hv(0);
+    attrs.set_inherit(1);
+    attrs.set_pinned(1);
+
+    let result = unsafe { perf::perf_event_open(&mut attrs, -1, cpu as i32, -1, 0) };
+
+    if result < 0 {
+        return Err(anyhow!("failed to open perf event: {}", result));
+    }
+
+    unsafe {
+        if perf::ioctls::ENABLE(result, 0) < 0 {
+            return Err(anyhow!("failed to enable perf event: {}", event));
+        }
+    }
+    Ok(())
 }
 
 struct Scheduler<'a> {

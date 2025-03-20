@@ -1040,6 +1040,12 @@ static s32 init_cpu(int cpu)
 	return 0;
 }
 
+SEC("")
+int BPF_PROG(perf_event_cb)
+{
+	return 0;
+}
+
 static bool load_balance_timer(void)
 {
 	struct llc_ctx *llcx;
