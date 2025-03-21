@@ -762,6 +762,57 @@ void BPF_STRUCT_OPS(p2dq_stopping, struct task_struct *p, bool runnable)
 }
 
 
+static void dispatch_pick_two(s32 cpu)
+{
+	struct task_ctx *taskc;
+	struct task_struct *p;
+	struct llc_ctx *llcx;
+	u64 dsq_id;
+	int i;
+
+	// If on a single LLC there isn't anything left to try.
+	if (nr_llcs == 1 || dispatch_pick2_disable)
+		return;
+
+	// Last ditch effort try consuming from the most loaded DSQ.
+	llcx = pick_two_llc_ctx(rand_llc_ctx(), rand_llc_ctx(), false);
+	if (!llcx)
+		return;
+
+	// Start with least interactive DSQs to avoid migrating interactive
+	// tasks.
+	bool dispatched = false;
+	bpf_for(i, 1, nr_dsqs_per_llc) {
+		dsq_id = llcx->dsqs[nr_dsqs_per_llc - i];
+		if ((max_dsq_pick2 && i > 1) ||
+		    (min_nr_queued_pick2 > 0 &&
+		    scx_bpf_dsq_nr_queued(dsq_id) < min_nr_queued_pick2))
+			continue;
+
+		bpf_rcu_read_lock();
+		bpf_for_each(scx_dsq, p, dsq_id, 0) {
+			if (!(taskc = lookup_task_ctx(p)))
+				continue;
+
+			if (min_llc_runs_pick2 > 0 && taskc->llc_runs < min_llc_runs_pick2)
+				continue;
+
+			if (__COMPAT_scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p,
+						      SCX_DSQ_LOCAL_ON | cpu,
+						      0)) {
+				stat_inc(P2DQ_STAT_DISPATCH_PICK2);
+				dispatched = true;
+				break;
+			}
+		}
+		bpf_rcu_read_unlock();
+
+		if (dispatched)
+			return;
+	}
+
+}
+
 
 void BPF_STRUCT_OPS(p2dq_dispatch, s32 cpu, struct task_struct *prev)
 {
@@ -805,23 +856,7 @@ void BPF_STRUCT_OPS(p2dq_dispatch, s32 cpu, struct task_struct *prev)
 		    return;
 	}
 
-	// If on a single LLC there isn't anything left to try.
-	if (nr_llcs == 1 || dispatch_pick2_disable)
-		return;
-
-	// Last ditch effort try consuming from the most loaded DSQ.
-	llcx = pick_two_llc_ctx(rand_llc_ctx(), rand_llc_ctx(), false);
-	if (!llcx || cpuc->dsq_index < 0 || cpuc->dsq_index > nr_dsqs_per_llc)
-		return;
-
-	// Start with least interactive DSQs to avoid migrating interactive
-	// tasks.
-	bpf_for(i, 1, nr_dsqs_per_llc) {
-		if (scx_bpf_dsq_move_to_local(llcx->dsqs[nr_dsqs_per_llc - i])) {
-			stat_inc(P2DQ_STAT_DISPATCH_PICK2);
-			return;
-		}
-	}
+	dispatch_pick_two(cpu);
 }
 
 void BPF_STRUCT_OPS(p2dq_set_cpumask, struct task_struct *p,
