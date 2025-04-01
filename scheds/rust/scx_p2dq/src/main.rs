@@ -109,7 +109,7 @@ struct Opts {
     idle_resume_us: Option<u32>,
 
     /// Only pick2 load balance from the max DSQ.
-    #[clap(long, default_value = "true", action = clap::ArgAction::Set)]
+    #[clap(long, action = clap::ArgAction::SetTrue)]
     max_dsq_pick2: bool,
 
     /// Scheduling min slice duration in microseconds.
