@@ -375,8 +375,7 @@ static s32 pick_two_cpu(struct llc_ctx *cur_llcx, struct task_ctx *taskc,
 	u64 right_load = *MEMBER_VPTR(right->dsq_load, [dsq_index]);
 
 	// If the other LLCs have more load than the current don't bother.
-	if ((nr_llcs > 2 && left_queued >= cur_queued && right_queued >= cur_queued) ||
-	    (nr_llcs > 2 && left_load > cur_load && right_load > cur_load))
+	if ((nr_llcs > 2 && left_load > cur_load && right_load > cur_load))
 		return -EINVAL;
 
 	if (min_nr_queued_pick2 > 0 &&
@@ -384,9 +383,7 @@ static s32 pick_two_cpu(struct llc_ctx *cur_llcx, struct task_ctx *taskc,
 	     right_queued < min_nr_queued_pick2))
 		return -EINVAL;
 
-	if (((left_queued > 0 || right_queued > 0) ||
-	    left_queued < right_queued) ||
-	    left_load < right_load) {
+	if (left_load < right_load) {
 		chosen = left;
 		goto pick_llc;
 	} else {
