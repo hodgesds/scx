@@ -59,6 +59,12 @@ enum stat_idx {
 	P2DQ_NR_STATS,
 };
 
+enum llc_stat_idx {
+	P2DQ_LLC_STAT_NR_TASKS,
+	P2DQ_LLC_STAT_NR_INTERACTIVE,
+	P2DQ_NR_LLC_STATS,
+};
+
 enum scheduler_mode {
 	MODE_PERFORMANCE,
 };

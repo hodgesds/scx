@@ -253,6 +253,32 @@ static inline void stat_inc(enum stat_idx idx)
 	stat_add(idx, 1);
 }
 
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__type(key, u32);
+	__type(value, u64);
+	__uint(max_entries, P2DQ_NR_LLC_STATS);
+} llc_stats SEC(".maps");
+
+static inline void llc_stat_add(enum llc_stat_idx idx, u64 amount)
+{
+	u32 idx_v = idx;
+	u64 *cnt_p = bpf_map_lookup_elem(&stats, &idx_v);
+	if (cnt_p)
+		(*cnt_p) += amount;
+}
+
+static inline void llc_stat_inc(enum llc_stat_idx idx)
+{
+	llc_stat_add(idx, 1);
+}
+
+
+static inline void llc_stat_dec(enum llc_stat_idx idx)
+{
+	llc_stat_add(idx, -1);
+}
+
 /*
  * Returns if the task is interactive based on the tasks DSQ index.
  */
@@ -929,6 +955,8 @@ void BPF_STRUCT_OPS(p2dq_stopping, struct task_struct *p, bool runnable)
 	// comparing the used time to the scaled DSQ slice.
 	if (used >= ((9 * last_dsq_slice_ns) / 10)) {
 		if (taskc->dsq_index < nr_dsqs_per_llc - 1) {
+			if (taskc->dsq_index == 0)
+				llc_stat_dec(P2DQ_LLC_STAT_NR_INTERACTIVE);
 			taskc->dsq_index += 1;
 			stat_inc(P2DQ_STAT_DSQ_CHANGE);
 			trace("%s[%p]: DSQ inc %llu -> %u", p->comm, p,
@@ -941,8 +969,10 @@ void BPF_STRUCT_OPS(p2dq_stopping, struct task_struct *p, bool runnable)
 		if (taskc->dsq_index > 0) {
 			taskc->dsq_index -= 1;
 			stat_inc(P2DQ_STAT_DSQ_CHANGE);
-			trace("%s[%p]: DSQ dec %llu -> %u", p->comm, p,
-			      taskc->last_dsq_index, taskc->dsq_index);
+			if (taskc->dsq_index == 0)
+				llc_stat_inc(P2DQ_LLC_STAT_NR_INTERACTIVE);
+			trace("%s[%p]: DSQ change %u -> %u slice %llu", p->comm, p,
+			      taskc->last_dsq_id, taskc->dsq_index, dsq_time_slice(taskc->dsq_index));
 		} else {
 			stat_inc(P2DQ_STAT_DSQ_SAME);
 		}
@@ -1152,12 +1182,28 @@ static __always_inline s32 p2dq_init_task_impl(struct task_struct *p,
 	taskc->all_cpus = p->cpus_ptr == &p->cpus_mask && p->nr_cpus_allowed == nr_cpus;
 	p->scx.dsq_vtime = llcx->vtime;
 
+	llc_stat_inc(P2DQ_LLC_STAT_NR_TASKS);
 	return 0;
 }
 
-void BPF_STRUCT_OPS(p2dq_exit_task, struct task_struct *p, struct scx_exit_task_args *args)
+void BPF_STRUCT_OPS(p2dq_exit_task, struct task_struct *p,
+		    struct scx_exit_task_args *args)
 {
+	task_ctx *taskc;
+	struct llc_ctx *llcx;
+	struct cpu_ctx *cpuc;
+
 	scx_task_free(p);
+
+	if (args->cancelled)
+		return;
+
+	if (!(cpuc = lookup_cpu_ctx(-1)) ||
+	    !(llcx = lookup_llc_ctx(cpuc->llc_id)) ||
+	    !(taskc = lookup_task_ctx(p)))
+		return;
+
+	llc_stat_dec(P2DQ_LLC_STAT_NR_TASKS);
 }
 
 static int init_llc(u32 llc_id)
