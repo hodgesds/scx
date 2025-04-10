@@ -434,7 +434,6 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *taskc,
 	struct node_ctx *nodec;
 	struct llc_ctx *llcx;
 	bool interactive = is_interactive(taskc);
-	int llc_idle = 0;
 	s32 cpu = prev_cpu;
 
 	idle_cpumask = scx_bpf_get_idle_cpumask();
@@ -450,10 +449,6 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *taskc,
 		goto found_cpu;
 
 	bpf_cpumask_and(llcx->tmp_cpumask, idle_cpumask, cast_mask(llcx->cpumask));
-	int nr_idle = bpf_cpumask_weight(idle_cpumask);
-	int nr_queued = scx_bpf_dsq_nr_queued(taskc->dsq_id);
-	if (llcx->tmp_cpumask)
-		llc_idle = bpf_cpumask_weight(cast_mask(llcx->tmp_cpumask));
 
 
 	// Special handling of tasks with custom affinities
@@ -555,9 +550,9 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *taskc,
 		}
 	}
 
-	if (nr_llcs > 1 &&
-	    (eager_load_balance ||
-	     (llc_idle == 0 && nr_queued > llcx->nr_cpus && nr_idle > 0))) {
+	int nr_idle = bpf_cpumask_weight(idle_cpumask);
+
+	if (nr_llcs > 1 && eager_load_balance) {
 		cpu = pick_two_cpu(llcx, taskc, is_idle);
 		if (cpu >= 0) {
 			stat_inc(P2DQ_STAT_SELECT_PICK2);
@@ -584,14 +579,15 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *taskc,
 	// First check if last CPU is idle
 	if (llcx->cpumask &&
 	    bpf_cpumask_test_cpu(prev_cpu, cast_mask(llcx->cpumask)) &&
-	    bpf_cpumask_test_cpu(prev_cpu, smt_enabled ? idle_smtmask : idle_cpumask)) {
+	    bpf_cpumask_test_cpu(prev_cpu, (smt_enabled && !interactive) ? idle_smtmask : idle_cpumask)) {
 		cpu = prev_cpu;
 		*is_idle = true;
 		goto found_cpu;
 	}
 
 	// Next try in the local LLC
-	if (llcx->cpumask &&
+	if (!interactive &&
+	    llcx->cpumask &&
 	    (cpu = scx_bpf_pick_idle_cpu(cast_mask(llcx->cpumask),
 					 SCX_PICK_IDLE_CORE)) >= 0) {
 		*is_idle = true;
