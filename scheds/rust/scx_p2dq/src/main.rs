@@ -7,11 +7,13 @@ pub use bpf_skel::*;
 
 pub mod bpf_intf;
 pub mod stats;
+use stats::LlcMetrics;
 use stats::Metrics;
 
 use scx_p2dq::SchedulerOpts;
 use scx_p2dq::TOPO;
 
+use std::collections::BTreeMap;
 use std::mem::MaybeUninit;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -50,6 +52,10 @@ use crate::bpf_intf::stat_idx_P2DQ_STAT_SELECT_PICK2;
 use crate::bpf_intf::stat_idx_P2DQ_STAT_WAKE_LLC;
 use crate::bpf_intf::stat_idx_P2DQ_STAT_WAKE_MIG;
 use crate::bpf_intf::stat_idx_P2DQ_STAT_WAKE_PREV;
+
+use crate::bpf_intf::llc_stat_idx_P2DQ_LLC_STAT_NR_INTERACTIVE;
+use crate::bpf_intf::llc_stat_idx_P2DQ_LLC_STAT_NR_TASKS;
+use crate::bpf_intf::llc_stat_idx_P2DQ_NR_LLC_STATS;
 
 /// scx_p2dq: A pick 2 dumb queuing load balancing scheduler.
 ///
@@ -139,6 +145,30 @@ impl<'a> Scheduler<'a> {
                 .sum();
             stats[stat as usize] = sum;
         }
+        let mut llc_metrics: BTreeMap<usize, LlcMetrics> = BTreeMap::new();
+        for llc in TOPO.all_llcs.values() {
+            let mut llc_stats = vec![0u64; llc_stat_idx_P2DQ_NR_LLC_STATS as usize];
+            let stats_map = &self.skel.maps.llc_stats;
+            for stat in 0..llc_stat_idx_P2DQ_NR_LLC_STATS {
+                let cpu_stat_vec: Vec<Vec<u8>> = stats_map
+                    .lookup_percpu(&stat.to_ne_bytes(), libbpf_rs::MapFlags::ANY)
+                    .unwrap()
+                    .unwrap();
+                let sum: u64 = cpu_stat_vec
+                    .iter()
+                    .map(|val| u64::from_ne_bytes(val.as_slice().try_into().unwrap()))
+                    .sum();
+                llc_stats[stat as usize] = sum;
+            }
+            llc_metrics.insert(
+                llc.id,
+                LlcMetrics {
+                    index: llc.id,
+                    tasks: stats[llc_stat_idx_P2DQ_LLC_STAT_NR_TASKS as usize],
+                    interactive_tasks: stats[llc_stat_idx_P2DQ_LLC_STAT_NR_INTERACTIVE as usize],
+                },
+            );
+        }
         Metrics {
             direct: stats[stat_idx_P2DQ_STAT_DIRECT as usize],
             idle: stats[stat_idx_P2DQ_STAT_IDLE as usize],
@@ -153,6 +183,7 @@ impl<'a> Scheduler<'a> {
             wake_prev: stats[stat_idx_P2DQ_STAT_WAKE_PREV as usize],
             wake_llc: stats[stat_idx_P2DQ_STAT_WAKE_LLC as usize],
             wake_mig: stats[stat_idx_P2DQ_STAT_WAKE_MIG as usize],
+            llc_metrics,
         }
     }
 

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -10,6 +11,29 @@ use scx_stats_derive::stat_doc;
 use scx_stats_derive::Stats;
 use serde::Deserialize;
 use serde::Serialize;
+
+#[stat_doc]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Stats)]
+#[stat(_om_prefix = "llc_", _om_label = "LlcMetrics")]
+pub struct LlcMetrics {
+    #[stat(desc = "Index", _om_skip)]
+    pub index: usize,
+    #[stat(desc = "Number of tasks")]
+    pub tasks: u64,
+    #[stat(desc = "Number of interactive tasks")]
+    pub interactive_tasks: u64,
+}
+
+impl LlcMetrics {
+    fn format<W: Write>(&self, w: &mut W) -> Result<()> {
+        writeln!(
+            w,
+            "LLC {}\n\ttasks/interactive {}/{}",
+            self.index, self.tasks, self.interactive_tasks,
+        )?;
+        Ok(())
+    }
+}
 
 #[stat_doc]
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Stats)]
@@ -41,6 +65,8 @@ pub struct Metrics {
     pub wake_llc: u64,
     #[stat(desc = "Number of times tasks have been woken and migrated llc")]
     pub wake_mig: u64,
+    #[stat(desc = "LLC metrics")]
+    pub llc_metrics: BTreeMap<usize, LlcMetrics>,
 }
 
 impl Metrics {
@@ -61,10 +87,26 @@ impl Metrics {
             self.llc_migrations,
             self.node_migrations,
         )?;
+        for llc_metrics in self.llc_metrics.values() {
+            llc_metrics.format(w)?;
+        }
         Ok(())
     }
 
-    fn delta(&self, rhs: &Self) -> Self {
+    fn delta(&self, rhs: &mut Self) -> Self {
+        let mut llc_metrics = BTreeMap::new();
+        for (llc_id, cur_llc) in &self.llc_metrics {
+            let rhs_llc = &rhs.llc_metrics.entry(*llc_id).or_default();
+            llc_metrics.insert(
+                *llc_id,
+                LlcMetrics {
+                    index: cur_llc.index,
+                    tasks: cur_llc.tasks - rhs_llc.tasks,
+                    interactive_tasks: cur_llc.interactive_tasks - rhs_llc.interactive_tasks,
+                },
+            );
+        }
+
         Self {
             direct: self.direct - rhs.direct,
             idle: self.idle - rhs.idle,
@@ -78,6 +120,7 @@ impl Metrics {
             wake_prev: self.wake_prev - rhs.wake_prev,
             wake_llc: self.wake_llc - rhs.wake_llc,
             wake_mig: self.wake_mig - rhs.wake_mig,
+            llc_metrics,
             ..self.clone()
         }
     }
@@ -90,7 +133,7 @@ pub fn server_data() -> StatsServerData<(), Metrics> {
         let read: Box<dyn StatsReader<(), Metrics>> = Box::new(move |_args, (req_ch, res_ch)| {
             req_ch.send(())?;
             let cur = res_ch.recv()?;
-            let delta = cur.delta(&prev);
+            let delta = cur.delta(&mut prev);
             prev = cur;
             delta.to_json()
         });
@@ -100,6 +143,7 @@ pub fn server_data() -> StatsServerData<(), Metrics> {
 
     StatsServerData::new()
         .add_meta(Metrics::meta())
+        .add_meta(LlcMetrics::meta())
         .add_ops("top", StatsOps { open, close: None })
 }
 
