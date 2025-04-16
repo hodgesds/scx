@@ -589,8 +589,7 @@ static s32 pick_idle_cpu(struct task_struct *p, struct task_ctx *taskc,
 	}
 
 	// Next try in the local LLC
-	if (!interactive &&
-	    llcx->cpumask &&
+	if (llcx->cpumask &&
 	    (cpu = scx_bpf_pick_idle_cpu(cast_mask(llcx->cpumask),
 					 SCX_PICK_IDLE_CORE)) >= 0) {
 		*is_idle = true;
