@@ -31,6 +31,8 @@ enum consts {
 	MSEC_PER_SEC		= 1000ULL,
 	NSEC_PER_SEC		= NSEC_PER_MSEC * MSEC_PER_SEC,
 
+	TARGET_LATENCY_NS	= (20ULL * NSEC_PER_MSEC),
+
 	// kernel definitions
 	CLOCK_BOOTTIME		= 7,
 };

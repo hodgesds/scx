@@ -48,6 +48,9 @@ const volatile u64 min_llc_runs_pick2 = 5;
 const volatile u32 interactive_ratio = 10;
 const volatile u32 min_nr_queued_pick2 = 10;
 
+const volatile u64 target_latency_ns = TARGET_LATENCY_NS;
+const volatile bool deadline_scheduling = false;
+
 const volatile bool autoslice = true;
 const volatile bool dispatch_pick2_disable = false;
 const volatile bool eager_load_balance = true;
@@ -86,18 +89,23 @@ private(A) struct bpf_cpumask __kptr *all_cpumask;
 private(A) struct bpf_cpumask __kptr *big_cpumask;
 
 
-static u64 max(u64 a, u64 b)
+static __always_inline u64 max(u64 a, u64 b)
 {
 	return a >= b ? a : b;
 }
 
-static __always_inline u64 dsq_time_slice(int dsq_id)
+static __always_inline u64 min(u64 a, u64 b)
 {
-	if (dsq_id > nr_dsqs_per_llc || dsq_id < 0) {
-		scx_bpf_error("Invalid DSQ id");
+	return a <= b ? a : b;
+}
+
+static __always_inline u64 dsq_time_slice(int dsq_index)
+{
+	if (dsq_index > nr_dsqs_per_llc || dsq_index < 0) {
+		scx_bpf_error("Invalid DSQ index");
 		return 0;
 	}
-	return dsq_time_slices[dsq_id];
+	return dsq_time_slices[dsq_index];
 }
 
 struct p2dq_timer p2dq_timers[MAX_TIMERS] = {
@@ -247,6 +255,49 @@ static bool is_interactive(struct task_ctx *taskc)
 		return false;
 	// For now only the shortest duration DSQ is considered interactive.
 	return taskc->dsq_index == 0;
+}
+
+/*
+ * Returns a deadline slice_ns for a task
+ */
+static __always_inline u64 task_deadline_slice_ns(u64 dsq_index, struct cpu_ctx *cpuc,
+						  struct llc_ctx *llcx)
+{
+	u64 dsq_id = cpu_dsq_id(dsq_index, cpuc);
+	u64 dsq_nr_queued = scx_bpf_dsq_nr_queued(dsq_id);
+
+	if (dsq_nr_queued < 1)
+		return dsq_time_slice(dsq_index);
+
+	u64 dsq_slice = dsq_time_slice(dsq_index);
+
+	u64 nr_queued, requested_sum = 0;
+	int i;
+	bpf_for(i, 0, nr_dsqs_per_llc) {
+		nr_queued = scx_bpf_dsq_nr_queued(cpu_dsq_id(i, cpuc));
+		requested_sum += nr_queued * dsq_time_slice(i);
+	}
+
+	// u64 slice_ns = (runtime_sum / llcx->nr_cpus) / target_latency_ns;
+	u64 target_sum = (target_latency_ns * llcx->nr_cpus);
+	if (target_sum > requested_sum)
+		return target_sum / requested_sum;
+
+	return dsq_slice;
+	// return min(slice_ns, dsq_slice);
+	// if (runtime_sum > TARGET_LATENCY_NS) {
+	// 	u64 slice_ns = min(TARGET_LATENCY_NS / dsq_nr_queued, dsq_slice);
+	// 	return slice_ns;
+	// }
+
+	// The deadline is how many interactive tasks can complete in the time
+	// a non interactive task slice.
+	//u64 slice_ns = dsq_time_slice((dsq_index < nr_dsqs_per_llc - 1) ? dsq_index + 1 : dsq_index) / nr_queued;
+	// u64 slice_ns = dsq_time_slice((dsq_index < nr_dsqs_per_llc - 1) ? dsq_index + 1 : dsq_index);
+	// slice_ns = sum / (slice_ns * nr_queued_sum);
+
+	// if (slice_ns > dsq_slice)
+	// 	return dsq_slice;
 }
 
 /*
@@ -669,8 +720,11 @@ found_cpu:
 static __always_inline s32 p2dq_select_cpu_impl(struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
 	struct task_ctx *taskc;
+	struct cpu_ctx *cpuc;
+	struct llc_ctx *llcx;
 	bool is_idle = false;
 	s32 cpu;
+	u64 slice_ns;
 
 	if (!(taskc = lookup_task_ctx(p)))
 		return prev_cpu;
@@ -678,7 +732,13 @@ static __always_inline s32 p2dq_select_cpu_impl(struct task_struct *p, s32 prev_
 	cpu = pick_idle_cpu(p, taskc, prev_cpu, wake_flags, &is_idle);
 	if (is_idle) {
 		stat_inc(P2DQ_STAT_IDLE);
-		u64 slice_ns = dsq_time_slice(taskc->dsq_index);
+		if (deadline_scheduling &&
+		    (cpuc = lookup_cpu_ctx(cpu)) &&
+		    (llcx = lookup_llc_ctx(cpuc->llc_id))) {
+			slice_ns = task_deadline_slice_ns(taskc->dsq_index, cpuc, llcx);
+		} else {
+			slice_ns = dsq_time_slice(taskc->dsq_index);
+		}
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_ns, 0);
 	}
 
@@ -703,7 +763,7 @@ static __always_inline void async_p2dq_enqueue(struct enqueue_promise *ret,
 	struct llc_ctx *llcx, *prev_llcx;
 	struct cpu_ctx *cpuc, *task_cpuc;
 	struct task_ctx *taskc;
-	u64 dsq_id;
+	u64 dsq_id, slice_ns;
 
 	s32 cpu, task_cpu = scx_bpf_task_cpu(p);
 
@@ -716,7 +776,6 @@ static __always_inline void async_p2dq_enqueue(struct enqueue_promise *ret,
 	}
 
 	u64 vtime_now = llcx->vtime;
-	u64 slice_ns = dsq_time_slice(taskc->dsq_index);
 
 	// If the task in in another LLC need to update vtime.
 	if (taskc->llc_id != cpuc->llc_id) {
@@ -732,6 +791,12 @@ static __always_inline void async_p2dq_enqueue(struct enqueue_promise *ret,
 	}
 
 	u64 vtime = p->scx.dsq_vtime;
+
+	if (deadline_scheduling && cpuc) {
+		slice_ns = task_deadline_slice_ns(taskc->dsq_index, cpuc, llcx);
+	} else {
+		slice_ns = dsq_time_slice(taskc->dsq_index);
+	}
 
 	/*
 	 * Limit the amount of budget that an idling task can accumulate to the
@@ -765,6 +830,13 @@ static __always_inline void async_p2dq_enqueue(struct enqueue_promise *ret,
 		cpu = pick_idle_cpu(p, taskc, taskc->cpu, 0, &is_idle);
 		cpuc = lookup_cpu_ctx(cpu);
 		if (cpuc && taskc->dsq_index >= 0 && taskc->dsq_index < nr_dsqs_per_llc) {
+			if (deadline_scheduling &&
+			    (cpuc = lookup_cpu_ctx(cpu)) &&
+			    (llcx = lookup_llc_ctx(cpuc->llc_id))) {
+				slice_ns = task_deadline_slice_ns(taskc->dsq_index, cpuc, llcx);
+			} else {
+				slice_ns = dsq_time_slice(taskc->dsq_index);
+			}
 			dsq_id = cpu_dsq_id(taskc->dsq_index, cpuc);
 			scx_bpf_dsq_insert_vtime(p, dsq_id, slice_ns, vtime, enq_flags);
 			if (is_idle) {
