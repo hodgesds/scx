@@ -31,6 +31,8 @@ enum consts {
 	MSEC_PER_SEC		= 1000ULL,
 	NSEC_PER_SEC		= NSEC_PER_MSEC * MSEC_PER_SEC,
 
+	TARGET_LATENCY_NS	= (20ULL * NSEC_PER_MSEC),
+
 	// kernel definitions
 	CLOCK_BOOTTIME		= 7,
 };
@@ -112,6 +114,7 @@ struct llc_ctx {
 	u64				vtime;
 	u64				last_period_ns;
 	u64				load;
+	u64				target_load_sum;
 	bool				all_big;
 	u64				dsqs[MAX_DSQS_PER_LLC];
 	u64				dsq_max_vtime[MAX_DSQS_PER_LLC];
