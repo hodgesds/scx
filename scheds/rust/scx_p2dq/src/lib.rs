@@ -36,6 +36,10 @@ pub struct SchedulerOpts {
     #[clap(short = 'r', long, default_value = "10")]
     pub interactive_ratio: usize,
 
+    /// Ratio of interactive tasks vtime scaling, percent value from 1-99.
+    #[clap(short = 'r', long, default_value = "100")]
+    pub interactive_vtime_scaling_ratio: usize,
+
     /// Disables eager pick2 load balancing.
     #[clap(short = 'e', long, action = clap::ArgAction::SetTrue)]
     pub eager_load_balance: bool,
@@ -177,6 +181,8 @@ macro_rules! init_open_skel {
             }
 
             $skel.maps.rodata_data.interactive_ratio = opts.interactive_ratio as u32;
+            $skel.maps.rodata_data.interactive_vtime_scaling_ratio =
+                opts.interactive_vtime_scaling_ratio as u32;
             $skel.maps.rodata_data.min_slice_us = opts.min_slice_us;
             $skel.maps.rodata_data.min_nr_queued_pick2 = opts.min_nr_queued_pick2;
             $skel.maps.rodata_data.min_llc_runs_pick2 = opts.min_llc_runs_pick2;

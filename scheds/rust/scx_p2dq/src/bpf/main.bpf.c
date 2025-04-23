@@ -46,6 +46,7 @@ const volatile int init_dsq_index = 0;
 const volatile u64 min_slice_us = 100;
 const volatile u64 min_llc_runs_pick2 = 5;
 const volatile u32 interactive_ratio = 10;
+const volatile u32 interactive_vtime_scaling_ratio = 100;
 const volatile u32 min_nr_queued_pick2 = 10;
 
 const volatile bool autoslice = true;
@@ -891,7 +892,10 @@ void BPF_STRUCT_OPS(p2dq_stopping, struct task_struct *p, bool runnable)
 	taskc->last_dsq_id = taskc->dsq_id;
 	taskc->last_dsq_index = dsq_index;
 	__sync_fetch_and_add(&llcx->vtime, scaled_used);
-	__sync_fetch_and_add(&llcx->dsq_max_vtime[dsq_index], scaled_used);
+	if (dsq_index == 0)
+		__sync_fetch_and_add(&llcx->dsq_max_vtime[dsq_index], ((interactive_vtime_scaling_ratio * scaled_used) / 100));
+	else
+		__sync_fetch_and_add(&llcx->dsq_max_vtime[dsq_index], scaled_used);
 	__sync_fetch_and_add(&llcx->dsq_load[dsq_index], used);
 	__sync_fetch_and_add(&llcx->load, used);
 
