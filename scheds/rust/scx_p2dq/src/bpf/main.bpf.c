@@ -679,6 +679,8 @@ static __always_inline s32 p2dq_select_cpu_impl(struct task_struct *p, s32 prev_
 	if (is_idle) {
 		stat_inc(P2DQ_STAT_IDLE);
 		u64 slice_ns = dsq_time_slice(taskc->dsq_index);
+		if (taskc->dsq_index == 0)
+			slice_ns += taskc->interactive_boost;
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, slice_ns, 0);
 	}
 
@@ -766,6 +768,8 @@ static __always_inline void async_p2dq_enqueue(struct enqueue_promise *ret,
 		cpuc = lookup_cpu_ctx(cpu);
 		if (cpuc && taskc->dsq_index >= 0 && taskc->dsq_index < nr_dsqs_per_llc) {
 			dsq_id = cpu_dsq_id(taskc->dsq_index, cpuc);
+			if (taskc->dsq_index == 0)
+				slice_ns += taskc->interactive_boost;
 			scx_bpf_dsq_insert_vtime(p, dsq_id, slice_ns, vtime, enq_flags);
 			if (is_idle) {
 				stat_inc(P2DQ_STAT_IDLE);
@@ -778,6 +782,8 @@ static __always_inline void async_p2dq_enqueue(struct enqueue_promise *ret,
 	}
 
 	dsq_id = cpu_dsq_id(taskc->dsq_index, cpuc);
+	if (taskc->dsq_index == 0)
+		slice_ns += taskc->interactive_boost;
 
 	ret->kind = P2DQ_ENQUEUE_PROMISE_VTIME;
 	ret->vtime.dsq_id = dsq_id;
@@ -868,6 +874,7 @@ void BPF_STRUCT_OPS(p2dq_stopping, struct task_struct *p, bool runnable)
 	struct llc_ctx *llcx;
 	u64 used, scaled_used, last_dsq_slice_ns;
 	u64 now = scx_bpf_now();
+	int prev_index;
 
 	if (!(taskc = lookup_task_ctx(p)))
 		return;
@@ -885,6 +892,7 @@ void BPF_STRUCT_OPS(p2dq_stopping, struct task_struct *p, bool runnable)
 		return;
 	}
 
+	prev_index = taskc->last_dsq_index;
 	used = now - taskc->last_run_at;
 	scaled_used = scale_by_task_weight_inverse(p, used);
 	p->scx.dsq_vtime += scaled_used;
@@ -909,6 +917,11 @@ void BPF_STRUCT_OPS(p2dq_stopping, struct task_struct *p, bool runnable)
 	// If under half the slice was consumed move the task back down.
 	} else if (used < last_dsq_slice_ns / 2) {
 		if (taskc->dsq_index > 0) {
+			// Task was interactive, then wasn't and now
+			// interactive again. Add a boost.
+			if (prev_index == 0)
+				taskc->interactive_boost += used / 2;
+
 			taskc->dsq_index -= 1;
 			stat_inc(P2DQ_STAT_DSQ_CHANGE);
 			trace("%s[%p]: DSQ change %u -> %u slice %llu", p->comm, p,
@@ -917,6 +930,8 @@ void BPF_STRUCT_OPS(p2dq_stopping, struct task_struct *p, bool runnable)
 			stat_inc(P2DQ_STAT_DSQ_SAME);
 		}
 	} else {
+		if (prev_index == 0)
+			taskc->interactive_boost = 0;
 		stat_inc(P2DQ_STAT_DSQ_SAME);
 	}
 }
@@ -1110,6 +1125,7 @@ static __always_inline s32 p2dq_init_task_impl(struct task_struct *p,
 	taskc->node_id = cpuc->node_id;
 	taskc->dsq_index = init_dsq_index;
 	taskc->last_dsq_index = init_dsq_index;
+	taskc->interactive_boost = 0;
 	taskc->runnable = true;
 	taskc->all_cpus = p->cpus_ptr == &p->cpus_mask && p->nr_cpus_allowed == nr_cpus;
 	p->scx.dsq_vtime = llcx->vtime;

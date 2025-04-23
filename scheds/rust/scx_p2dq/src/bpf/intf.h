@@ -77,6 +77,7 @@ struct task_ctx {
 	u32			node_id;
 	bool			runnable;
 	u32			weight;
+	u64			interactive_boost;
 	u64			last_dsq_id;
 	int			last_dsq_index;
 	u64 			last_run_at;
