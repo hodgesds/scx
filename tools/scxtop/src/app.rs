@@ -2132,14 +2132,16 @@ impl<'a> App<'a> {
 
     /// Handles MangoApp pressure events.
     pub fn on_mangoapp(&mut self, action: &MangoAppAction) -> Result<()> {
-        self.last_mangoapp_action = Some(action.clone());
-        // Update the perf event to the mangoapp event
-        if action.pid as i32 != self.process_id && action.pid > 0 {
-            self.prev_process_id = self.process_id;
-            self.process_id = action.pid as i32;
-            // reactivate the active perf event with the pid from mangoapp
-            let perf_event = &self.available_events[self.active_hw_event_id].clone();
-            let _ = self.activate_perf_event(perf_event);
+        if self.state == AppState::MangoApp {
+            self.last_mangoapp_action = Some(action.clone());
+            // Update the perf event to the mangoapp event
+            if action.pid as i32 != self.process_id && action.pid > 0 {
+                self.prev_process_id = self.process_id;
+                self.process_id = action.pid as i32;
+                // reactivate the active perf event with the pid from mangoapp
+                let perf_event = self.active_event.clone();
+                let _ = self.activate_perf_event(&perf_event);
+            }
         }
         Ok(())
     }
