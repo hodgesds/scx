@@ -58,6 +58,7 @@ const volatile bool autoslice = true;
 const volatile bool dispatch_pick2_disable = false;
 const volatile bool eager_load_balance = true;
 const volatile bool interactive_sticky = false;
+const volatile bool interactive_fifo = false;
 const volatile bool keep_running_enabled = true;
 const volatile bool kthreads_local = true;
 const volatile bool max_dsq_pick2 = false;
@@ -813,7 +814,11 @@ static __always_inline void async_p2dq_enqueue(struct enqueue_promise *ret,
 
 	taskc->dsq_id = cpu_dsq_id(taskc->dsq_index, cpuc);
 
-	ret->kind = P2DQ_ENQUEUE_PROMISE_VTIME;
+	if (interactive_fifo && taskc->dsq_id == 0)
+		ret->kind = P2DQ_ENQUEUE_PROMISE_VTIME;
+	else
+		ret->kind = P2DQ_ENQUEUE_PROMISE_VTIME;
+
 	ret->vtime.dsq_id = taskc->dsq_id;
 	ret->vtime.enq_flags = enq_flags;
 	ret->vtime.slice_ns = taskc->slice_ns;
