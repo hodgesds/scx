@@ -475,7 +475,7 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 		goto found_cpu;
 
 	// Special handling of tasks with custom affinities
-	if (!taskc->all_cpus) {
+	if (unlikely(!taskc->all_cpus)) {
 		wrapper = bpf_task_storage_get(&task_masks, p, 0, 0);
 		if (!wrapper) {
 			cpu = prev_cpu;
@@ -546,7 +546,7 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 	 * (WAKE_SYNC), attempt to migrate the wakee on the same CPU as the
 	 * waker.
 	 */
-	if (wake_flags & SCX_WAKE_SYNC) {
+	if (unlikely(wake_flags & SCX_WAKE_SYNC)) {
 		struct task_struct *current = (void *)bpf_get_current_task_btf();
 		task_ctx *cur_taskc = scx_task_data(current);
 		// Shouldn't happen, but makes code easier to follow
@@ -644,7 +644,7 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 		goto found_cpu;
 	}
 
-	if (has_little_cores && llcx->little_cpumask && llcx->big_cpumask) {
+	if (unlikely(has_little_cores && llcx->little_cpumask && llcx->big_cpumask)) {
 		if (interactive) {
 			if ((cpu = scx_bpf_pick_idle_cpu(cast_mask(llcx->little_cpumask),
 							 0)) >= 0) {
@@ -677,10 +677,10 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 	}
 
 	// Non-interactive tasks load balance
-	if (nr_llcs > 1 &&
+	if (unlikely(nr_llcs > 1 &&
 	    !interactive &&
 	    wakeup_lb_busy > 0 &&
-	    (cpu = pick_two_cpu(llcx, taskc, is_idle)) >= 0) {
+	    (cpu = pick_two_cpu(llcx, taskc, is_idle)) >= 0)) {
 		stat_inc(P2DQ_STAT_SELECT_PICK2);
 		goto found_cpu;
 	}
