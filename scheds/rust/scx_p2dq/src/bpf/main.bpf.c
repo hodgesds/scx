@@ -59,6 +59,7 @@ const volatile u64 min_llc_runs_pick2 = 5;
 const volatile u32 interactive_ratio = 10;
 const volatile u32 min_nr_queued_pick2 = 10;
 
+const volatile bool arena_task_ctx = true;
 const volatile bool autoslice = true;
 const volatile bool dispatch_pick2_disable = false;
 const volatile bool eager_load_balance = true;
@@ -224,16 +225,29 @@ struct mask_wrapper {
 	struct bpf_cpumask __kptr *mask;
 };
 
+// struct {
+// 	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
+// 	__uint(map_flags, BPF_F_NO_PREALLOC);
+// 	__type(key, int);
+// 	__type(value, struct mask_wrapper);
+// } task_masks SEC(".maps");
+
 struct {
 	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
 	__uint(map_flags, BPF_F_NO_PREALLOC);
 	__type(key, int);
-	__type(value, struct mask_wrapper);
-} task_masks SEC(".maps");
+	__type(value, task_ctx);
+} task_ctxs SEC(".maps");
+
+static task_ctx *lookup_task_ctx_may_fail(struct task_struct *p)
+{
+	return bpf_task_storage_get(&task_ctxs, p, 0, 0);
+}
 
 static task_ctx *lookup_task_ctx(struct task_struct *p)
 {
-	task_ctx *taskc = scx_task_data(p);
+	// task_ctx *taskc = scx_task_data(p);
+	task_ctx *taskc = lookup_task_ctx_may_fail(p);
 
 	if (!taskc)
 		scx_bpf_error("task_ctx lookup failed");
@@ -486,7 +500,7 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 			 s32 prev_cpu, u64 wake_flags, bool *is_idle)
 {
 	const struct cpumask *idle_smtmask, *idle_cpumask;
-	struct mask_wrapper *wrapper;
+	//struct mask_wrapper *wrapper;
 	struct cpu_ctx *prev_cpuc;
 	struct bpf_cpumask *mask;
 	struct llc_ctx *llcx;
@@ -520,13 +534,14 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 			goto found_cpu;
 		}
 
-		wrapper = bpf_task_storage_get(&task_masks, p, 0, 0);
-		if (!wrapper) {
-			cpu = prev_cpu;
-			goto found_cpu;
-		}
+		mask = taskc->mask;
+		// wrapper = bpf_task_storage_get(&task_masks, p, 0, 0);
+		// if (!wrapper) {
+		// 	cpu = prev_cpu;
+		// 	goto found_cpu;
+		// }
 
-		mask = wrapper->mask;
+		// mask = wrapper->mask;
 		if (!mask) {
 			cpu = prev_cpu;
 			goto found_cpu;
@@ -586,7 +601,8 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 	 */
 	if (wake_flags & SCX_WAKE_SYNC) {
 		struct task_struct *current = (void *)bpf_get_current_task_btf();
-		task_ctx *cur_taskc = scx_task_data(current);
+		// task_ctx *cur_taskc = scx_task_data(current);
+		task_ctx *cur_taskc = lookup_task_ctx_may_fail(current);
 		// Shouldn't happen, but makes code easier to follow
 		if (!cur_taskc) {
 			cpu = prev_cpu;
@@ -1131,7 +1147,7 @@ void BPF_STRUCT_OPS(p2dq_set_cpumask, struct task_struct *p,
 static __always_inline s32 p2dq_init_task_impl(struct task_struct *p,
 					       struct scx_init_task_args *args)
 {
-	struct mask_wrapper *wrapper;
+	// struct mask_wrapper *wrapper;
 	struct bpf_cpumask *cpumask;
 	task_ctx *taskc;
 	struct cpu_ctx *cpuc;
@@ -1139,7 +1155,9 @@ static __always_inline s32 p2dq_init_task_impl(struct task_struct *p,
 
 	s32 task_cpu = scx_bpf_task_cpu(p);
 
-	taskc = scx_task_alloc(p);
+	taskc = bpf_task_storage_get(&task_ctxs, p, 0,
+				     BPF_LOCAL_STORAGE_GET_F_CREATE);
+	// taskc = scx_task_alloc(p);
 	if (!taskc) {
 		scx_bpf_error("task_ctx allocation failure");
 		return -ENOMEM;
@@ -1154,15 +1172,20 @@ static __always_inline s32 p2dq_init_task_impl(struct task_struct *p,
 		return -ENOMEM;
 	}
 
-	wrapper = bpf_task_storage_get(&task_masks, p, 0,
-				    BPF_LOCAL_STORAGE_GET_F_CREATE);
-	if (!wrapper) {
-		bpf_cpumask_release(cpumask);
-		scx_bpf_error("task mask allocation failure");
-		return -ENOMEM;
-	}
+	//wrapper = bpf_task_storage_get(&task_masks, p, 0,
+	//			    BPF_LOCAL_STORAGE_GET_F_CREATE);
+	//if (!wrapper) {
+	//	bpf_cpumask_release(cpumask);
+	//	scx_bpf_error("task mask allocation failure");
+	//	return -ENOMEM;
+	//}
 
-	if ((cpumask = bpf_kptr_xchg(&wrapper->mask, cpumask))) {
+	// if ((cpumask = bpf_kptr_xchg(&wrapper->mask, cpumask))) {
+	// 	bpf_cpumask_release(cpumask);
+	// 	scx_bpf_error("task_ctx allocation failure");
+	// 	return -EINVAL;
+	// }
+	if ((cpumask = bpf_kptr_xchg(&taskc->mask, cpumask))) {
 		bpf_cpumask_release(cpumask);
 		scx_bpf_error("task_ctx allocation failure");
 		return -EINVAL;
@@ -1184,7 +1207,7 @@ static __always_inline s32 p2dq_init_task_impl(struct task_struct *p,
 
 void BPF_STRUCT_OPS(p2dq_exit_task, struct task_struct *p, struct scx_exit_task_args *args)
 {
-	scx_task_free(p);
+	// scx_task_free(p);
 }
 
 static int init_llc(u32 llc_id)
@@ -1693,9 +1716,65 @@ void BPF_STRUCT_OPS(p2dq_running, struct task_struct *p)
 
 void BPF_STRUCT_OPS(p2dq_enqueue, struct task_struct *p __arg_trusted, u64 enq_flags)
 {
-	struct enqueue_promise pro;
-	async_p2dq_enqueue(&pro, p, enq_flags);
-	complete_p2dq_enqueue(&pro, p);
+	struct cpu_ctx *cpuc;
+	struct llc_ctx *llcx;
+	task_ctx *taskc;
+	s32 cpu;
+
+	/*
+	 * Per-cpu kthreads are considered interactive and dispatched directly
+	 * into the local DSQ.
+	 */
+	if ((p->flags & PF_KTHREAD) && p->cpus_ptr == &p->cpus_mask && p->nr_cpus_allowed == nr_cpus &&
+	    kthreads_local) {
+		stat_inc(P2DQ_STAT_DIRECT);
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, dsq_time_slices[0], enq_flags);
+		return;
+	}
+
+	if(!(taskc = lookup_task_ctx(p))) {
+		scx_bpf_error("invalid lookup");
+		return;
+	}
+
+	// If an idle CPU hasn't been found in select_cpu find one now
+	if ((select_idle_in_enqueue && !__COMPAT_is_enq_cpu_selected(enq_flags)) ||
+	    !taskc->all_cpus) {
+		bool is_idle = false;
+		cpu = pick_idle_cpu(p, taskc, taskc->cpu, 0, &is_idle);
+		if (!(cpuc = lookup_cpu_ctx(cpu)) ||
+		     !(llcx = lookup_llc_ctx(cpuc->llc_id))) {
+			scx_bpf_error("invalid lookup");
+			return;
+		}
+
+		taskc->dsq_id = cpu_dsq_id(taskc->dsq_index, cpuc);
+		update_vtime(p, cpuc, taskc, llcx->vtime);
+		if (interactive_fifo && taskc->dsq_index == 0) {
+			scx_bpf_dsq_insert(p, taskc->dsq_id, taskc->slice_ns, enq_flags);
+		} else {
+			scx_bpf_dsq_insert_vtime(p, taskc->dsq_id, taskc->slice_ns, p->scx.dsq_vtime, enq_flags);
+		}
+		if (is_idle) {
+			stat_inc(P2DQ_STAT_IDLE);
+			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+		}
+		return;
+	}
+
+	if (!(cpuc = lookup_cpu_ctx(scx_bpf_task_cpu(p))) ||
+	    !(llcx = lookup_llc_ctx(cpuc->llc_id))) {
+		scx_bpf_error("invalid lookup");
+		return;
+	}
+
+	taskc->dsq_id = cpu_dsq_id(taskc->dsq_index, cpuc);
+	update_vtime(p, cpuc, taskc, llcx->vtime);
+	if (interactive_fifo && taskc->dsq_index == 0) {
+		scx_bpf_dsq_insert(p, taskc->dsq_id, taskc->slice_ns, enq_flags);
+	} else {
+		scx_bpf_dsq_insert_vtime(p, taskc->dsq_id, taskc->slice_ns, p->scx.dsq_vtime, enq_flags);
+	}
 }
 
 void BPF_STRUCT_OPS(p2dq_dispatch, s32 cpu, struct task_struct *prev)
