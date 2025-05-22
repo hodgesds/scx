@@ -313,6 +313,22 @@ static __always_inline void update_vtime(struct task_struct *p,
 	return;
 }
 
+static void maybe_kick_cpu(struct cpu_ctx *cpuc)
+{
+	int i;
+
+	if (scx_bpf_test_and_clear_cpu_idle(cpuc->id))
+		return;
+
+	bpf_for(i, 0, nr_dsqs_per_llc) {
+		if (scx_bpf_dsq_nr_queued(cpuc->dsqs[i])) {
+			scx_bpf_kick_cpu(cpuc->id, SCX_KICK_IDLE);
+			stat_inc(P2DQ_STAT_IDLE);
+			break;
+		}
+	}
+}
+
 /*
  * Returns a random llc_ctx
  */
@@ -831,38 +847,54 @@ static __always_inline void async_p2dq_enqueue(struct enqueue_promise *ret,
 		return;
 	}
 
+	ret->task_cpu = cpuc->id;
 	taskc->dsq_id = cpu_dsq_id(taskc->dsq_index, cpuc);
 	update_vtime(p, cpuc, taskc, llcx->vtime);
 
 	if (interactive_fifo && taskc->dsq_index == 0) {
-		ret->kind = P2DQ_ENQUEUE_PROMISE_FIFO;
-		ret->fifo.dsq_id = taskc->dsq_id;
-		ret->fifo.enq_flags = enq_flags;
-		ret->fifo.slice_ns = taskc->slice_ns;
+		scx_bpf_dsq_insert(p, taskc->dsq_id, taskc->slice_ns, enq_flags);
 	} else {
-		ret->kind = P2DQ_ENQUEUE_PROMISE_VTIME;
-		ret->vtime.dsq_id = taskc->dsq_id;
-		ret->vtime.enq_flags = enq_flags;
-		ret->vtime.slice_ns = taskc->slice_ns;
-		ret->vtime.vtime = p->scx.dsq_vtime;
+		scx_bpf_dsq_insert_vtime(p, taskc->dsq_id, taskc->slice_ns, p->scx.dsq_vtime, enq_flags);
 	}
+	maybe_kick_cpu(cpuc);
+	ret->kind = P2DQ_ENQUEUE_PROMISE_COMPLETE;
+
+	// if (interactive_fifo && taskc->dsq_index == 0) {
+	// 	ret->kind = P2DQ_ENQUEUE_PROMISE_FIFO;
+	// 	ret->fifo.dsq_id = taskc->dsq_id;
+	// 	ret->fifo.enq_flags = enq_flags;
+	// 	ret->fifo.slice_ns = taskc->slice_ns;
+	// } else {
+	// 	ret->kind = P2DQ_ENQUEUE_PROMISE_VTIME;
+	// 	ret->vtime.dsq_id = taskc->dsq_id;
+	// 	ret->vtime.enq_flags = enq_flags;
+	// 	ret->vtime.slice_ns = taskc->slice_ns;
+	// 	ret->vtime.vtime = p->scx.dsq_vtime;
+	// }
 }
 
 static __always_inline void complete_p2dq_enqueue(struct enqueue_promise *pro,
 						  struct task_struct *p)
 {
+	struct cpu_ctx *cpuc;
+
 	switch (pro->kind) {
 	case P2DQ_ENQUEUE_PROMISE_COMPLETE:
 		goto out;
 	case P2DQ_ENQUEUE_PROMISE_FIFO:
 		scx_bpf_dsq_insert(p, pro->fifo.dsq_id, pro->fifo.slice_ns,
 				   pro->fifo.enq_flags);
-		goto out;
+		goto maybe_kick;
 	case P2DQ_ENQUEUE_PROMISE_VTIME:
 		scx_bpf_dsq_insert_vtime(p, pro->vtime.dsq_id, pro->vtime.slice_ns,
 				         pro->vtime.vtime, pro->vtime.enq_flags);
-		goto out;
+		goto maybe_kick;
 	}
+
+maybe_kick:
+	if((cpuc = lookup_cpu_ctx(pro->task_cpu)))
+		maybe_kick_cpu(cpuc);
+
 out:
 	pro->kind = P2DQ_ENQUEUE_PROMISE_COMPLETE;
 }
@@ -1185,6 +1217,16 @@ static __always_inline s32 p2dq_init_task_impl(struct task_struct *p,
 void BPF_STRUCT_OPS(p2dq_exit_task, struct task_struct *p, struct scx_exit_task_args *args)
 {
 	scx_task_free(p);
+}
+
+void BPF_STRUCT_OPS(p2dq_update_idle, s32 cpu, bool idle)
+{
+	struct cpu_ctx *cpuc;
+
+	if (!idle || !(cpuc = lookup_cpu_ctx(cpu)))
+		return;
+
+	maybe_kick_cpu(cpuc);
 }
 
 static int init_llc(u32 llc_id)
@@ -1725,6 +1767,8 @@ SCX_OPS_DEFINE(p2dq,
 	       .exit_task		= (void *)p2dq_exit_task,
 	       .init			= (void *)p2dq_init,
 	       .exit			= (void *)p2dq_exit,
+	       .update_idle		= (void *)p2dq_update_idle,
+	       .flags			= SCX_OPS_KEEP_BUILTIN_IDLE,
 	       .timeout_ms		= 20000,
 	       .name			= "p2dq");
 #endif

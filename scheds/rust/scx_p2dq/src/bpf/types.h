@@ -87,5 +87,6 @@ struct enqueue_promise {
 		struct enqueue_promise_vtime	vtime;
 		struct enqueue_promise_fifo	fifo;
 	};
+	u32	task_cpu;
 };
 
