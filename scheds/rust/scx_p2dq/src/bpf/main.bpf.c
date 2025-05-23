@@ -466,9 +466,13 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 			cpu = prev_cpu;
 			goto found_cpu;
 		}
+		bool last_waker = waker->pid == taskc->last_waker;
+		bool prior_waker = (waker->pid & taskc->waker_mask) == waker->pid;
+		taskc->last_waker = waker->pid;
+		taskc->waker_mask &= waker->pid;
 
 		// Interactive tasks aren't worth migrating across LLCs.
-		if (interactive) {
+		if (!last_waker || !prior_waker) {
 			cpu = prev_cpu;
 			if (scx_bpf_test_and_clear_cpu_idle(cpu)) {
 				stat_inc(P2DQ_STAT_WAKE_PREV);

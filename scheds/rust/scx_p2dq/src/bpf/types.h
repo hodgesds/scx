@@ -52,6 +52,8 @@ struct task_p2dq {
 	int			dsq_index;
 	u32			llc_id;
 	u32			node_id;
+	u32			last_waker;
+	u32			waker_mask;
 	u64			used;
 	u64			last_dsq_id;
 	u64 			last_run_started;
