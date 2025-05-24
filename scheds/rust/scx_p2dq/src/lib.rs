@@ -345,6 +345,7 @@ macro_rules! init_skel {
                 } else {
                     0
                 };
+            $skel.maps.bss_data.cpu_smt_ids[cpu.id] = cpu.smt_level as u64;
             $skel.maps.bss_data.cpu_llc_ids[cpu.id] = cpu.llc_id as u64;
             $skel.maps.bss_data.cpu_node_ids[cpu.id] = cpu.node_id as u64;
         }
