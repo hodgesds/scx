@@ -60,6 +60,7 @@ const volatile u32 interactive_ratio = 10;
 const volatile u32 min_nr_queued_pick2 = 10;
 
 const volatile bool autoslice = true;
+const volatile bool cpu_compaction = true;
 const volatile bool dispatch_pick2_disable = false;
 const volatile bool eager_load_balance = true;
 const volatile bool interactive_sticky = false;
@@ -565,15 +566,19 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 			 s32 prev_cpu, u64 wake_flags, bool *is_idle)
 {
 	const struct cpumask *idle_smtmask, *idle_cpumask;
-	struct cpu_ctx *prev_cpuc;
 	struct llc_ctx *llcx;
 	bool interactive = is_interactive(taskc);
 	s32 cpu = prev_cpu;
 
+	if (cpu < 0 || cpu > MAX_CPUS)
+		return cpu;
+
+	u32 prev_llc = cpu_llc_ids[cpu];
+
 	idle_cpumask = scx_bpf_get_idle_cpumask();
 	idle_smtmask = scx_bpf_get_idle_smtmask();
 
-	if (!idle_cpumask || !idle_smtmask)
+	if (!idle_cpumask || !idle_smtmask || prev_llc > MAX_LLCS || prev_llc < 0)
 		goto found_cpu;
 
 	if (interactive_sticky && interactive) {
@@ -592,10 +597,17 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 		goto found_cpu;
 	}
 
-	if (!(prev_cpuc = lookup_cpu_ctx(prev_cpu)) ||
-	    !(llcx = lookup_llc_ctx(prev_cpuc->llc_id)) ||
+	if (!(llcx = lookup_llc_ctx(prev_llc)) ||
 	    !llcx->cpumask)
 		goto found_cpu;
+
+	if (cpu_compaction && taskc->all_cpus) {
+		cpu = llcx->last_idle_cpu;
+		if (scx_bpf_test_and_clear_cpu_idle(cpu)) {
+			*is_idle = true;
+			goto found_cpu;
+		}
+	}
 
 	/*
 	 * If the current task is waking up another task and releasing the CPU
@@ -1172,6 +1184,17 @@ void BPF_STRUCT_OPS(p2dq_set_cpumask, struct task_struct *p,
 		return;
 
 	taskc->all_cpus = p->cpus_ptr == &p->cpus_mask && p->nr_cpus_allowed == nr_cpus;
+}
+
+void BPF_STRUCT_OPS(p2dq_update_idle, s32 cpu, bool idle)
+{
+	struct llc_ctx *llcx;
+
+	if (!idle || cpu < 0 || cpu >= MAX_CPUS ||
+	    !(llcx = lookup_llc_ctx(cpu_llc_ids[cpu])))
+		return;
+
+	llcx->last_idle_cpu = cpu;
 }
 
 static __always_inline s32 p2dq_init_task_impl(struct task_struct *p,
@@ -1765,10 +1788,12 @@ SCX_OPS_DEFINE(p2dq,
 	       .running			= (void *)p2dq_running,
 	       .stopping		= (void *)p2dq_stopping,
 	       .set_cpumask		= (void *)p2dq_set_cpumask,
+	       .update_idle		= (void *)p2dq_update_idle,
 	       .init_task		= (void *)p2dq_init_task,
 	       .exit_task		= (void *)p2dq_exit_task,
 	       .init			= (void *)p2dq_init,
 	       .exit			= (void *)p2dq_exit,
+	       .flags			= SCX_OPS_KEEP_BUILTIN_IDLE,
 	       .timeout_ms		= 20000,
 	       .name			= "p2dq");
 #endif

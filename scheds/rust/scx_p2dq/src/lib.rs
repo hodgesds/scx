@@ -38,6 +38,10 @@ pub struct SchedulerOpts {
     #[clap(short = 'a', long, action = clap::ArgAction::SetTrue)]
     pub autoslice: bool,
 
+    /// CPU compaction, attempts to aggressively use the last idle CPU.
+    #[clap(short = 'c', long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub cpu_compaction: bool,
+
     /// Ratio of interactive tasks for autoslice tuning, percent value from 1-99.
     #[clap(short = 'r', long, default_value = "10")]
     pub interactive_ratio: usize,
@@ -69,7 +73,7 @@ pub struct SchedulerOpts {
 
     /// Enables pick2 load balancing on the dispatch path when LLC utilization is under the
     /// specified utilization.
-    #[clap(long, default_value = "75", value_parser = clap::value_parser!(u64).range(0..100))]
+    #[clap(long, default_value = "95", value_parser = clap::value_parser!(u64).range(0..100))]
     pub dispatch_lb_busy: u64,
 
     /// Enables pick2 load balancing on the dispatch path for interactive tasks.
@@ -312,6 +316,7 @@ macro_rules! init_open_skel {
             $skel.maps.rodata_data.lb_slack_factor = opts.lb_slack_factor;
 
             $skel.maps.rodata_data.autoslice = opts.autoslice;
+            $skel.maps.rodata_data.cpu_compaction = opts.cpu_compaction;
             $skel.maps.rodata_data.debug = verbose as u32;
             $skel.maps.rodata_data.dispatch_pick2_disable = opts.dispatch_pick2_disable;
             $skel.maps.rodata_data.dispatch_lb_busy = opts.dispatch_lb_busy;
