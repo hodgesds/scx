@@ -675,15 +675,26 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 		}
 	}
 
-	if (has_little_cores && llcx->little_cpumask && llcx->big_cpumask) {
-		if (interactive) {
+	if (has_little_cores) {
+		// If all the big cores are idle then let it run.
+		if (idle_cpumask && llcx->big_cpumask &&
+		    bpf_cpumask_subset(cast_mask(llcx->big_cpumask), idle_cpumask)) {
+			if (llcx->big_cpumask &&
+			    (cpu = scx_bpf_pick_idle_cpu(cast_mask(llcx->big_cpumask),
+							 0)) >= 0) {
+				*is_idle = true;
+				goto found_cpu;
+			}
+		}
+		if (interactive && llcx->little_cpumask) {
 			if ((cpu = scx_bpf_pick_idle_cpu(cast_mask(llcx->little_cpumask),
 							 0)) >= 0) {
 				*is_idle = true;
 				goto found_cpu;
 			}
 		} else {
-			if ((cpu = scx_bpf_pick_idle_cpu(cast_mask(llcx->big_cpumask),
+			if (llcx->big_cpumask &&
+			    (cpu = scx_bpf_pick_idle_cpu(cast_mask(llcx->big_cpumask),
 							 SCX_PICK_IDLE_CORE)) >= 0) {
 				*is_idle = true;
 				goto found_cpu;
