@@ -601,6 +601,14 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 	    !llcx->cpumask)
 		goto found_cpu;
 
+	if (llcx->lb_llc_id >= 0 && taskc->llc_runs > min_llc_runs_pick2) {
+		u32 target_llc_id = llcx->lb_llc_id;
+		llcx->lb_llc_id = -1;
+		if (!(llcx = lookup_llc_ctx(target_llc_id)))
+			goto found_cpu;
+		stat_inc(P2DQ_STAT_SELECT_PICK2);
+	}
+
 	/*
 	 * If the current task is waking up another task and releasing the CPU
 	 * (WAKE_SYNC), attempt to migrate the wakee on the same CPU as the
@@ -689,13 +697,13 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 		goto found_cpu;
 	}
 
-	if (eager_load_balance && wakeup_lb_busy > 0 && nr_llcs > 1) {
-		cpu = pick_two_cpu(llcx, taskc, is_idle);
-		if (cpu >= 0) {
-			stat_inc(P2DQ_STAT_SELECT_PICK2);
-			goto found_cpu;
-		}
-	}
+	// if (eager_load_balance && wakeup_lb_busy > 0 && nr_llcs > 1) {
+	// 	cpu = pick_two_cpu(llcx, taskc, is_idle);
+	// 	if (cpu >= 0) {
+	// 		stat_inc(P2DQ_STAT_SELECT_PICK2);
+	// 		goto found_cpu;
+	// 	}
+	// }
 
 	if (has_little_cores && llcx->little_cpumask && llcx->big_cpumask) {
 		if (interactive) {
@@ -730,13 +738,13 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 	}
 
 	// Non-interactive tasks load balance
-	if (nr_llcs > 1 &&
-	    !interactive &&
-	    wakeup_lb_busy > 0 &&
-	    (cpu = pick_two_cpu(llcx, taskc, is_idle)) >= 0) {
-		stat_inc(P2DQ_STAT_SELECT_PICK2);
-		goto found_cpu;
-	}
+	// if (nr_llcs > 1 &&
+	//     !interactive &&
+	//     wakeup_lb_busy > 0 &&
+	//     (cpu = pick_two_cpu(llcx, taskc, is_idle)) >= 0) {
+	// 	stat_inc(P2DQ_STAT_SELECT_PICK2);
+	// 	goto found_cpu;
+	// }
 
 	// Couldn't find anything idle just return something in the local LLC
 	if (interactive && llcx->cpumask)
@@ -825,13 +833,6 @@ static __always_inline void async_p2dq_enqueue(struct enqueue_promise *ret,
 		bool is_idle = false;
 		if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
 			cpu = pick_idle_affinitized_cpu(p, taskc, cpu, &is_idle);
-
-		// if (!(cpuc = lookup_cpu_ctx(cpu)) ||
-		//      !(llcx = lookup_llc_ctx(cpuc->llc_id))) {
-		// 	scx_bpf_error("invalid lookup");
-		// 	ret->kind = P2DQ_ENQUEUE_PROMISE_COMPLETE;
-		// 	return;
-		// }
 
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON|cpu, taskc->slice_ns, enq_flags);
 		if (is_idle) {
@@ -1423,26 +1424,37 @@ static bool load_balance_timer(void)
 	struct llc_ctx *llcx;
 	int llc_id, j;
 	u64 ideal_sum, load_sum = 0, interactive_sum = 0;
+	u64 min_llc_load = 0, max_llc_load = 0;
+	u32 min_llc_id = 0, max_llc_id = 0;
 
-	if (nr_llcs == 1 && !autoslice)
+	if (nr_llcs == 1)
 		return false;
-
-	if (!autoslice)
-		goto reset_load;
 
 	bpf_for(llc_id, 0, nr_llcs) {
 		if (!(llcx = lookup_llc_ctx(llc_id)))
-			return false;
-
-		bpf_for(j, 0, nr_dsqs_per_llc) {
-			load_sum += llcx->dsq_load[j];
-			if (j == 0)
-				interactive_sum += llcx->dsq_load[j];
+			break;
+		load_sum += llcx->load;
+		interactive_sum += llcx->dsq_load[0];
+		if (llcx->load < min_llc_load || min_llc_load == 0) {
+			min_llc_id = llc_id;
+			min_llc_load = llcx->load;
+		}
+		if (llcx->load > max_llc_load || max_llc_load == 0) {
+			max_llc_id = llc_id;
+			max_llc_load = llcx->load;
 		}
 	}
-	dbg("load %llu interactive %llu", load_sum, interactive_sum);
+	u64 load_imbalance = (100 * (max_llc_load - min_llc_load)) / max_llc_load;
+	dbg("LB load %llu interactive %llu, min %llu max %llu imbalance %llu",
+	    load_sum, interactive_sum, min_llc_load, max_llc_load, load_imbalance);
 
-	if (load_sum == 0 || load_sum < interactive_sum)
+	if (load_imbalance > (lb_slack_factor > 0 ? lb_slack_factor : LOAD_BALANCE_SLACK)) {
+		if (!(llcx = lookup_llc_ctx(max_llc_id)))
+			goto reset_load;
+		llcx->lb_llc_id = min_llc_id;
+	}
+
+	if (!autoslice || load_sum == 0 || load_sum < interactive_sum)
 		goto reset_load;
 
 	if (interactive_sum == 0) {
@@ -1452,7 +1464,7 @@ static bool load_balance_timer(void)
 		}
 	} else {
 		ideal_sum = (load_sum * interactive_ratio) / 100;
-		dbg("ideal/sum %llu/%llu", ideal_sum, interactive_sum);
+		dbg("LB ideal/sum %llu/%llu", ideal_sum, interactive_sum);
 		if (interactive_sum < ideal_sum) {
 			dsq_time_slices[0] = (11 * dsq_time_slices[0]) / 10;
 
@@ -1483,7 +1495,7 @@ reset_load:
 				if (j > 0 && dsq_time_slices[j] < dsq_time_slices[j-1]) {
 					dsq_time_slices[j] = dsq_time_slices[j-1] << dsq_shift;
 				}
-				dbg("interactive slice %llu", dsq_time_slices[j]);
+				dbg("LB interactive slice %llu", dsq_time_slices[j]);
 			}
 		}
 	}

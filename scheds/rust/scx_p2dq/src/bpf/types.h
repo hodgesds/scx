@@ -27,6 +27,7 @@ struct llc_ctx {
 	u64				vtime;
 	u64				last_period_ns;
 	u64				load;
+	s32				lb_llc_id;
 	bool				all_big;
 	u64				dsqs[MAX_DSQS_PER_LLC];
 	u64				dsq_max_vtime[MAX_DSQS_PER_LLC];
