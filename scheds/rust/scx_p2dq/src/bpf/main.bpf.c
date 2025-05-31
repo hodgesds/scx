@@ -89,6 +89,7 @@ const u64 lb_backoff_ns = 5LLU * NSEC_PER_MSEC;
 
 static u32 llc_lb_offset = 1;
 
+u64 llc_ids[MAX_LLCS];
 u64 cpu_llc_ids[MAX_CPUS];
 u64 cpu_node_ids[MAX_CPUS];
 u64 big_core_ids[MAX_CPUS];
@@ -1080,8 +1081,8 @@ static __always_inline int dispatch_pick_two(s32 cpu, struct llc_ctx *cur_llcx, 
 		return -EINVAL;
 
 	// Special case when two llcs are present
-	left = nr_llcs == 2 ? lookup_llc_ctx(0) : rand_llc_ctx();
-	right = nr_llcs == 2 ? lookup_llc_ctx(1) : rand_llc_ctx();
+	left = nr_llcs == 2 ? lookup_llc_ctx(llc_ids[0]) : rand_llc_ctx();
+	right = nr_llcs == 2 ? lookup_llc_ctx(llc_ids[1]) : rand_llc_ctx();
 
 	// Last ditch effort try consuming from the most loaded DSQ.
 	llcx = pick_two_llc_ctx(cur_llcx, left, right);
@@ -1226,10 +1227,11 @@ void BPF_STRUCT_OPS(p2dq_exit_task, struct task_struct *p, struct scx_exit_task_
 	scx_task_free(p);
 }
 
-static int init_llc(u32 llc_id)
+static int init_llc(u32 llc_index)
 {
 	struct bpf_cpumask *cpumask, *big_cpumask, *little_cpumask, *node_cpumask;
 	struct llc_ctx *llcx;
+	u32 llc_id = llc_ids[llc_index];
 
 	llcx = bpf_map_lookup_elem(&llc_ctxs, &llc_id);
 	if (!llcx) {
@@ -1238,7 +1240,7 @@ static int init_llc(u32 llc_id)
 	}
 
 	llcx->vtime = 0;
-	llcx->id = llc_id;
+	llcx->id = *MEMBER_VPTR(llc_ids, [llc_index]);
 	llcx->nr_cpus = 0;
 
 	cpumask = bpf_cpumask_create();
@@ -1405,21 +1407,30 @@ static s32 init_cpu(int cpu)
 static bool load_balance_timer(void)
 {
 	struct llc_ctx *llcx, *lb_llcx;
-	int llc_id, j;
+	int j;
 	u64 ideal_sum, load_sum = 0, interactive_sum = 0;
+	u32 llc_id, llc_index, lb_llc_index, lb_llc_id;
 
-	if (nr_llcs == 1)
-		return false;
+	bpf_for(llc_index, 0, nr_llcs) {
+		// verifier
+		if (llc_index >= MAX_LLCS)
+			break;
 
-	bpf_for(llc_id, 0, nr_llcs) {
+		llc_id = *MEMBER_VPTR(llc_ids, [llc_index]);
 		if (!(llcx = lookup_llc_ctx(llc_id))) {
-			scx_bpf_error("failed to lookup llc %d", llc_id);
+			scx_bpf_error("failed to lookup llc");
 			return false;
 		}
 
-		u32 lb_llc_id = (llc_id + llc_lb_offset) % nr_llcs;
+		lb_llc_index = (llc_index + llc_lb_offset) % nr_llcs;
+		if (lb_llc_index < 0 || lb_llc_index >= MAX_LLCS) {
+			scx_bpf_error("failed to lookup lb_llc");
+			return false;
+		}
+
+		lb_llc_id = *MEMBER_VPTR(llc_ids, [lb_llc_index]);
 		if (!(lb_llcx = lookup_llc_ctx(lb_llc_id))) {
-			scx_bpf_error("failed to lookup lb llc %d", lb_llc_id);
+			scx_bpf_error("failed to lookup lb llc");
 			return false;
 		}
 
@@ -1469,13 +1480,13 @@ static bool load_balance_timer(void)
 				dsq_time_slices[j] = dsq_time_slices[0] << j << dsq_shift;
 			}
 		}
-
 	}
 
 
 reset_load:
 
-	bpf_for(llc_id, 0, nr_llcs) {
+	bpf_for(llc_index, 0, nr_llcs) {
+		llc_id = *MEMBER_VPTR(llc_ids, [llc_index]);
 		if (!(llcx = lookup_llc_ctx(llc_id)))
 			return false;
 
@@ -1623,8 +1634,9 @@ static __always_inline s32 p2dq_init_impl()
 	// Create DSQs for the LLCs
 	struct llc_ctx *llcx;
 	u64 dsq_id;
-	int llc_id;
-	bpf_for(llc_id, 0, nr_llcs) {
+	u32 llc_id, llc_index;
+	bpf_for(llc_index, 0, nr_llcs) {
+		llc_id = *MEMBER_VPTR(llc_ids, [llc_index]);
 		if (!(llcx = lookup_llc_ctx(llc_id)))
 			return -EINVAL;
 
