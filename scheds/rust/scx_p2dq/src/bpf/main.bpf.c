@@ -60,6 +60,7 @@ const volatile u32 interactive_ratio = 10;
 const volatile u32 min_nr_queued_pick2 = 10;
 
 const volatile bool autoslice = true;
+const volatile bool deadline_slice = true;
 const volatile bool dispatch_pick2_disable = false;
 const volatile bool eager_load_balance = true;
 const volatile bool interactive_sticky = false;
@@ -296,6 +297,17 @@ static __always_inline void update_vtime(struct task_struct *p,
 	p->scx.dsq_vtime = vtime_now;
 
 	return;
+}
+
+static __always_inline void update_task_slice_ns(struct task_struct *p, task_ctx *taskc, struct llc_ctx *llcx)
+{
+	taskc->slice_ns = p->scx.weight * dsq_time_slice(taskc->dsq_index);
+	if (deadline_slice && !(p->flags & PF_KTHREAD) && taskc->dsq_index > 0) {
+		int nr_queued = scx_bpf_dsq_nr_queued(taskc->dsq_id);
+		if (nr_queued > llcx->nr_cpus)
+			// taskc->slice_ns = dsq_time_slice(taskc->dsq_index - 1);
+			taskc->slice_ns = nr_dsqs_per_llc * taskc->slice_ns / log2_u64(nr_queued);
+	}
 }
 
 /*
@@ -690,6 +702,7 @@ static __always_inline void async_p2dq_enqueue(struct enqueue_promise *ret,
 
 		taskc->dsq_id = cpu_dsq_id(taskc->dsq_index, cpuc);
 		update_vtime(p, cpuc, taskc, llcx->vtime);
+		update_task_slice_ns(p, taskc, llcx);
 		if (interactive_fifo && taskc->dsq_index == 0) {
 			scx_bpf_dsq_insert(p, taskc->dsq_id, taskc->slice_ns, enq_flags);
 		} else {
@@ -712,6 +725,7 @@ static __always_inline void async_p2dq_enqueue(struct enqueue_promise *ret,
 
 	taskc->dsq_id = cpu_dsq_id(taskc->dsq_index, cpuc);
 	update_vtime(p, cpuc, taskc, llcx->vtime);
+	update_task_slice_ns(p, taskc, llcx);
 
 	if (interactive_fifo && taskc->dsq_index == 0) {
 		ret->kind = P2DQ_ENQUEUE_PROMISE_FIFO;
