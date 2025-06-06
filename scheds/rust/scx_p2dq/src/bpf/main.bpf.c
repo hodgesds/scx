@@ -45,9 +45,6 @@ UEI_DEFINE(uei);
 #define dbg(fmt, args...)	do { if (debug) bpf_printk(fmt, ##args); } while (0)
 #define trace(fmt, args...)	do { if (debug > 1) bpf_printk(fmt, ##args); } while (0)
 
-/*
- * Domains and cpus
- */
 const volatile u32 nr_llcs = 32;
 const volatile u32 nr_nodes = 32;
 const volatile u32 nr_cpus = 64;
@@ -668,11 +665,34 @@ static __always_inline void async_p2dq_enqueue(struct enqueue_promise *ret,
 		if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
 			cpu = pick_idle_affinitized_cpu(p, taskc, cpu, &is_idle);
 
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON|cpu, taskc->slice_ns, enq_flags);
+		if (!(cpuc = lookup_cpu_ctx(cpu)) ||
+		    !(llcx = lookup_llc_ctx(cpuc->llc_id))) {
+			scx_bpf_error("invalid lookup");
+			ret->kind = P2DQ_ENQUEUE_PROMISE_COMPLETE;
+			return;
+		}
+
+		taskc->dsq_id = llcx->affn_dsq;
+		update_vtime(p, cpuc, taskc, llcx->vtime);
+
+		// Idle affinitized tasks can be direct dispatched.
 		if (is_idle) {
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON|cpu, taskc->slice_ns, enq_flags);
 			stat_inc(P2DQ_STAT_IDLE);
 			scx_bpf_kick_cpu(cpu, 0);
+			ret->kind = P2DQ_ENQUEUE_PROMISE_COMPLETE;
+			return;
 		}
+
+		// Interactive affinitized tasks can preempt
+		if (taskc->dsq_index == 0) {
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON|cpu, taskc->slice_ns, enq_flags|SCX_ENQ_PREEMPT);
+			stat_inc(P2DQ_STAT_IDLE);
+			ret->kind = P2DQ_ENQUEUE_PROMISE_COMPLETE;
+			return;
+		}
+
+		scx_bpf_dsq_insert_vtime(p, taskc->dsq_id, taskc->slice_ns, p->scx.dsq_vtime, enq_flags);
 		ret->kind = P2DQ_ENQUEUE_PROMISE_COMPLETE;
 		return;
 	}
@@ -800,6 +820,12 @@ static __always_inline int p2dq_running_impl(struct task_struct *p)
 	    p->scx.dsq_vtime > llcx->dsq_max_vtime[taskc->dsq_index])
 		llcx->dsq_max_vtime[taskc->dsq_index] = p->scx.dsq_vtime;
 
+	// Affinitized task vtime is handled separately
+	if (!taskc->all_cpus &&
+	    p->scx.dsq_vtime > llcx->affn_max_vtime)
+		__sync_val_compare_and_swap(&llcx->affn_max_vtime,
+					    llcx->affn_max_vtime,
+					    p->scx.dsq_vtime);
 
 	// If the task is running in the least interactive DSQ, bump the
 	// frequency.
@@ -844,13 +870,15 @@ void BPF_STRUCT_OPS(p2dq_stopping, struct task_struct *p, bool runnable)
 
 	p->scx.dsq_vtime += scaled_used;
 	__sync_fetch_and_add(&llcx->vtime, scaled_used);
-	__sync_fetch_and_add(&llcx->dsq_max_vtime[dsq_index], scaled_used);
-	__sync_fetch_and_add(&llcx->dsq_load[dsq_index], used);
-	__sync_fetch_and_add(&llcx->load, used);
-	if (!taskc->all_cpus)
+	if (taskc->all_cpus) {
+		__sync_fetch_and_add(&llcx->dsq_max_vtime[dsq_index], scaled_used);
+		__sync_fetch_and_add(&llcx->dsq_load[dsq_index], used);
+	} else {
 		// Note that affinitized load is absolute load, not scaled.
 		__sync_fetch_and_add(&llcx->affn_load, used);
-
+		__sync_fetch_and_add(&llcx->affn_max_vtime, scaled_used);
+	}
+	__sync_fetch_and_add(&llcx->load, used);
 
 	trace("%s weight %d slice %llu used %llu scaled %llu",
 	      p->comm, p->scx.weight, last_dsq_slice_ns, used, scaled_used);
@@ -1043,7 +1071,6 @@ static __always_inline void p2dq_dispatch_impl(s32 cpu, struct task_struct *prev
 {
 	struct cpu_ctx *cpuc;
 	struct llc_ctx *llcx;
-	u64 dsq_id = 0;
 	int i;
 
 	if (!(cpuc = lookup_cpu_ctx(cpu)) ||
@@ -1055,14 +1082,18 @@ static __always_inline void p2dq_dispatch_impl(s32 cpu, struct task_struct *prev
 		return;
 	}
 
-
+	u64 dsq_id = 0;
 	u64 min_vtime = llcx->vtime;
+
 	bpf_for(i, 0, nr_dsqs_per_llc) {
 		if (llcx->dsq_max_vtime[i] < min_vtime) {
 			min_vtime = llcx->dsq_max_vtime[i];
 			dsq_id = llcx->dsqs[i];
 		}
 	}
+
+	if (min_vtime > llcx->affn_max_vtime)
+		dsq_id = llcx->affn_dsq;
 
 	if (dsq_id != 0 && scx_bpf_dsq_move_to_local(dsq_id))
 		return;
@@ -1080,6 +1111,9 @@ static __always_inline void p2dq_dispatch_impl(s32 cpu, struct task_struct *prev
 		    scx_bpf_dsq_move_to_local(dsq_id))
 		    return;
 	}
+
+	if (scx_bpf_dsq_move_to_local(llcx->affn_dsq))
+		return;
 
 	if (prev && keep_running(cpuc, llcx, prev))
 		return;
@@ -1580,6 +1614,15 @@ static __always_inline s32 p2dq_init_impl()
 			llcx->dsq_max_vtime[i] = 0;
 			llcx->vtime = 0;
 		}
+		dsq_id = ((llc_index << nr_dsqs_per_llc) | nr_dsqs_per_llc) + 1;
+		dbg("CFG creating affn DSQ[%llu] for LLC[%u]",
+		    dsq_id, llc_id);
+		ret = scx_bpf_create_dsq(dsq_id, llcx->node_id);
+		if (ret < 0) {
+			scx_bpf_error("failed to create DSQ %llu", dsq_id);
+			return ret;
+		}
+		llcx->affn_dsq = dsq_id;
 	}
 	struct cpu_ctx *cpuc;
 	bpf_for(i, 0, nr_cpus) {
@@ -1601,6 +1644,9 @@ static __always_inline s32 p2dq_init_impl()
 			dbg("CFG CPU[%d]DSQ[%d] %llu",
 			    i, j, cpuc->dsqs[j]);
 		}
+		cpuc->affn_dsq = llcx->affn_dsq;
+		dbg("CFG CPU[%d] affn DSQ[%d]",
+		    i, cpuc->affn_dsq);
 	}
 
 	min_slice_ns = 1000 * min_slice_us;

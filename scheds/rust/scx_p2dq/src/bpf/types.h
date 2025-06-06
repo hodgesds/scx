@@ -16,6 +16,7 @@ struct cpu_ctx {
 	bool				interactive;
 	bool				is_big;
 	u64				ran_for;
+	u64				affn_dsq;
 	u64				dsqs[MAX_DSQS_PER_LLC];
 	u64				max_load_dsq;
 };
@@ -28,9 +29,11 @@ struct llc_ctx {
 	u32				lb_llc_id;
 	u64				last_period_ns;
 	u64				load;
-	u64				affn_load;
 	u32				index;
 	bool				all_big;
+	u64				affn_dsq;
+	u64				affn_load;
+	u64				affn_max_vtime;
 	u64				dsqs[MAX_DSQS_PER_LLC];
 	u64				dsq_max_vtime[MAX_DSQS_PER_LLC];
 	u64				dsq_load[MAX_DSQS_PER_LLC];
