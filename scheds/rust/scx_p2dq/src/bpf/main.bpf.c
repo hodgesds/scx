@@ -66,6 +66,7 @@ const volatile bool interactive_fifo = false;
 const volatile bool keep_running_enabled = true;
 const volatile bool kthreads_local = true;
 const volatile bool max_dsq_pick2 = false;
+const volatile bool mempolicy_scheduling = false;
 const volatile bool freq_control = false;
 const volatile bool select_idle_in_enqueue = true;
 const volatile u64 max_exec_ns = 20 * NSEC_PER_MSEC;
@@ -330,6 +331,41 @@ static struct llc_ctx *rand_llc_ctx(void)
 	return lookup_llc_ctx(bpf_get_prandom_u32() % nr_llcs);
 }
 
+#if !defined(__TARGET_ARCH_arm64) && ! defined(__TARGET_ARCH_riscv)
+/*
+ * Returns the mempolicy preferred llc_ctx.
+ */
+static struct llc_ctx *task_pref_mempolicy_llc_ctx(struct task_struct *p,
+						   task_ctx *taskc)
+{
+	struct mempolicy *mempolicy;
+	int mode, home_node;
+
+	if (!mempolicy_scheduling)
+		return NULL;
+
+	mempolicy = BPF_CORE_READ(p, mempolicy);
+	if (!mempolicy)
+		return NULL;
+
+	mode = BPF_CORE_READ(p, mempolicy, mode);
+	if (!(mode & (MPOL_BIND|MPOL_PREFERRED|MPOL_PREFERRED_MANY)))
+		return NULL;
+
+	home_node = BPF_CORE_READ(p, mempolicy, home_node);
+	return lookup_llc_ctx(home_node);
+}
+
+#else
+
+static struct llc_ctx *task_pref_mempolicy_llc_ctx(struct task_struct *p,
+						   task_ctx *taskc)
+{
+	return NULL;
+}
+
+#endif
+
 static bool keep_running(struct cpu_ctx *cpuc, struct llc_ctx *llcx, struct task_struct *p)
 {
 	// Only tasks in the most interactive DSQs can keep running.
@@ -432,7 +468,7 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 			 s32 prev_cpu, u64 wake_flags, bool *is_idle)
 {
 	const struct cpumask *idle_smtmask, *idle_cpumask;
-	struct llc_ctx *llcx;
+	struct llc_ctx *llcx, *pref_llcx;
 	s32 cpu = prev_cpu;
 
 	idle_cpumask = scx_bpf_get_idle_cpumask();
@@ -463,6 +499,10 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 	if (!valid_dsq(taskc->dsq_id))
 		if (!(llcx = rand_llc_ctx()))
 			goto found_cpu;
+
+	if (mempolicy_scheduling &&
+	    (pref_llcx = task_pref_mempolicy_llc_ctx(p, taskc)))
+		llcx = pref_llcx;
 
 	/*
 	 * If the current task is waking up another task and releasing the CPU
