@@ -111,6 +111,38 @@ static __always_inline u64 dsq_time_slice(int dsq_index)
 	return dsq_time_slices[dsq_index];
 }
 
+static __always_inline bool valid_dsq_index(int index)
+{
+	if (index < 0 || index >= nr_dsqs_per_llc) {
+		scx_bpf_error("invalid dsq index");
+		return false;
+	}
+	return true;
+}
+
+static u64 __always_inline decay_lag(u64 lag)
+{
+	return (lag * 7) >> 4;
+}
+
+static __always_inline void set_vtime_lag(struct task_struct *p, task_ctx *taskc,
+					  struct cpu_ctx *cpuc, struct llc_ctx *llcx)
+{
+	if (!valid_dsq_index(taskc->dsq_index))
+		return;
+
+	taskc->vtime_lag = p->scx.dsq_vtime >= llcx->vtime ? 0 : llcx->vtime - p->scx.dsq_vtime;
+	if (taskc->all_cpus) {
+		if (taskc->vtime_lag > 0) {
+			__sync_fetch_and_add(&llcx->dsq_vtime_lag[taskc->dsq_index],
+					     taskc->vtime_lag);
+		}
+	} else {
+		if (taskc->vtime_lag > 0)
+			__sync_fetch_and_add(&cpuc->affn_vtime_lag, taskc->vtime_lag);
+	}
+}
+
 static __always_inline bool valid_dsq(u64 dsq_id)
 {
 	return dsq_id != 0 && dsq_id != SCX_DSQ_INVALID;
@@ -604,6 +636,7 @@ static __always_inline s32 p2dq_select_cpu_impl(struct task_struct *p, s32 prev_
 
 	if (is_idle) {
 		stat_inc(P2DQ_STAT_IDLE);
+		taskc->vtime_lag = 0;
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL_ON|cpu, taskc->slice_ns, 0);
 	}
 	trace("SELECT [%d][%s] %i->%i idle %i",
@@ -652,6 +685,7 @@ static __always_inline void async_p2dq_enqueue(struct enqueue_promise *ret,
 		ret->kind = P2DQ_ENQUEUE_PROMISE_COMPLETE;
 		return;
 	}
+	taskc->vtime_lag = 0;
 
 	// Handle affinitized tasks separately
 	if (!taskc->all_cpus ||
@@ -681,10 +715,12 @@ static __always_inline void async_p2dq_enqueue(struct enqueue_promise *ret,
 			return;
 		}
 
-		if (interactive_fifo && taskc->dsq_index == 0)
+		if (interactive_fifo && taskc->dsq_index == 0) {
 			scx_bpf_dsq_insert(p, taskc->dsq_id, taskc->slice_ns, enq_flags);
-		else
+		} else {
+			set_vtime_lag(p, taskc, cpuc, llcx);
 			scx_bpf_dsq_insert_vtime(p, taskc->dsq_id, taskc->slice_ns, p->scx.dsq_vtime, enq_flags);
+		}
 
 		ret->kind = P2DQ_ENQUEUE_PROMISE_COMPLETE;
 		return;
@@ -714,9 +750,7 @@ static __always_inline void async_p2dq_enqueue(struct enqueue_promise *ret,
 		if (interactive_fifo && taskc->dsq_index == 0) {
 			scx_bpf_dsq_insert(p, taskc->dsq_id, taskc->slice_ns, enq_flags);
 		} else {
-			if ((taskc->dsq_index >= 0 && taskc->dsq_index < nr_dsqs_per_llc) &&
-			    p->scx.dsq_vtime < llcx->dsq_max_vtime[taskc->dsq_index])
-				llcx->dsq_max_vtime[taskc->dsq_index] = p->scx.dsq_vtime;
+			set_vtime_lag(p, taskc, cpuc, llcx);
 			scx_bpf_dsq_insert_vtime(p, taskc->dsq_id, taskc->slice_ns, p->scx.dsq_vtime, enq_flags);
 		}
 
@@ -747,9 +781,7 @@ static __always_inline void async_p2dq_enqueue(struct enqueue_promise *ret,
 		ret->fifo.enq_flags = enq_flags;
 		ret->fifo.slice_ns = taskc->slice_ns;
 	} else {
-		if ((taskc->dsq_index >= 0 && taskc->dsq_index < nr_dsqs_per_llc) &&
-		    p->scx.dsq_vtime < llcx->dsq_max_vtime[taskc->dsq_index])
-			llcx->dsq_max_vtime[taskc->dsq_index] = p->scx.dsq_vtime;
+		set_vtime_lag(p, taskc, cpuc, llcx);
 		ret->kind = P2DQ_ENQUEUE_PROMISE_VTIME;
 		ret->vtime.dsq_id = taskc->dsq_id;
 		ret->vtime.enq_flags = enq_flags;
@@ -781,7 +813,7 @@ static __always_inline int p2dq_running_impl(struct task_struct *p)
 {
 	task_ctx *taskc;
 	struct cpu_ctx *cpuc;
-	struct llc_ctx *llcx;
+	struct llc_ctx *llcx, *prev_llcx;
 	s32 task_cpu = scx_bpf_task_cpu(p);
 
 	if (!(taskc = lookup_task_ctx(p)) ||
@@ -795,6 +827,12 @@ static __always_inline int p2dq_running_impl(struct task_struct *p)
 		trace("RUNNING %d cpu %d->%d llc %d->%d",
 		      p->pid, cpuc->id, task_cpu,
 		      taskc->llc_id, llcx->id);
+		// To be correct for vtime lag accounting need to update the
+		// prev llc vtime lag.
+		if (!(prev_llcx = lookup_llc_ctx(taskc->llc_id))) {
+			scx_bpf_error("failed to lookup prev llc_ctx");
+			return -ENOENT;
+		}
 	} else {
 		taskc->llc_runs += 1;
 	}
@@ -815,29 +853,19 @@ static __always_inline int p2dq_running_impl(struct task_struct *p)
 		__sync_val_compare_and_swap(&llcx->vtime, llcx->vtime, p->scx.dsq_vtime);
 	}
 
-	// If there is nothing queued then update the max vtime for the
-	// dsq index. When enqueueing the max vtime for the dsq will be
-	// updated as needed.
-	if ((taskc->dsq_index >= 0 && taskc->dsq_index < nr_dsqs_per_llc) &&
-	    taskc->all_cpus) {
-		if (scx_bpf_dsq_nr_queued(llcx->dsqs[taskc->dsq_index]) == 0 &&
-		    taskc->dsq_index >= 0 && taskc->dsq_index < nr_dsqs_per_llc)
-			llcx->dsq_max_vtime[taskc->dsq_index] = p->scx.dsq_vtime;
-	}
-
 	// Affinitized task vtime is handled separately
-	if (!taskc->all_cpus &&
-	    !(interactive_fifo && taskc->dsq_index == 0) &&
-	    !((p->flags & PF_KTHREAD) && kthreads_local) &&
-	     p->scx.dsq_vtime > llcx->affn_max_vtime &&
-	     p->scx.dsq_vtime < llcx->vtime + max_dsq_time_slice()) {
-		__sync_val_compare_and_swap(&llcx->affn_max_vtime, llcx->affn_max_vtime, p->scx.dsq_vtime);
-		cpuc->affn_max_vtime = p->scx.dsq_vtime;
+	// if (!taskc->all_cpus &&
+	//     !(interactive_fifo && taskc->dsq_index == 0) &&
+	//     !((p->flags & PF_KTHREAD) && kthreads_local) &&
+	//      p->scx.dsq_vtime > llcx->affn_max_vtime &&
+	//      p->scx.dsq_vtime < llcx->vtime + max_dsq_time_slice()) {
+	// 	__sync_val_compare_and_swap(&llcx->affn_max_vtime, llcx->affn_max_vtime, p->scx.dsq_vtime);
+	// 	cpuc->affn_max_vtime = p->scx.dsq_vtime;
 
-		u64 max_lag = llcx->vtime - max_dsq_time_slice();
-		if (cpuc->affn_max_vtime < max_lag)
-			cpuc->affn_max_vtime = max_lag;
-	}
+	// 	u64 max_lag = llcx->vtime - max_dsq_time_slice();
+	// 	if (cpuc->affn_max_vtime < max_lag)
+	// 		cpuc->affn_max_vtime = max_lag;
+	// }
 
 
 	// If the task is running in the least interactive DSQ, bump the
@@ -877,6 +905,7 @@ void BPF_STRUCT_OPS(p2dq_stopping, struct task_struct *p, bool runnable)
 	taskc->last_dsq_id = taskc->dsq_id;
 	taskc->last_dsq_index = taskc->dsq_index;
 	taskc->used = 0;
+	taskc->vtime_lag = 0;
 
 	last_dsq_slice_ns = taskc->slice_ns;
 	used = now - taskc->last_run_at;
@@ -887,15 +916,9 @@ void BPF_STRUCT_OPS(p2dq_stopping, struct task_struct *p, bool runnable)
 	__sync_fetch_and_add(&llcx->load, used);
 	__sync_fetch_and_add(&llcx->dsq_load[dsq_index], used);
 
-	if (taskc->all_cpus) {
-		__sync_fetch_and_add(&llcx->dsq_max_vtime[dsq_index], used);
-	} else {
+	if (!taskc->all_cpus) {
 		// Note that affinitized load is absolute load, not scaled.
 		__sync_fetch_and_add(&llcx->affn_load, used);
-
-		if ((cpuc = lookup_cpu_ctx(scx_bpf_task_cpu(p)))) {
-			cpuc->affn_max_vtime += used;
-		}
 	}
 
 	trace("STOPPING %s weight %d slice %llu used %llu scaled %llu",
@@ -973,6 +996,10 @@ static __always_inline bool consume_llc_compat(struct llc_ctx *cur_llcx, struct 
 	if (dispatch_lb_interactive &&
 	    scx_bpf_dsq_move_to_local(llcx->dsqs[0])) {
 			stat_inc(P2DQ_STAT_DISPATCH_PICK2);
+			u64 new_lag = decay_lag(llcx->dsq_vtime_lag[0]);
+			__sync_val_compare_and_swap(&llcx->dsq_vtime_lag[0],
+						    llcx->dsq_vtime_lag[0],
+						    new_lag);
 			return true;
 	}
 
@@ -981,6 +1008,10 @@ static __always_inline bool consume_llc_compat(struct llc_ctx *cur_llcx, struct 
 			dsq_id = llcx->dsqs[nr_dsqs_per_llc - i];
 			if (scx_bpf_dsq_move_to_local(dsq_id)) {
 				stat_inc(P2DQ_STAT_DISPATCH_PICK2);
+				u64 new_lag = decay_lag(llcx->dsq_vtime_lag[i]);
+				__sync_val_compare_and_swap(&llcx->dsq_vtime_lag[i],
+							    llcx->dsq_vtime_lag[i],
+							    new_lag);
 				return true;
 			}
 		}
@@ -1000,13 +1031,23 @@ static __always_inline bool consume_llc(struct llc_ctx *cur_llcx, struct llc_ctx
 	if (dispatch_lb_interactive &&
 	    scx_bpf_dsq_move_to_local(llcx->dsqs[0])) {
 		stat_inc(P2DQ_STAT_DISPATCH_PICK2);
+		u64 new_lag = decay_lag(llcx->dsq_vtime_lag[0]);
+		__sync_val_compare_and_swap(&llcx->dsq_vtime_lag[0],
+					    llcx->dsq_vtime_lag[0],
+					    new_lag);
 		return true;
 	}
 
 	bpf_for(i, 1, nr_dsqs_per_llc) {
 		dsq_id = llcx->dsqs[nr_dsqs_per_llc - i];
-		if (dispatch_cpu(dsq_id, cpu) > 0)
+		if (dispatch_cpu(dsq_id, cpu) > 0) {
+			stat_inc(P2DQ_STAT_DISPATCH_PICK2);
+			u64 new_lag = decay_lag(llcx->dsq_vtime_lag[i]);
+			__sync_val_compare_and_swap(&llcx->dsq_vtime_lag[i],
+						    llcx->dsq_vtime_lag[i],
+						    new_lag);
 			return true;
+		}
 	}
 
 	return false;
@@ -1099,8 +1140,8 @@ static __always_inline void p2dq_dispatch_impl(s32 cpu, struct task_struct *prev
 {
 	struct cpu_ctx *cpuc;
 	struct llc_ctx *llcx;
-	u64 dsq_id = 0;
-	int i;
+	u64 dsq_id = 0, max_lag = 0;
+	int i, dsq_index = -1;
 
 	if (!(cpuc = lookup_cpu_ctx(cpu)) ||
 	    !(llcx = lookup_llc_ctx(cpuc->llc_id)))
@@ -1111,21 +1152,28 @@ static __always_inline void p2dq_dispatch_impl(s32 cpu, struct task_struct *prev
 		return;
 	}
 
-	u64 min_vtime = llcx->vtime;
-
 	bpf_for(i, 0, nr_dsqs_per_llc) {
-		if (llcx->dsq_max_vtime[i] < min_vtime) {
-			min_vtime = llcx->dsq_max_vtime[i];
+		if (llcx->dsq_vtime_lag[i] > max_lag) {
+			max_lag = llcx->dsq_vtime_lag[i];
 			dsq_id = llcx->dsqs[i];
+			dsq_index = i;
 		}
 	}
 
-	if (cpuc->affn_max_vtime < min_vtime &&
-	    llcx->affn_load < llcx->load / 2)
+	if (cpuc->affn_vtime_lag > max_lag) {
 		dsq_id = cpuc->affn_dsq;
+		cpuc->affn_vtime_lag = decay_lag(cpuc->affn_vtime_lag);
+	}
 
-	trace("DISPATCH cpu[%d] vtime %llu affn_vtime %llu min_vtime %llu dsq_id %llu",
-	      cpu, llcx->vtime, cpuc->affn_max_vtime, min_vtime, dsq_id);
+	if (dsq_index >= 0) {
+		u64 new_lag = decay_lag(llcx->dsq_vtime_lag[dsq_index]);
+	 	__sync_val_compare_and_swap(&llcx->dsq_vtime_lag[dsq_index],
+					    llcx->dsq_vtime_lag[dsq_index],
+					    new_lag);
+	}
+
+	trace("DISPATCH cpu[%d] vtime %llu affn lag %llu max lag %llu dsq_id %llu",
+	      cpu, llcx->vtime, cpuc->affn_vtime_lag, max_lag, dsq_id);
 
 	if (valid_dsq(dsq_id) && scx_bpf_dsq_move_to_local(dsq_id))
 		return;
@@ -1202,6 +1250,7 @@ static __always_inline s32 p2dq_init_task_impl(struct task_struct *p,
 		return -EINVAL;
 	}
 
+	taskc->vtime_lag = 0;
 	taskc->llc_id = cpuc->llc_id;
 	taskc->node_id = cpuc->node_id;
 	taskc->dsq_index = init_dsq_index;
@@ -1358,7 +1407,7 @@ static s32 init_cpu(int cpu)
 	cpuc->llc_id = cpu_llc_ids[cpu];
 	cpuc->node_id = cpu_node_ids[cpu];
 	cpuc->is_big = big_core_ids[cpu] == 1;
-	cpuc->affn_max_vtime = 0;
+	cpuc->affn_vtime_lag = 0;
 	cpuc->dsq_id = 0;
 	cpuc->slice_ns = 1;
 
@@ -1644,7 +1693,7 @@ static __always_inline s32 p2dq_init_impl()
 			}
 
 			llcx->dsqs[i] = dsq_id;
-			llcx->dsq_max_vtime[i] = 0;
+			llcx->dsq_vtime_lag[i] = 0;
 			llcx->vtime = 0;
 		}
 	}

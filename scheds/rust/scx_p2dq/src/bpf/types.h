@@ -19,7 +19,7 @@ struct cpu_ctx {
 	bool				is_big;
 	u64				ran_for;
 	u32				node_id;
-	u64				affn_max_vtime;
+	s64				affn_vtime_lag;
 	u64				dsqs[MAX_DSQS_PER_LLC];
 	u64				max_load_dsq;
 };
@@ -35,9 +35,8 @@ struct llc_ctx {
 	u32				index;
 	bool				all_big;
 	u64				affn_load;
-	u64				affn_max_vtime;
 	u64				dsqs[MAX_DSQS_PER_LLC];
-	u64				dsq_max_vtime[MAX_DSQS_PER_LLC];
+	u64				dsq_vtime_lag[MAX_DSQS_PER_LLC];
 	u64				dsq_load[MAX_DSQS_PER_LLC];
 	struct bpf_cpumask __kptr	*cpumask;
 	struct bpf_cpumask __kptr	*big_cpumask;
@@ -62,6 +61,7 @@ struct task_p2dq {
 	u64			last_dsq_id;
 	u64 			last_run_started;
 	u64 			last_run_at;
+	u64 			vtime_lag;
 	u64			llc_runs; /* how many runs on the current LLC */
 	int			last_dsq_index;
 
