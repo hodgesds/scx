@@ -1828,6 +1828,15 @@ impl<'a> App<'a> {
             )),
             Line::from(Span::styled(
                 format!(
+                    "{}: perf top view",
+                    self.config
+                        .active_keymap
+                        .action_keys_string(Action::SetState(AppState::PerfTop))
+                ),
+                Style::default(),
+            )),
+            Line::from(Span::styled(
+                format!(
                     "{}: display default view",
                     self.config
                         .active_keymap
@@ -2086,6 +2095,10 @@ impl<'a> App<'a> {
         Ok(())
     }
 
+    fn render_perftop(&mut self, frame: &mut Frame) -> Result<()> {
+        Ok(())
+    }
+
     /// Renders the application to the frame.
     pub fn render(&mut self, frame: &mut Frame) -> Result<()> {
         match self.state {
@@ -2094,6 +2107,7 @@ impl<'a> App<'a> {
             AppState::MangoApp => self.render_mangoapp(frame),
             AppState::Node => self.render_node(frame),
             AppState::Llc => self.render_llc(frame),
+            AppState::PerfTop => self.render_perftop(frame),
             AppState::Scheduler => {
                 let [left, right] =
                     Layout::horizontal([Constraint::Fill(1); 2]).areas(frame.area());

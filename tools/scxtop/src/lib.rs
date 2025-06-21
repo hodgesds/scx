@@ -83,6 +83,8 @@ pub enum AppState {
     Tracing,
     /// Application is in the mangoapp state.
     MangoApp,
+    /// Application is in the  perf top state
+    PerfTop,
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

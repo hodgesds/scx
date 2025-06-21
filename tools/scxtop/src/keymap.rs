@@ -43,6 +43,7 @@ impl Default for KeyMap {
         bindings.insert(Key::Char('u'), Action::ToggleUncoreFreq);
         bindings.insert(Key::Char('L'), Action::ToggleLocalization);
         bindings.insert(Key::Char('P'), Action::ToggleHwPressure);
+        bindings.insert(Key::Char('p'), Action::SetState(AppState::PerfTop));
         bindings.insert(Key::Char('h'), Action::SetState(AppState::Help));
         bindings.insert(Key::Char('m'), Action::SetState(AppState::MangoApp));
         bindings.insert(Key::Char('?'), Action::SetState(AppState::Help));
@@ -347,6 +348,7 @@ pub fn parse_action(action_str: &str) -> Result<Action> {
         "ToggleUncoreFreq" => Ok(Action::ToggleUncoreFreq),
         "ToggleLocalization" => Ok(Action::ToggleLocalization),
         "ToggleHwPressure" => Ok(Action::ToggleHwPressure),
+        "AppStatePerfTop" => Ok(Action::SetState(AppState::PerfTop)),
         "AppStateHelp" => Ok(Action::SetState(AppState::Help)),
         "AppStateLlc" => Ok(Action::SetState(AppState::Llc)),
         "AppStateMangoApp" => Ok(Action::SetState(AppState::MangoApp)),
