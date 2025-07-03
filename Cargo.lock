@@ -1529,6 +1529,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "humanize-bytes"
+version = "1.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0a92093c50b761e6ba595c797365301d3aaae67db1382ddf9d5d0092d98df799"
+dependencies = [
+ "smartstring",
+]
+
+[[package]]
 name = "humantime"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3117,9 +3126,11 @@ dependencies = [
  "config",
  "criterion",
  "crossterm 0.28.1",
+ "fb_procfs",
  "futures",
  "glob",
  "hashbrown 0.15.2",
+ "humanize-bytes",
  "libbpf-rs",
  "libc",
  "log",

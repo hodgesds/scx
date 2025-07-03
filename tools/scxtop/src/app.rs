@@ -41,6 +41,7 @@ use crate::{
 
 use anyhow::{bail, Result};
 use glob::glob;
+use humanize_bytes::humanize_bytes_binary;
 use libbpf_rs::Link;
 use libbpf_rs::ProgramInput;
 use num_format::{SystemLocale, ToFormattedString};
@@ -51,11 +52,12 @@ use ratatui::{
     symbols::bar::{NINE_LEVELS, THREE_LEVELS},
     text::{Line, Span},
     widgets::{
-        Bar, BarChart, BarGroup, Block, BorderType, Borders, Gauge, Paragraph, RenderDirection,
+        Bar, BarChart, BarGroup, Block, BorderType, Borders, Gauge, LineGauge, Paragraph, RenderDirection,
         Scrollbar, ScrollbarOrientation, ScrollbarState, Sparkline,
     },
     Frame,
 };
+use fb_procfs::ProcReader;
 use regex::Regex;
 use scx_stats::prelude::StatsClient;
 use scx_utils::misc::read_from_file;
@@ -72,11 +74,13 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 
+
 const DSQ_VTIME_CUTOFF: u64 = 1_000_000_000_000_000;
 
 /// App is the struct for scxtop application state.
 pub struct App<'a> {
     config: Config,
+    proc_reader: ProcReader,
     hw_pressure: bool,
     localize: bool,
     locale: SystemLocale,
@@ -264,6 +268,7 @@ impl<'a> App<'a> {
             active_hw_event_id: 0,
             active_event,
             active_prof_events,
+            proc_reader: ProcReader::new(),
             available_events: default_events,
             event_input_buffer: String::new(),
             perf_event_search: Search::new(initial_perf_events_list),
@@ -1472,6 +1477,52 @@ impl<'a> App<'a> {
         Ok(())
     }
 
+    /// Renders memory info
+    fn render_meminfo(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+    ) -> Result<()> {
+        let meminfo = self.proc_reader.read_meminfo()?;
+
+        let [top, bottom] = Layout::vertical([Constraint::Fill(1); 2]).areas(area);
+
+        //let mem_block = Block::default()
+        //    .title_top(Line::from("Memory"))
+        //    .style(self.theme().border_style())
+        //    .borders(Borders::ALL)
+        //    .border_type(BorderType::Rounded);
+
+        let free_ratio = meminfo.free.unwrap() as f64 / meminfo.total.unwrap() as f64;
+        let free_gauge = LineGauge::default()
+            .block(Block::default()
+                .title_top(Line::from("free"))
+                .style(self.theme().border_style())
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded))
+            .filled_style(Style::new().white().on_black().bold())
+            .line_set(ratatui::symbols::line::THICK)
+            .label(humanize_bytes_binary!(meminfo.total.unwrap_or(0)).to_string())
+            .ratio(free_ratio.min(1.0));
+
+        let swap_ratio = meminfo.swap_free.unwrap_or(0) as f64 / meminfo.swap_total.unwrap_or(1) as f64;
+        let swap_gauge = LineGauge::default()
+            .block(Block::default()
+                .title_top(Line::from("swap"))
+                .style(self.theme().border_style())
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded))
+            .filled_style(Style::new().white().on_black().bold())
+            .filled_style(Style::new().white().on_black().bold())
+            .line_set(ratatui::symbols::line::THICK)
+            .label(humanize_bytes_binary!(meminfo.swap_total.unwrap_or(0)).to_string())
+            .ratio(swap_ratio.max(0.0).min(1.0));
+
+        frame.render_widget(free_gauge, top);
+        frame.render_widget(swap_gauge, bottom);
+        Ok(())
+    }
+
     /// Renders the scheduler application state.
     fn render_scheduler(
         &mut self,
@@ -1762,9 +1813,10 @@ impl<'a> App<'a> {
     /// Renders the default application state.
     fn render_default(&mut self, frame: &mut Frame) -> Result<()> {
         let [left, right] = Layout::horizontal([Constraint::Fill(1); 2]).areas(frame.area());
-        let [top_left, bottom_left] = Layout::vertical([Constraint::Fill(1); 2]).areas(left);
+        let [top_left, mid_left, bottom_left] = Layout::vertical([Constraint::Fill(1); 3]).areas(left);
 
         self.render_event(frame, right)?;
+        self.render_meminfo(frame, mid_left)?;
         self.render_scheduler("dsq_lat_us", frame, top_left, true, true)?;
         self.render_scheduler("dsq_slice_consumed", frame, bottom_left, true, false)?;
         Ok(())
