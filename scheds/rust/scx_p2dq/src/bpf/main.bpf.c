@@ -148,6 +148,7 @@ const u64 lb_timer_intvl_ns = 250LLU * NSEC_PER_MSEC;
 static u32 llc_lb_offset = 1;
 static u32 min_llc_runs_pick2 = 1;
 static bool saturated = false;
+static u64 task_epoch = 0;
 
 u64 llc_ids[MAX_LLCS];
 u64 cpu_llc_ids[MAX_CPUS];
@@ -266,6 +267,18 @@ static u64 task_dsq_slice_ns(struct task_struct *p, int dsq_index)
 static void task_refresh_llc_runs(task_ctx *taskc)
 {
 	taskc->llc_runs = min_llc_runs_pick2;
+}
+
+static void task_refresh_epoch(task_ctx *taskc)
+{
+	if (taskc->epoch == task_epoch)
+		return;
+
+	taskc->epoch = task_epoch;
+	taskc->waker_mask = 0;
+	taskc->wakee_mask = 0;
+	WRITE_ONCE(taskc->nr_wakees, 0ULL);
+	WRITE_ONCE(taskc->nr_wakers, 0ULL);
 }
 
 static u64 llc_nr_queued(struct llc_ctx *llcx)
@@ -664,6 +677,34 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 	 * waker.
 	 */
 	if (wake_flags & SCX_WAKE_SYNC) {
+		struct task_struct *waker = (void *)bpf_get_current_task_btf();
+		if (!waker) {
+			stat_inc(P2DQ_STAT_WAKE_PREV);
+			goto found_cpu;
+		}
+
+		task_ctx *waker_taskc = scx_task_data(waker);
+
+		// Shouldn't happen, but makes code easier to follow
+		if (!waker_taskc) {
+			stat_inc(P2DQ_STAT_WAKE_PREV);
+			goto found_cpu;
+		}
+
+		if (!((taskc->waker_mask & waker->pid) == waker->pid)) {
+			taskc->nr_wakers += 1;
+			taskc->waker_mask |= waker->pid;
+		}
+
+		if (!((waker_taskc->wakee_mask & p->pid) == p->pid)) {
+			waker_taskc->nr_wakees += 1;
+			waker_taskc->wakee_mask |= p->pid;
+		}
+
+		trace("WAKE [%s-%d](%llu)->[%s-%d](%llu)",
+		      waker->comm, waker->pid, waker_taskc->nr_wakees,
+		      p->comm, p->pid, taskc->nr_wakers);
+
 		// Interactive tasks aren't worth migrating across LLCs.
 		if (taskc->interactive ||
 		    (topo_config.nr_llcs == 2 && topo_config.nr_nodes == 2)) {
@@ -678,14 +719,6 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 			// Nothing idle, stay sticky
 			stat_inc(P2DQ_STAT_WAKE_PREV);
 			cpu = prev_cpu;
-			goto found_cpu;
-		}
-
-		struct task_struct *waker = (void *)bpf_get_current_task_btf();
-		task_ctx *waker_taskc = scx_task_data(waker);
-		// Shouldn't happen, but makes code easier to follow
-		if (!waker_taskc) {
-			stat_inc(P2DQ_STAT_WAKE_PREV);
 			goto found_cpu;
 		}
 
@@ -1302,6 +1335,7 @@ void BPF_STRUCT_OPS(p2dq_stopping, struct task_struct *p, bool runnable)
 		}
 		taskc->last_run_started = 0;
 		taskc->interactive = is_interactive(taskc);
+		task_refresh_epoch(taskc);
 	}
 }
 
@@ -1738,6 +1772,10 @@ static s32 p2dq_init_task_impl(struct task_struct *p, struct scx_init_task_args 
 	taskc->slice_ns = slice_ns;
 	taskc->all_cpus = p->cpus_ptr == &p->cpus_mask &&
 			  p->nr_cpus_allowed == topo_config.nr_cpus;
+	WRITE_ONCE(taskc->nr_wakees, 0ULL);
+	WRITE_ONCE(taskc->nr_wakers, 0ULL);
+	taskc->wakee_mask = 0;
+	taskc->waker_mask = 0;
 	taskc->interactive = is_interactive(taskc);
 	p->scx.dsq_vtime = llcx->vtime;
 	task_refresh_llc_runs(taskc);
@@ -2011,6 +2049,7 @@ static bool load_balance_timer(void)
 
 reset_load:
 
+	task_epoch += 1;
 	bpf_for(llc_index, 0, topo_config.nr_llcs) {
 		llc_id = *MEMBER_VPTR(llc_ids, [llc_index]);
 		if (!(llcx = lookup_llc_ctx(llc_id)))
