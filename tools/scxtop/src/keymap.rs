@@ -81,6 +81,16 @@ impl KeyMap {
         KeyMap { bindings }
     }
 
+    /// Returns if the KeyMap is empty.
+    pub fn is_empty(&self) -> bool {
+        self.bindings.is_empty()
+    }
+
+    // Returns an Action for a Key.
+    pub fn get(&self, key: &Key) -> Option<&Action> {
+        self.bindings.get(key)
+    }
+
     /// Maps the Key to an Action.
     pub fn action(&self, key: &Key) -> Action {
         self.bindings.get(key).cloned().unwrap_or(Action::None)
@@ -329,11 +339,11 @@ pub fn parse_key(key_str: &str) -> Result<Key> {
         Ok(Key::Code(keycode_wrapper.into()))
     } else {
         match key_str {
-            "Page Up" | "PageUp" => Ok(Key::Code(KeyCode::PageUp)),
-            "Page Down" | "PageDown" => Ok(Key::Code(KeyCode::PageDown)),
-            "Up" => Ok(Key::Code(KeyCode::Up)),
-            "Down" => Ok(Key::Code(KeyCode::Down)),
-            "Enter" => Ok(Key::Code(KeyCode::Enter)),
+            "page up" | "Page Up" | "PageUp" => Ok(Key::Code(KeyCode::PageUp)),
+            "page down" | "Page Down" | "PageDown" => Ok(Key::Code(KeyCode::PageDown)),
+            "up" | "Up" => Ok(Key::Code(KeyCode::Up)),
+            "down" | "Down" => Ok(Key::Code(KeyCode::Down)),
+            "enter" | "Enter" => Ok(Key::Code(KeyCode::Enter)),
             _ => Err(anyhow!("Invalid key: {}", key_str)),
         }
     }
@@ -359,18 +369,18 @@ pub fn parse_action(action_str: &str) -> Result<Action> {
         "ClearEvent" => Ok(Action::ClearEvent),
         "PrevEvent" => Ok(Action::PrevEvent),
         "NextEvent" => Ok(Action::NextEvent),
-        "Quit" => Ok(Action::Quit),
+        "quit" | "Quit" => Ok(Action::Quit),
         "ChangeTheme" => Ok(Action::ChangeTheme),
         "DecTickRate" => Ok(Action::DecTickRate),
         "IncTickRate" => Ok(Action::IncTickRate),
         "DecBpfSampleRate" => Ok(Action::DecBpfSampleRate),
         "IncBpfSampleRate" => Ok(Action::IncBpfSampleRate),
         "NextViewState" => Ok(Action::NextViewState),
-        "Down" => Ok(Action::Down),
-        "Up" => Ok(Action::Up),
-        "PageDown" => Ok(Action::PageDown),
-        "PageUp" => Ok(Action::PageUp),
-        "Enter" => Ok(Action::Enter),
+        "down" | "Down" => Ok(Action::Down),
+        "up" | "Up" => Ok(Action::Up),
+        "page down" | "Page Down" | "PageDown" => Ok(Action::PageDown),
+        "page up" | "Page Up" | "PageUp" => Ok(Action::PageUp),
+        "enter" | "Enter" => Ok(Action::Enter),
         _ => Err(anyhow!("Invalid action: {}", action_str)),
     }
 }
