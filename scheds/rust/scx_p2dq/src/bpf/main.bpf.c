@@ -111,6 +111,7 @@ const volatile struct {
 	u64 dsq_shift;
 	u32 interactive_ratio;
 
+	bool magic_slice;
 	bool freq_control;
 	bool interactive_sticky;
 	bool interactive_fifo;
@@ -124,6 +125,7 @@ const volatile struct {
 	.dsq_shift = 2,
 	.interactive_ratio = 10,
 
+	.magic_slice = true,
 	.freq_control = false,
 	.interactive_sticky = false,
 	.interactive_fifo = true,
@@ -1146,31 +1148,39 @@ void BPF_STRUCT_OPS(p2dq_stopping, struct task_struct *p, bool runnable)
 
 	if (!runnable) {
 		used = now - taskc->last_run_started;
-		// On stopping determine if the task can move to a longer DSQ by
-		// comparing the used time to the scaled DSQ slice.
-		if (used >= ((9 * last_dsq_slice_ns) / 10)) {
-			if (taskc->dsq_index < p2dq_config.nr_dsqs_per_llc - 1 &&
-			    p->scx.weight >= 100) {
-				taskc->dsq_index += 1;
-				stat_inc(P2DQ_STAT_DSQ_CHANGE);
-				trace("%s[%p]: DSQ inc %llu -> %u", p->comm, p,
-				      taskc->last_dsq_index, taskc->dsq_index);
-			} else {
-				stat_inc(P2DQ_STAT_DSQ_SAME);
-			}
-		// If under half the slice was consumed move the task back down.
-		} else if (used < last_dsq_slice_ns / 2) {
-			if (taskc->dsq_index > 0) {
-				taskc->dsq_index -= 1;
-				stat_inc(P2DQ_STAT_DSQ_CHANGE);
-				trace("%s[%p]: DSQ dec %llu -> %u",
-				      p->comm, p,
-				      taskc->last_dsq_index, taskc->dsq_index);
-			} else {
-				stat_inc(P2DQ_STAT_DSQ_SAME);
+		if (p2dq_config.magic_slice) {
+			if (used >= ((9 * last_dsq_slice_ns) / 10)) {
+				taskc->slice_ns = clamp_slice(taskc->slice_ns + (10 * used / 100));
+			} else if (used < last_dsq_slice_ns / 2) {
+				taskc->slice_ns = clamp_slice(taskc->slice_ns - (10 * used / 100));
 			}
 		} else {
-			stat_inc(P2DQ_STAT_DSQ_SAME);
+			// On stopping determine if the task can move to a longer DSQ by
+			// comparing the used time to the scaled DSQ slice.
+			if (used >= ((9 * last_dsq_slice_ns) / 10)) {
+				if (taskc->dsq_index < p2dq_config.nr_dsqs_per_llc - 1 &&
+				    p->scx.weight >= 100) {
+					taskc->dsq_index += 1;
+					stat_inc(P2DQ_STAT_DSQ_CHANGE);
+					trace("%s[%p]: DSQ inc %llu -> %u", p->comm, p,
+					      taskc->last_dsq_index, taskc->dsq_index);
+				} else {
+					stat_inc(P2DQ_STAT_DSQ_SAME);
+				}
+			// If under half the slice was consumed move the task back down.
+			} else if (used < last_dsq_slice_ns / 2) {
+				if (taskc->dsq_index > 0) {
+					taskc->dsq_index -= 1;
+					stat_inc(P2DQ_STAT_DSQ_CHANGE);
+					trace("%s[%p]: DSQ dec %llu -> %u",
+					      p->comm, p,
+					      taskc->last_dsq_index, taskc->dsq_index);
+				} else {
+					stat_inc(P2DQ_STAT_DSQ_SAME);
+				}
+			} else {
+				stat_inc(P2DQ_STAT_DSQ_SAME);
+			}
 		}
 
 		// nice tasks can only get the minimal amount of non
@@ -1178,7 +1188,8 @@ void BPF_STRUCT_OPS(p2dq_stopping, struct task_struct *p, bool runnable)
 		if (p->scx.weight < 100 && taskc->dsq_index > 1)
 			taskc->dsq_index = 1;
 
-		taskc->slice_ns = task_dsq_slice_ns(p, taskc->dsq_index);
+		if (!p2dq_config.magic_slice)
+			taskc->slice_ns = task_dsq_slice_ns(p, taskc->dsq_index);
 		taskc->last_run_started = 0;
 		taskc->interactive = is_interactive(taskc);
 	}
