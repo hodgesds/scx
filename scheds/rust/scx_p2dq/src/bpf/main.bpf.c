@@ -116,6 +116,7 @@ const volatile struct {
 
 	bool atq_enabled;
 	bool cpu_priority;
+	bool magic_slice;
 	bool freq_control;
 	bool interactive_dsq;
 	bool interactive_fifo;
@@ -132,6 +133,7 @@ const volatile struct {
 
 	.atq_enabled = false,
 	.cpu_priority = false,
+	.magic_slice = true,
 	.freq_control = false,
 	.interactive_fifo = true,
 	.interactive_sticky = false,
@@ -1312,7 +1314,15 @@ void BPF_STRUCT_OPS(p2dq_stopping, struct task_struct *p, bool runnable)
 		if (p->scx.weight < 100 && taskc->dsq_index > 1)
 			taskc->dsq_index = 1;
 
-		taskc->slice_ns = task_dsq_slice_ns(p, taskc->dsq_index);
+		if (p2dq_config.magic_slice) {
+			if (used >= ((9 * last_dsq_slice_ns) / 10)) {
+				taskc->slice_ns = clamp_slice(taskc->slice_ns + (10 * used / 100));
+			} else if (used < last_dsq_slice_ns / 2) {
+				taskc->slice_ns = clamp_slice(taskc->slice_ns - (10 * used / 100));
+			}
+		} else {
+			taskc->slice_ns = task_dsq_slice_ns(p, taskc->dsq_index);
+		}
 		taskc->last_run_started = 0;
 		taskc->interactive = is_interactive(taskc);
 	}
