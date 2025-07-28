@@ -29,6 +29,8 @@ fn get_default_llc_runs() -> u64 {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 pub enum LbMode {
+    /// Always load balance
+    Always,
     /// load of the LLC
     Load,
     /// number of tasks queued
@@ -38,6 +40,7 @@ pub enum LbMode {
 impl LbMode {
     pub fn as_i32(&self) -> i32 {
         match self {
+            LbMode::Always => bpf_intf::p2dq_lb_mode_PICK2_ALWAYS as i32,
             LbMode::Load => bpf_intf::p2dq_lb_mode_PICK2_LOAD as i32,
             LbMode::NrQueued => bpf_intf::p2dq_lb_mode_PICK2_NR_QUEUED as i32,
         }

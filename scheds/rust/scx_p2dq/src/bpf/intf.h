@@ -55,6 +55,7 @@ enum p2dq_timers_defs {
 enum p2dq_lb_mode {
 	PICK2_LOAD,
 	PICK2_NR_QUEUED,
+	PICK2_ALWAYS,
 };
 
 enum stat_idx {

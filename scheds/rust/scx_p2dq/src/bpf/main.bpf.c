@@ -149,6 +149,7 @@ extern const volatile u32 nr_cpu_ids;
 const u64 lb_timer_intvl_ns = 250LLU * NSEC_PER_MSEC;
 
 static u32 llc_lb_offset = 1;
+static u32 min_llc_runs_pick2 = 5;
 
 u64 llc_ids[MAX_LLCS];
 u64 cpu_llc_ids[MAX_CPUS];
@@ -245,6 +246,18 @@ static u64 llc_nr_queued(struct llc_ctx *llcx)
 	}
 
 	return nr_queued;
+}
+
+static u32 nr_idle_cpus(void)
+{
+	const struct cpumask *idle_cpumask;
+	u32 nr_idle;
+
+	idle_cpumask = scx_bpf_get_idle_cpumask();
+	nr_idle = bpf_cpumask_weight(idle_cpumask);
+	scx_bpf_put_cpumask(idle_cpumask);
+
+	return nr_idle;
 }
 
 static int llc_create_atqs(struct llc_ctx *llcx)
@@ -425,49 +438,11 @@ static bool can_migrate(task_ctx *taskc, struct llc_ctx *llcx)
 	    taskc->dsq_index != p2dq_config.nr_dsqs_per_llc - 1)
 		return false;
 
-	if ((taskc->all_cpus && taskc->llc_runs < lb_config.min_llc_runs_pick2) ||
+	if ((taskc->all_cpus && taskc->llc_runs < min_llc_runs_pick2) ||
 	    !taskc->all_cpus)
 		return false;
 
-	u64 mig_nr_queued = scx_bpf_dsq_nr_queued(llcx->mig_dsq);
-	u64 llc_nr_queued = scx_bpf_dsq_nr_queued(llcx->dsq);
-	if (mig_nr_queued >= llc_nr_queued)
-		return false;
-
-	if (p2dq_config.interactive_dsq) {
-		u64 intr_nr_queued;
-
-		if (p2dq_config.atq_enabled)
-			intr_nr_queued = scx_atq_nr_queued(llcx->intr_atq);
-		else
-			intr_nr_queued = scx_bpf_dsq_nr_queued(llcx->intr_dsq);
-		if (mig_nr_queued >= intr_nr_queued)
-			return false;
-	}
-
-	// The least interactive can always migrate
-	if (taskc->dsq_index == MAX_DSQS_PER_LLC - 1)
-		return true;
-
-	// For load balancing if the current DSQ index has more load the the
-	// more interactive tasks then it is eligible for migration.
-	bpf_for(idx, 1, p2dq_config.nr_dsqs_per_llc - 1) {
-		non_intr_sum += llcx->dsq_load[idx];
-		if (idx != taskc->dsq_index)
-			continue;
-
-		prev_load = llcx->dsq_load[idx - 1];
-		load = llcx->dsq_load[idx];
-
-		if (load > prev_load)
-			return true;
-	}
-
-	// If there is more interactive load than non then allow migrations
-	if (taskc->dsq_index == 0 && llcx->dsq_load[0] > non_intr_sum)
-		return true;
-
-	return false;
+	return true;
 }
 
 static void set_deadline_slice(struct task_struct *p, task_ctx *taskc,
@@ -1439,7 +1414,14 @@ static __always_inline int dispatch_pick_two(s32 cpu, struct llc_ctx *cur_llcx,
 	trace("PICK2 cpu[%d] first[%d] %llu second[%d] %llu",
 	      cpu, first->id, first->load, second->id, second->load);
 
-	if (lb_config.pick2_mode == PICK2_LOAD) {
+	switch (lb_config.pick2_mode) {
+	case PICK2_ALWAYS:
+		if (consume_llc(first))
+			return 0;
+
+		if (consume_llc(second))
+			return 0;
+	case PICK2_LOAD:
 		cur_load = cur_llcx->load + ((cur_llcx->load * lb_config.slack_factor) / 100);
 
 		if (first->load > cur_load &&
@@ -1449,7 +1431,7 @@ static __always_inline int dispatch_pick_two(s32 cpu, struct llc_ctx *cur_llcx,
 		if (second->load > cur_load &&
 		    consume_llc(second))
 			return 0;
-	} else if (lb_config.pick2_mode == PICK2_NR_QUEUED) {
+	case PICK2_NR_QUEUED:
 		cur_load = llc_nr_queued(cur_llcx);
 
 		if (llc_nr_queued(first) >= cur_load &&
@@ -1703,6 +1685,11 @@ void BPF_STRUCT_OPS(p2dq_update_idle, s32 cpu, bool idle)
 	struct llc_ctx *llcx;
 	u64 idle_score;
 	int ret, priority;
+	u32 nr_idle;
+
+	nr_idle = nr_idle_cpus();
+
+	min_llc_runs_pick2 = log2_u32(nr_idle);
 
 	if (!idle ||
 	    !p2dq_config.cpu_priority ||
