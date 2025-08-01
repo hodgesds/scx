@@ -1656,6 +1656,8 @@ static __always_inline s32 p2dq_init_task_impl(struct task_struct *p,
 	taskc->enq_flags = 0;
 	taskc->llc_id = cpuc->llc_id;
 	taskc->node_id = cpuc->node_id;
+	taskc->pref_node_id = p->tgid % topo_config.nr_nodes;
+	taskc->pref_llc_id = llc_ids[p->pid % topo_config.nr_llcs];
 	// Adjust starting index based on niceness
 	if (p->scx.weight == 100) {
 		taskc->dsq_index = p2dq_config.init_dsq_index;
