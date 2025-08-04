@@ -1048,7 +1048,8 @@ static __always_inline void async_p2dq_enqueue(struct enqueue_promise *ret,
 			return;
 		}
 	} else {
-		taskc->dsq_id = llcx->dsq;
+		taskc->dsq_id = cpuc->affn_dsq;
+		//taskc->dsq_id = topo_config.nr_llcs > 1 ? llcx->dsq : cpuc->affn_dsq;
 		stat_inc(P2DQ_STAT_ENQ_LLC);
 	}
 
@@ -1326,6 +1327,84 @@ static __always_inline bool consume_llc(struct llc_ctx *llcx)
 	return false;
 }
 
+static __always_inline bool consume_cpu(struct cpu_ctx *cpuc)
+{
+	struct task_struct *p;
+
+	bpf_for_each(scx_dsq, p, cpuc->affn_dsq, 0) {
+		// verifier
+		p = bpf_task_from_pid(p->pid);
+		if (!p)
+			return false;
+
+		if (!bpf_cpumask_test_cpu(cpuc->id, p->cpus_ptr)) {
+			bpf_task_release(p);
+			return false;
+		}
+
+		if (!__COMPAT_scx_bpf_dsq_move(BPF_FOR_EACH_ITER,
+					       p,
+					       SCX_DSQ_LOCAL_ON | cpuc->id,
+					       0)
+		) {
+			bpf_task_release(p);
+			return false;
+		}
+
+		bpf_task_release(p);
+		break;
+	}
+
+	return false;
+}
+
+static __always_inline int dispatch_pick_two_local(s32 cur_cpu,
+						   struct llc_ctx *cur_llcx,
+						   struct cpu_ctx *cpuc)
+{
+	struct cpu_ctx *first_cpuc, *second_cpuc;
+	s32 first_cpu, second_cpu;
+	s32 first_nr, second_nr;
+
+
+	if (!cur_llcx->cpumask)
+		return -EINVAL;
+	first_cpu = bpf_cpumask_any_distribute(cast_mask(cur_llcx->cpumask));
+	if (!cur_llcx->cpumask)
+		return -EINVAL;
+
+	second_cpu = bpf_cpumask_any_distribute(cast_mask(cur_llcx->cpumask));
+	if (first_cpu == cur_cpu)
+		first_cpu = cur_llcx->load % cur_llcx->nr_cpus;
+	if (second_cpu == cur_cpu)
+		second_cpu = cur_llcx->intr_load % cur_llcx->nr_cpus;
+
+	if (first_cpu >= topo_config.nr_cpus ||
+	    second_cpu >= topo_config.nr_cpus)
+		return -EINVAL;
+
+	if (!(first_cpuc = lookup_cpu_ctx(first_cpu)) ||
+	    !(second_cpuc = lookup_cpu_ctx(second_cpu)))
+		return -EINVAL;
+
+	first_nr = scx_bpf_dsq_nr_queued(first_cpuc->affn_dsq);
+	second_nr = scx_bpf_dsq_nr_queued(second_cpuc->affn_dsq);
+
+	if (first_nr > second_nr) {
+		if (consume_cpu(first_cpuc))
+			return 0;
+		if (consume_cpu(second_cpuc))
+			return 0;
+	} else {
+		if (consume_cpu(second_cpuc))
+			return 0;
+		if (consume_cpu(first_cpuc))
+			return 0;
+	}
+
+	return 0;
+}
+
 static __always_inline int dispatch_pick_two(s32 cpu, struct llc_ctx *cur_llcx,
 					     struct cpu_ctx *cpuc)
 {
@@ -1333,9 +1412,10 @@ static __always_inline int dispatch_pick_two(s32 cpu, struct llc_ctx *cur_llcx,
 	int i;
 	u64 cur_load;
 
-	// If on a single LLC there isn't anything left to try.
-	if (topo_config.nr_llcs == 1 ||
-	    lb_config.dispatch_pick2_disable ||
+	//if (topo_config.nr_llcs == 1)
+		return dispatch_pick_two_local(cpu, cur_llcx, cpuc);
+
+	if (lb_config.dispatch_pick2_disable ||
 	    topo_config.nr_llcs >= MAX_LLCS)
 		return -EINVAL;
 
