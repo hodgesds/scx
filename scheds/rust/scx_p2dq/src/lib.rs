@@ -307,10 +307,184 @@ macro_rules! init_skel {
             $skel.maps.bss_data.as_mut().unwrap().cpu_llc_ids[cpu.id] = cpu.llc_id as u64;
             $skel.maps.bss_data.as_mut().unwrap().cpu_node_ids[cpu.id] = cpu.node_id as u64;
         }
+
         for llc in $crate::TOPO.all_llcs.values() {
             $skel.maps.bss_data.as_mut().unwrap().llc_ids[llc.id] = llc.id as u64;
         }
+
+        // After initializing the basic topology, update CPU, LLC, and Node contexts with enhanced topology information
+        $crate::update_cpu_contexts($skel);
+        $crate::update_llc_contexts($skel);
+        $crate::update_node_contexts($skel);
     };
+}
+
+/// Updates the CPU contexts with enhanced topology information directly
+pub fn update_cpu_contexts<'a>(skel: &mut bpf_skel::BpfSkel<'a>) {
+    use std::ffi::c_int;
+    use libbpf_rs::ProgramInput;
+
+    // Create a BPF program to update the CPU context with enhanced topology information
+    let prog = &mut skel.progs.update_cpu_topology;
+
+    for cpu in TOPO.all_cpus.values() {
+        // Create the arguments for the BPF program
+        let mut args = bpf_intf::update_cpu_topology_args {
+            cpu_id: cpu.id as c_int,
+            core_id: cpu.core_id as u32,
+            package_id: cpu.package_id as u32,
+            cluster_id: cpu.cluster_id as i32,
+            smt_level: cpu.smt_level as u32,
+            cpu_capacity: cpu.cpu_capacity as u32,
+            l2_id: cpu.l2_id as u32,
+            l3_id: cpu.l3_id as u32,
+            cache_size: cpu.cache_size as u32,
+            min_freq: cpu.min_freq as u32,
+            max_freq: cpu.max_freq as u32,
+            base_freq: cpu.base_freq as u32,
+            pm_qos_resume_latency_us: cpu.pm_qos_resume_latency_us as u32,
+            trans_lat_ns: cpu.trans_lat_ns as u32,
+        };
+
+        // Create the program input
+        let input = ProgramInput {
+            context_in: Some(unsafe {
+                std::slice::from_raw_parts_mut(
+                    &mut args as *mut _ as *mut u8,
+                    std::mem::size_of_val(&args),
+                )
+            }),
+            ..Default::default()
+        };
+
+        // Run the BPF program to update the CPU context
+        match prog.test_run(input) {
+            Ok(output) => {
+                if output.return_value != 0 {
+                    log::warn!("Failed to update CPU context for CPU {}: {}", cpu.id, output.return_value);
+                }
+            },
+            Err(e) => {
+                log::error!("Error running update_cpu_topology for CPU {}: {}", cpu.id, e);
+            }
+        }
+    }
+}
+
+/// Updates the LLC contexts with enhanced topology information directly
+pub fn update_llc_contexts<'a>(skel: &mut bpf_skel::BpfSkel<'a>) {
+    use libbpf_rs::ProgramInput;
+
+    // Create a BPF program to update the LLC context with enhanced topology information
+    let prog = &mut skel.progs.update_llc_topology;
+
+    for (llc_id, llc) in TOPO.all_llcs.iter() {
+        // Extract cache information
+        let cache_size = llc.kernel_id; // Using kernel_id as a placeholder for cache size
+        let cache_line_size = 64; // Default cache line size
+        let ways_of_associativity = 16; // Default ways of associativity
+        let physical_line_partition = 1; // Default physical line partition
+        let coherency_line_size = 64; // Default coherency line size
+
+        // Count cores and siblings in this LLC
+        let mut nr_cores = 0;
+        let mut nr_siblings = 0;
+
+        for core in TOPO.all_cores.values() {
+            if core.llc_id == *llc_id {
+                nr_cores += 1;
+                nr_siblings += core.cpus.len();
+            }
+        }
+
+        // Create the arguments for the BPF program
+        let mut args = bpf_intf::update_llc_topology_args {
+            llc_id: *llc_id as u32,
+            kernel_id: llc.kernel_id as u32,
+            cache_level: 3, // LLC is typically L3 cache
+            cache_size: cache_size as u32,
+            cache_line_size: cache_line_size as u32,
+            ways_of_associativity: ways_of_associativity as u32,
+            physical_line_partition: physical_line_partition as u32,
+            coherency_line_size: coherency_line_size as u32,
+            nr_cores: nr_cores as u32,
+            nr_siblings: nr_siblings as u32,
+        };
+
+        // Create the program input
+        let input = ProgramInput {
+            context_in: Some(unsafe {
+                std::slice::from_raw_parts_mut(
+                    &mut args as *mut _ as *mut u8,
+                    std::mem::size_of_val(&args),
+                )
+            }),
+            ..Default::default()
+        };
+
+        // Run the BPF program to update the LLC context
+        match prog.test_run(input) {
+            Ok(output) => {
+                if output.return_value != 0 {
+                    log::warn!("Failed to update LLC context for LLC {}: {}", llc_id, output.return_value);
+                }
+            },
+            Err(e) => {
+                log::error!("Error running update_llc_topology for LLC {}: {}", llc_id, e);
+            }
+        }
+    }
+}
+
+/// Updates the Node contexts with NUMA distance information directly
+pub fn update_node_contexts<'a>(skel: &mut bpf_skel::BpfSkel<'a>) {
+    use libbpf_rs::ProgramInput;
+
+    // Create a BPF program to update the Node context with NUMA distance information
+    let prog = &mut skel.progs.update_node_topology;
+
+    for (node_id, node) in TOPO.nodes.iter() {
+        // Create an array to store the NUMA distances
+        let mut distance_array = [0u32; bpf_intf::consts_MAX_NUMA_NODES as usize];
+
+        // Copy the distance information from the Node struct
+        let nr_nodes = node.distance.len();
+        for (i, &distance) in node.distance.iter().enumerate() {
+            if i < bpf_intf::consts_MAX_NUMA_NODES as usize {
+                distance_array[i] = distance as u32;
+            }
+        }
+
+        // Create the arguments for the BPF program
+        let mut args = bpf_intf::update_node_topology_args {
+            node_id: *node_id as u32,
+            nr_nodes: nr_nodes as u32,
+            distance: distance_array,
+        };
+
+        // Create the program input
+        let input = ProgramInput {
+            context_in: Some(unsafe {
+                std::slice::from_raw_parts_mut(
+                    &mut args as *mut _ as *mut u8,
+                    std::mem::size_of_val(&args),
+                )
+            }),
+            ..Default::default()
+        };
+
+        // Run the BPF program to update the Node context
+        match prog.test_run(input) {
+            Ok(output) => {
+                if output.return_value != 0 {
+                    log::warn!("Failed to update Node context for Node {}: {}", node_id, output.return_value);
+                }
+            },
+            Err(e) => {
+                log::error!("Error running update_node_topology for Node {}: {}", node_id, e);
+            }
+        }
+    }
 }
 
 pub mod bpf_srcs {
