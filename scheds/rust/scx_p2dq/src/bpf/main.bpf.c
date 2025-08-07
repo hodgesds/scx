@@ -199,6 +199,20 @@ static __always_inline u64 cpu_dsq_id(s32 cpu)
 	return ((MAX_DSQS_PER_LLC * MAX_LLCS) << 2) + cpu;
 }
 
+static __always_inline u64 task_mm_ptr(struct task_struct *p)
+{
+	u64 mm_ptr;
+	int err;
+
+	err = bpf_probe_read_kernel(&mm_ptr, sizeof(mm_ptr), &p->mm);
+	if (err) {
+		scx_bpf_error("failed to get task mm ptr");
+		return 0;
+	}
+
+	return mm_ptr;
+}
+
 static __always_inline s32 __pick_idle_cpu(struct bpf_cpumask *mask, int flags)
 {
 	return scx_bpf_pick_idle_cpu(cast_mask(mask), flags);
@@ -657,9 +671,13 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 	 * waker.
 	 */
 	if (wake_flags & SCX_WAKE_SYNC) {
+		struct task_struct *waker = (void *)bpf_get_current_task_btf();
+		bool same_mm = task_mm_ptr(waker) == task_mm_ptr(p);
+
 		// Interactive tasks aren't worth migrating across LLCs.
-		if (taskc->interactive ||
-		    (topo_config.nr_llcs == 2 && topo_config.nr_nodes == 2)) {
+		if ((taskc->interactive || !same_mm ) ||
+		    ((topo_config.nr_llcs == 2 && topo_config.nr_nodes == 2) &&
+		      !same_mm)) {
 			// Try an idle CPU in the LLC.
 			if (llcx->cpumask &&
 			    (cpu = __pick_idle_cpu(llcx->cpumask, 0)
@@ -674,16 +692,8 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 			goto found_cpu;
 		}
 
-		struct task_struct *waker = (void *)bpf_get_current_task_btf();
-		task_ctx *waker_taskc = scx_task_data(waker);
-		// Shouldn't happen, but makes code easier to follow
-		if (!waker_taskc) {
-			stat_inc(P2DQ_STAT_WAKE_PREV);
-			goto found_cpu;
-		}
-
-		if (waker_taskc->llc_id == llcx->id ||
-		    !lb_config.wakeup_llc_migrations) {
+		if (cpu_llc_id(scx_bpf_task_cpu(waker)) == llcx->id ||
+		    (!lb_config.wakeup_llc_migrations && !same_mm)) {
 			// Try an idle smt core in the LLC.
 			if (topo_config.smt_enabled &&
 			    llcx->cpumask &&
@@ -710,7 +720,7 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 		}
 
 		// If wakeup LLC are allowed then migrate to the waker llc.
-		struct llc_ctx *waker_llcx = lookup_llc_ctx(waker_taskc->llc_id);
+		struct llc_ctx *waker_llcx = lookup_cpu_llc_ctx(scx_bpf_task_cpu(waker));
 		if (!waker_llcx) {
 			stat_inc(P2DQ_STAT_WAKE_PREV);
 			cpu = prev_cpu;
