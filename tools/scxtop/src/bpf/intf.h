@@ -42,6 +42,8 @@ enum event_type {
 	EXEC,
 	EXIT,
 	FORK,
+	FUTEX_ENTER,
+	FUTEX_EXIT,
 	WAIT,
 	GPU_MEM,
 	HW_PRESSURE,
@@ -92,10 +94,10 @@ struct wakeup_event {
 };
 
 struct migrate_event {
-    u8      comm[MAX_COMM];
-    u32     pid;
-    int     prio;
-    u32     dest_cpu;
+	u8		comm[MAX_COMM];
+	u32		pid;
+	int		prio;
+	u32		dest_cpu;
 };
 
 struct set_perf_event {
@@ -185,6 +187,14 @@ struct kprobe_event {
 	u64             instruction_pointer;
 };
 
+struct futex_event {
+	u32             pid;
+	u32		tgid;
+	u32		op;
+	u64		uaddr;
+	int		ret;
+};
+
 struct bpf_event {
 	int		type;
 	u64		ts;
@@ -208,6 +218,7 @@ struct bpf_event {
 		struct  hang_event hang;
 		struct  trace_started_event trace;
 		struct  kprobe_event kprobe;
+		struct  futex_event futex;
 	} event;
 };
 
