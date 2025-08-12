@@ -366,7 +366,7 @@ static struct llc_ctx *lookup_cpu_llc_ctx(s32 cpu)
 		return NULL;
 	}
 
-	return lookup_llc_ctx(cpu_llc_ids[cpu]);
+	return lookup_llc_ctx(*MEMBER_VPTR(cpu_llc_ids, [cpu]));
 }
 
 struct {
