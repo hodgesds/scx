@@ -13,44 +13,51 @@ struct p2dq_timer {
 struct cpu_ctx {
 	int				id;
 	u32				llc_id;
+	u32				l2_id;
+
+	u64 				llc_dsq;
+	u64 				mig_dsq;
 	u64				affn_dsq;
-	u32				dsq_index;
+	u64 				l2_dsq;
+
 	u64				slice_ns;
+	u64				ran_for;
+	bool				nice_task;
+
+	u32				dsq_index;
+	u32 				node_id;
 	u32				perf;
 	bool				interactive;
 	bool				is_big;
-	bool				nice_task;
-	u64				ran_for;
-	u32				node_id;
-	u64				mig_dsq;
-	u64				llc_dsq;
-	u64				max_load_dsq;
+	u64 				max_load_dsq;
 
 	scx_atq_t			*mig_atq;
 };
 
 struct llc_ctx {
 	u32				id;
-	u32				nr_cpus;
-	u32				node_id;
-	u64				vtime;
-	u32				lb_llc_id;
-	u64				last_period_ns;
-	u64				dsq;
-	u64				mig_dsq;
-	u32				index;
-	u64				load;
-	u64				affn_load;
-	u64				intr_load;
-	u64				dsq_load[MAX_DSQS_PER_LLC];
+	u32 				node_id;
+	u64 				vtime;
+	u32 				lb_llc_id;
+	u64 				last_period_ns;
+	u64 				dsq;
+	u64 				mig_dsq;
+	u32 				nr_cpus;
+	u32 				nr_l2s;
+	u32 				index;
+	u64 				load;
+	u64 				affn_load;
+	u64 				intr_load;
 	bool				saturated;
-	bool				all_big;
+	bool 				all_big;
+	u64 				l2_mask;
+	u64				l2_dsq_ids[MAX_CPUS];
 
 	struct bpf_cpumask __kptr	*cpumask;
-	struct bpf_cpumask __kptr	*big_cpumask;
-	struct bpf_cpumask __kptr	*little_cpumask;
-	struct bpf_cpumask __kptr	*node_cpumask;
-	struct bpf_cpumask __kptr	*tmp_cpumask;
+	struct bpf_cpumask __kptr 	*big_cpumask;
+	struct bpf_cpumask __kptr 	*little_cpumask;
+	struct bpf_cpumask __kptr 	*node_cpumask;
+	struct bpf_cpumask __kptr 	*tmp_cpumask;
 
 	scx_atq_t			*mig_atq;
 	scx_minheap_t			*idle_cpu_heap;

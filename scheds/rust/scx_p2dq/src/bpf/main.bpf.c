@@ -121,6 +121,7 @@ const volatile struct {
 	bool keep_running_enabled;
 	bool kthreads_local;
 	bool select_idle_in_enqueue;
+	bool l2_scheduling;
 } p2dq_config = {
 	.nr_dsqs_per_llc = 3,
 	.init_dsq_index = 0,
@@ -135,6 +136,7 @@ const volatile struct {
 	.keep_running_enabled = true,
 	.kthreads_local = true,
 	.select_idle_in_enqueue = true,
+	.l2_scheduling = false,
 };
 
 const volatile u32 debug = 2;
@@ -149,6 +151,7 @@ static bool saturated = false;
 
 u64 llc_ids[MAX_LLCS];
 u64 cpu_llc_ids[MAX_CPUS];
+u64 cpu_l2_ids[MAX_CPUS];
 u64 cpu_node_ids[MAX_CPUS];
 u64 big_core_ids[MAX_CPUS];
 u64 dsq_time_slices[MAX_DSQS_PER_LLC];
@@ -199,9 +202,53 @@ static __always_inline u64 cpu_dsq_id(s32 cpu)
 	return ((MAX_DSQS_PER_LLC * MAX_LLCS) << 2) + cpu;
 }
 
+static __always_inline u64 l2_dsq_id(s32 l2_id, u32 llc_id)
+{
+	return ((llc_id | MAX_LLCS) + (u64)l2_id) | P2DQ_L2_DSQ;
+}
+
+static __always_inline u32 wrap_index(u32 index, u32 min, u32 max)
+{
+	if (min > max) {
+		scx_bpf_error("invalid min");
+		return min;
+	}
+	u32 range = max - min + 1;
+	return min + (index % range);
+}
+
 static __always_inline s32 __pick_idle_cpu(struct bpf_cpumask *mask, int flags)
 {
 	return scx_bpf_pick_idle_cpu(cast_mask(mask), flags);
+}
+
+/*
+ * Pick2 load balancing for L2 DSQ selection.
+ * Compares preferred L2 DSQ with one random alternative and picks the less loaded one.
+ * Much more efficient than checking all L2 DSQs.
+ */
+static u64 select_l2_dsq_pick2(struct llc_ctx *llcx, u64 cpu_l2_dsq)
+{
+	u64 dsq_id;
+	u32 i;
+
+	u64 min_nr_queued = scx_bpf_dsq_nr_queued(cpu_l2_dsq);
+	u64 preferred_dsq_id = cpu_l2_dsq;
+
+	if (llcx->nr_l2s > MAX_CPUS) {
+		scx_bpf_error("can't happen");
+		return cpu_l2_dsq;
+	}
+
+	bpf_for(i, 0, llcx->nr_l2s) {
+		dsq_id = llcx->l2_dsq_ids[i & (MAX_CPUS-1)];
+		if (dsq_id == cpu_l2_dsq)
+			continue;
+		if(scx_bpf_dsq_nr_queued(dsq_id) < min_nr_queued)
+			preferred_dsq_id = dsq_id;
+	}
+
+	return preferred_dsq_id;
 }
 
 static int init_cpumask(struct bpf_cpumask **mask_p)
@@ -263,7 +310,22 @@ static u64 task_dsq_slice_ns(struct task_struct *p, int dsq_index)
 
 static u64 llc_nr_queued(struct llc_ctx *llcx)
 {
-	u64 nr_queued = scx_bpf_dsq_nr_queued(llcx->dsq);
+	u64 dsq_id, nr_queued = 0;
+	int i;
+
+	if (llcx->nr_l2s > MAX_CPUS) {
+		scx_bpf_error("invalid");
+		return 0;
+	}
+
+	if (p2dq_config.l2_scheduling) {
+		bpf_for(i, 0, llcx->nr_l2s) {
+			dsq_id = llcx->l2_dsq_ids[i & (MAX_CPUS - 1)];
+			nr_queued += scx_bpf_dsq_nr_queued(dsq_id);
+		}
+	} else {
+		nr_queued += scx_bpf_dsq_nr_queued(llcx->dsq);
+	}
 
 	if (topo_config.nr_llcs > 1) {
 		if (p2dq_config.atq_enabled)
@@ -530,7 +592,7 @@ static bool keep_running(struct cpu_ctx *cpuc, struct llc_ctx *llcx,
 	    cpuc->ran_for >= timeline_config.max_exec_ns)
 		return false;
 
-	int nr_queued = scx_bpf_dsq_nr_queued(llcx->dsq);
+	int nr_queued = llc_nr_queued(llcx);
 
 	if (nr_queued >= llcx->nr_cpus)
 		return false;
@@ -799,15 +861,17 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 	}
 
 	// Couldn't find anything idle just return something in the local LLC
-	if (taskc->interactive && llcx->cpumask)
-		cpu = bpf_cpumask_any_distribute(cast_mask(llcx->cpumask));
-	else
-		// non interactive tasks stay sticky
+	// if (taskc->interactive && llcx->cpumask)
+	// 	cpu = bpf_cpumask_any_distribute(cast_mask(llcx->cpumask));
+	// else
+	// 	// non interactive tasks stay sticky
 		cpu = prev_cpu;
 
 found_cpu:
 	scx_bpf_put_cpumask(idle_cpumask);
 	scx_bpf_put_cpumask(idle_smtmask);
+	if (cpu > topo_config.nr_cpus || cpu < 0)
+		cpu = prev_cpu;
 
 	return cpu;
 }
@@ -976,7 +1040,7 @@ static void async_p2dq_enqueue(struct enqueue_promise *ret,
 			if (p2dq_config.atq_enabled) {
 				taskc->enq_flags = enq_flags;
 				ret->kind = P2DQ_ENQUEUE_PROMISE_ATQ_VTIME;
-				ret->vtime.dsq_id = llcx->dsq;
+				ret->vtime.dsq_id = p2dq_config.l2_scheduling ? cpuc->l2_dsq : llcx->dsq;
 				ret->vtime.atq = llcx->mig_atq;
 				ret->vtime.slice_ns = taskc->slice_ns;
 				ret->vtime.vtime = p->scx.dsq_vtime;
@@ -989,19 +1053,23 @@ static void async_p2dq_enqueue(struct enqueue_promise *ret,
 			}
 			stat_inc(P2DQ_STAT_ENQ_MIG);
 		} else {
-			taskc->dsq_id = llcx->dsq;
+			if (p2dq_config.l2_scheduling) {
+				taskc->dsq_id = select_l2_dsq_pick2(llcx, cpuc->l2_dsq);
+				stat_inc(P2DQ_STAT_ENQ_L2);
+			} else {
+				taskc->dsq_id = llcx->dsq;
+				stat_inc(P2DQ_STAT_ENQ_LLC);
+			}
 			ret->kind = P2DQ_ENQUEUE_PROMISE_VTIME;
 			ret->vtime.dsq_id = taskc->dsq_id;
 			ret->vtime.slice_ns = taskc->slice_ns;
 			ret->vtime.enq_flags = enq_flags;
 			ret->vtime.vtime = p->scx.dsq_vtime;
-			stat_inc(P2DQ_STAT_ENQ_LLC);
 		}
 
 		trace("ENQUEUE %s weight %d slice %llu vtime %llu llc vtime %llu",
 		      p->comm, p->scx.weight, taskc->slice_ns,
 		      p->scx.dsq_vtime, llcx->vtime);
-
 		return;
 	}
 
@@ -1044,8 +1112,13 @@ static void async_p2dq_enqueue(struct enqueue_promise *ret,
 			return;
 		}
 	} else {
-		taskc->dsq_id = llcx->dsq;
-		stat_inc(P2DQ_STAT_ENQ_LLC);
+		if (p2dq_config.l2_scheduling) {
+			taskc->dsq_id = select_l2_dsq_pick2(llcx, cpuc->l2_dsq);
+			stat_inc(P2DQ_STAT_ENQ_L2);
+		} else {
+			taskc->dsq_id = llcx->dsq;
+			stat_inc(P2DQ_STAT_ENQ_LLC);
+		}
 	}
 
 	trace("ENQUEUE %s weight %d slice %llu vtime %llu llc vtime %llu",
@@ -1226,8 +1299,6 @@ void BPF_STRUCT_OPS(p2dq_stopping, struct task_struct *p, bool runnable)
 	p->scx.dsq_vtime += scaled_used;
 	__sync_fetch_and_add(&llcx->vtime, used);
 	__sync_fetch_and_add(&llcx->load, used);
-	if (taskc->dsq_index >= 0 && taskc->dsq_index < MAX_DSQS_PER_LLC)
-		__sync_fetch_and_add(&llcx->dsq_load[taskc->dsq_index], used);
 
 	if (taskc->interactive)
 		__sync_fetch_and_add(&llcx->intr_load, used);
@@ -1417,6 +1488,7 @@ static void p2dq_dispatch_impl(s32 cpu, struct task_struct *prev)
 	struct llc_ctx *llcx;
 	u64 pid, peeked_pid, dsq_id = 0;
 	scx_atq_t *min_atq = NULL;
+	int i;
 
 	if (!(cpuc = lookup_cpu_ctx(cpu))) {
 		scx_bpf_error("can't happen");
@@ -1435,11 +1507,12 @@ static void p2dq_dispatch_impl(s32 cpu, struct task_struct *prev)
 			break;
 		}
 
-		// LLC DSQ
-		bpf_for_each(scx_dsq, p, cpuc->llc_dsq, 0) {
+		// LLC or L2 DSQ
+		u64 target_dsq = p2dq_config.l2_scheduling ? cpuc->l2_dsq : cpuc->llc_dsq;
+		bpf_for_each(scx_dsq, p, target_dsq, 0) {
 			if (p->scx.dsq_vtime < min_vtime || min_vtime == 0) {
 				min_vtime = p->scx.dsq_vtime;
-				dsq_id = cpuc->llc_dsq;
+				dsq_id = target_dsq;
 			}
 			break;
 		}
@@ -1449,8 +1522,7 @@ static void p2dq_dispatch_impl(s32 cpu, struct task_struct *prev)
 			if (p2dq_config.atq_enabled) {
 				pid = scx_atq_peek(cpuc->mig_atq);
 				if ((p = bpf_task_from_pid((s32)pid))) {
-					if (p->scx.dsq_vtime < min_vtime ||
-					    min_vtime == 0) {
+					if (p->scx.dsq_vtime < min_vtime || min_vtime == 0) {
 						min_vtime = p->scx.dsq_vtime;
 						min_atq = cpuc->mig_atq;
 						/*
@@ -1470,8 +1542,7 @@ static void p2dq_dispatch_impl(s32 cpu, struct task_struct *prev)
 				}
 			} else {
 				bpf_for_each(scx_dsq, p, cpuc->mig_dsq, 0) {
-					if (p->scx.dsq_vtime < min_vtime ||
-					    min_vtime == 0) {
+					if (p->scx.dsq_vtime < min_vtime || min_vtime == 0) {
 						min_vtime = p->scx.dsq_vtime;
 						dsq_id = cpuc->mig_dsq;
 					}
@@ -1515,10 +1586,10 @@ static void p2dq_dispatch_impl(s32 cpu, struct task_struct *prev)
 				 * back to the LLC DSQ.
 				 */
 				scx_bpf_dsq_insert_vtime(p,
-						   cpuc->llc_dsq,
-						   taskc->slice_ns,
-						   p->scx.dsq_vtime,
-						   taskc->enq_flags);
+							 cpuc->llc_dsq,
+							 taskc->slice_ns,
+							 p->scx.dsq_vtime,
+							 taskc->enq_flags);
 				bpf_task_release(p);
 				stat_inc(P2DQ_STAT_ATQ_REENQ);
 			}
@@ -1560,6 +1631,18 @@ static void p2dq_dispatch_impl(s32 cpu, struct task_struct *prev)
 	if (!(llcx = lookup_llc_ctx(cpuc->llc_id))) {
 		scx_bpf_error("invalid llc id %u", cpuc->llc_id);
 		return;
+	}
+
+	if (p2dq_config.l2_scheduling && llcx->nr_l2s > 1) {
+		u32 offset = cpuc->id % llcx->nr_l2s;
+		u32 l2_index;
+		bpf_for(i, 0, llcx->nr_l2s - 1) {
+			l2_index = wrap_index(offset + i, 0, llcx->nr_l2s - 1) & (MAX_CPUS - 1);
+			dsq_id = llcx->l2_dsq_ids[l2_index];
+			if (valid_dsq(dsq_id) && dsq_id != cpuc->l2_dsq &&
+			    scx_bpf_dsq_move_to_local(dsq_id))
+				return;
+		}
 	}
 
 	if (prev && keep_running(cpuc, llcx, prev))
@@ -1740,8 +1823,12 @@ static int init_llc(u32 llc_index)
 	llcx->vtime = 0;
 	llcx->id = *MEMBER_VPTR(llc_ids, [llc_index]);
 	llcx->index = llc_index;
+	llcx->l2_mask = 0;
 	llcx->nr_cpus = 0;
 	llcx->vtime = 0;
+	llcx->load = 0;
+	llcx->affn_load = 0;
+	llcx->intr_load = 0;
 
 	ret = llc_create_atqs(llcx);
 	if (ret) {
@@ -1848,6 +1935,7 @@ static s32 init_cpu(int cpu)
 	cpuc->id = cpu;
 	cpuc->llc_id = cpu_llc_ids[cpu];
 	cpuc->node_id = cpu_node_ids[cpu];
+	cpuc->l2_id = cpu_l2_ids[cpu];
 	cpuc->is_big = big_core_ids[cpu] == 1;
 	cpuc->slice_ns = 1;
 
@@ -1883,6 +1971,29 @@ static s32 init_cpu(int cpu)
 		nodec->all_big = false;
 	}
 
+	u64 dsq_id = cpu_dsq_id(cpu);
+	int ret;
+
+	cpuc->affn_dsq = dsq_id;
+	cpuc->mig_dsq = llcx->mig_dsq;
+
+	if (p2dq_config.l2_scheduling) {
+		cpuc->l2_dsq = l2_dsq_id(cpuc->l2_id, llcx->id);
+		if (llcx->nr_l2s == 0 ||
+		    !((llcx->l2_mask & (1LLU << cpuc->l2_id)) == (1LLU << cpuc->l2_id))) {
+			llcx->l2_dsq_ids[llcx->nr_cpus & (MAX_CPUS - 1)] = cpuc->l2_dsq;
+			ret = scx_bpf_create_dsq(cpuc->l2_dsq, llcx->node_id);
+			if (ret < 0) {
+				scx_bpf_error("failed to create L2 DSQ 0x%llx", cpuc->l2_dsq);
+				return ret;
+			}
+			trace("CFG created LLC[%d] L2[%d] DSQ[0x%llx] for CPU[%d]",
+			      llcx->id, cpuc->l2_id, cpuc->l2_dsq, cpuc->id);
+			llcx->l2_mask |= (1LLU << cpuc->l2_id);
+			llcx->nr_l2s += 1;
+		}
+	}
+
 	bpf_rcu_read_lock();
 	if (nodec->cpumask)
 		bpf_cpumask_set_cpu(cpu, nodec->cpumask);
@@ -1895,6 +2006,7 @@ static s32 init_cpu(int cpu)
 
 	return 0;
 }
+
 
 static bool load_balance_timer(void)
 {
@@ -1988,7 +2100,6 @@ reset_load:
 		llcx->affn_load = 0;
 		llcx->last_period_ns = scx_bpf_now();
 		bpf_for(j, 0, p2dq_config.nr_dsqs_per_llc) {
-			llcx->dsq_load[j] = 0;
 			if (llc_id == 0 && timeline_config.autoslice) {
 				if (j > 0 && dsq_time_slices[j] < dsq_time_slices[j-1]) {
 					dsq_time_slices[j] = dsq_time_slices[j-1] << p2dq_config.dsq_shift;
@@ -2138,10 +2249,10 @@ static s32 p2dq_init_impl()
 		cpuc->mig_atq = llcx->mig_atq;
 
 		dsq_id = cpu_dsq_id(i);
-		dbg("CFG creating affn CPU[%d]DSQ[%llu]", i, dsq_id);
+		dbg("CFG creating affn CPU[%d]DSQ[0x%llx]", i, dsq_id);
 		ret = scx_bpf_create_dsq(dsq_id, llcx->node_id);
 		if (ret < 0) {
-			scx_bpf_error("failed to create DSQ %llu", dsq_id);
+			scx_bpf_error("failed to create DSQ 0x%llx", dsq_id);
 			return ret;
 		}
 		cpuc->affn_dsq = dsq_id;

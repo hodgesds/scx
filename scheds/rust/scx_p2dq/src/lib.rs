@@ -129,6 +129,10 @@ pub struct SchedulerOpts {
     #[clap(long, action = clap::ArgAction::SetTrue)]
     pub queued_wakeup: bool,
 
+    /// Enable L2 cache sharding for LLC DSQs.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    pub l2_scheduling: bool,
+
     /// Set idle QoS resume latency based in microseconds.
     #[clap(long)]
     pub idle_resume_us: Option<u32>,
@@ -285,6 +289,7 @@ macro_rules! init_open_skel {
             rodata.p2dq_config.keep_running_enabled = MaybeUninit::new(opts.keep_running);
             rodata.p2dq_config.select_idle_in_enqueue =
                 MaybeUninit::new(opts.select_idle_in_enqueue);
+            rodata.p2dq_config.l2_scheduling = MaybeUninit::new(opts.l2_scheduling);
 
             rodata.debug = verbose as u32;
             rodata.nr_cpu_ids = *NR_CPU_IDS as u32;
@@ -305,6 +310,7 @@ macro_rules! init_skel {
                     0
                 };
             $skel.maps.bss_data.as_mut().unwrap().cpu_llc_ids[cpu.id] = cpu.llc_id as u64;
+            $skel.maps.bss_data.as_mut().unwrap().cpu_l2_ids[cpu.id] = cpu.l2_id as u64;
             $skel.maps.bss_data.as_mut().unwrap().cpu_node_ids[cpu.id] = cpu.node_id as u64;
         }
         for llc in $crate::TOPO.all_llcs.values() {
