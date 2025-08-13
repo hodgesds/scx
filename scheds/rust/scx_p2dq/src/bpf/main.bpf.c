@@ -121,6 +121,7 @@ const volatile struct {
 	bool keep_running_enabled;
 	bool kthreads_local;
 	bool select_idle_in_enqueue;
+	bool l2_scheduling;
 } p2dq_config = {
 	.nr_dsqs_per_llc = 3,
 	.init_dsq_index = 0,
@@ -135,6 +136,7 @@ const volatile struct {
 	.keep_running_enabled = true,
 	.kthreads_local = true,
 	.select_idle_in_enqueue = true,
+	.l2_scheduling = false,
 };
 
 const volatile u32 debug = 2;
@@ -149,6 +151,7 @@ static bool saturated = false;
 
 u64 llc_ids[MAX_LLCS];
 u64 cpu_llc_ids[MAX_CPUS];
+u64 cpu_l2_ids[MAX_CPUS];
 u64 cpu_node_ids[MAX_CPUS];
 u64 big_core_ids[MAX_CPUS];
 u64 dsq_time_slices[MAX_DSQS_PER_LLC];
@@ -202,6 +205,56 @@ static __always_inline u64 cpu_dsq_id(s32 cpu)
 static __always_inline s32 __pick_idle_cpu(struct bpf_cpumask *mask, int flags)
 {
 	return scx_bpf_pick_idle_cpu(cast_mask(mask), flags);
+}
+
+/*
+ * Pick2 load balancing for L2 DSQ selection.
+ * Compares preferred L2 DSQ with one random alternative and picks the less loaded one.
+ * Much more efficient than checking all L2 DSQs.
+ */
+static u32 select_l2_dsq_pick2(struct llc_ctx *llcx, u32 preferred_l2_id, u32 min_queued_threshold)
+{
+	u64 preferred_dsq_id = llcx->l2_dsq_ids[preferred_l2_id];
+	u64 preferred_queued;
+	u32 alternative_l2_id;
+	u64 alternative_dsq_id;
+	u64 alternative_queued;
+	u32 l2_id;
+
+	// Get queue length for preferred L2 DSQ
+	if (!valid_dsq(preferred_dsq_id))
+		return preferred_l2_id;
+
+	preferred_queued = scx_bpf_dsq_nr_queued(preferred_dsq_id);
+
+	// If preferred L2 DSQ has few queued tasks, use it (fast path)
+	if (preferred_queued <= min_queued_threshold)
+		return preferred_l2_id;
+
+	// Find a random alternative L2 DSQ within this LLC
+	u32 random_offset = bpf_get_prandom_u32() % MAX_CPUS;
+	alternative_l2_id = preferred_l2_id;
+
+	bpf_for(l2_id, 0, MAX_CPUS) {
+		u32 candidate = (preferred_l2_id + random_offset + l2_id) % MAX_CPUS;
+		if (candidate != preferred_l2_id && llcx->l2_dsq_ids[candidate] != 0) {
+			alternative_l2_id = candidate;
+			break;
+		}
+	}
+
+	// If no alternative found, stick with preferred
+	if (alternative_l2_id == preferred_l2_id)
+		return preferred_l2_id;
+
+	alternative_dsq_id = llcx->l2_dsq_ids[alternative_l2_id];
+	if (!valid_dsq(alternative_dsq_id))
+		return preferred_l2_id;
+
+	alternative_queued = scx_bpf_dsq_nr_queued(alternative_dsq_id);
+
+	// Pick2: choose the L2 DSQ with fewer queued tasks
+	return (alternative_queued < preferred_queued) ? alternative_l2_id : preferred_l2_id;
 }
 
 static int init_cpumask(struct bpf_cpumask **mask_p)
@@ -989,19 +1042,31 @@ static void async_p2dq_enqueue(struct enqueue_promise *ret,
 			}
 			stat_inc(P2DQ_STAT_ENQ_MIG);
 		} else {
-			taskc->dsq_id = llcx->dsq;
+			if (p2dq_config.l2_scheduling) {
+				if (cpuc->l2_id >= MAX_CPUS) {
+					scx_bpf_error("invalid L2 ID %u", cpuc->l2_id);
+					return;
+				}
+				// Use pick2 load balancing to select L2 DSQ (much more efficient)
+				u32 selected_l2_id = select_l2_dsq_pick2(llcx, cpuc->l2_id, 2);
+				u64 l2_dsq_id = llcx->l2_dsq_ids[selected_l2_id];
+				taskc->dsq_id = l2_dsq_id;
+
+				stat_inc(P2DQ_STAT_ENQ_L2);
+			} else {
+				taskc->dsq_id = llcx->dsq;
+				stat_inc(P2DQ_STAT_ENQ_LLC);
+			}
 			ret->kind = P2DQ_ENQUEUE_PROMISE_VTIME;
 			ret->vtime.dsq_id = taskc->dsq_id;
 			ret->vtime.slice_ns = taskc->slice_ns;
 			ret->vtime.enq_flags = enq_flags;
 			ret->vtime.vtime = p->scx.dsq_vtime;
-			stat_inc(P2DQ_STAT_ENQ_LLC);
 		}
 
 		trace("ENQUEUE %s weight %d slice %llu vtime %llu llc vtime %llu",
 		      p->comm, p->scx.weight, taskc->slice_ns,
 		      p->scx.dsq_vtime, llcx->vtime);
-
 		return;
 	}
 
@@ -1044,8 +1109,21 @@ static void async_p2dq_enqueue(struct enqueue_promise *ret,
 			return;
 		}
 	} else {
-		taskc->dsq_id = llcx->dsq;
-		stat_inc(P2DQ_STAT_ENQ_LLC);
+		if (p2dq_config.l2_scheduling) {
+			if (cpuc->l2_id >= MAX_CPUS) {
+				scx_bpf_error("invalid L2 ID %u", cpuc->l2_id);
+				return;
+			}
+			// Use pick2 load balancing to select L2 DSQ (much more efficient)
+			u32 selected_l2_id = select_l2_dsq_pick2(llcx, cpuc->l2_id, 2);
+			u64 l2_dsq_id = llcx->l2_dsq_ids[selected_l2_id];
+			taskc->dsq_id = l2_dsq_id;
+
+			stat_inc(P2DQ_STAT_ENQ_L2);
+		} else {
+			taskc->dsq_id = llcx->dsq;
+			stat_inc(P2DQ_STAT_ENQ_LLC);
+		}
 	}
 
 	trace("ENQUEUE %s weight %d slice %llu vtime %llu llc vtime %llu",
@@ -1435,11 +1513,12 @@ static void p2dq_dispatch_impl(s32 cpu, struct task_struct *prev)
 			break;
 		}
 
-		// LLC DSQ
-		bpf_for_each(scx_dsq, p, cpuc->llc_dsq, 0) {
+		// LLC or L2 DSQ
+		u64 target_dsq = p2dq_config.l2_scheduling ? cpuc->l2_dsq : cpuc->llc_dsq;
+		bpf_for_each(scx_dsq, p, target_dsq, 0) {
 			if (p->scx.dsq_vtime < min_vtime || min_vtime == 0) {
 				min_vtime = p->scx.dsq_vtime;
-				dsq_id = cpuc->llc_dsq;
+				dsq_id = target_dsq;
 			}
 			break;
 		}
@@ -1449,8 +1528,7 @@ static void p2dq_dispatch_impl(s32 cpu, struct task_struct *prev)
 			if (p2dq_config.atq_enabled) {
 				pid = scx_atq_peek(cpuc->mig_atq);
 				if ((p = bpf_task_from_pid((s32)pid))) {
-					if (p->scx.dsq_vtime < min_vtime ||
-					    min_vtime == 0) {
+					if (p->scx.dsq_vtime < min_vtime || min_vtime == 0) {
 						min_vtime = p->scx.dsq_vtime;
 						min_atq = cpuc->mig_atq;
 						/*
@@ -1470,8 +1548,7 @@ static void p2dq_dispatch_impl(s32 cpu, struct task_struct *prev)
 				}
 			} else {
 				bpf_for_each(scx_dsq, p, cpuc->mig_dsq, 0) {
-					if (p->scx.dsq_vtime < min_vtime ||
-					    min_vtime == 0) {
+					if (p->scx.dsq_vtime < min_vtime || min_vtime == 0) {
 						min_vtime = p->scx.dsq_vtime;
 						dsq_id = cpuc->mig_dsq;
 					}
@@ -1515,10 +1592,10 @@ static void p2dq_dispatch_impl(s32 cpu, struct task_struct *prev)
 				 * back to the LLC DSQ.
 				 */
 				scx_bpf_dsq_insert_vtime(p,
-						   cpuc->llc_dsq,
-						   taskc->slice_ns,
-						   p->scx.dsq_vtime,
-						   taskc->enq_flags);
+							 cpuc->llc_dsq,
+							 taskc->slice_ns,
+							 p->scx.dsq_vtime,
+							 taskc->enq_flags);
 				bpf_task_release(p);
 				stat_inc(P2DQ_STAT_ATQ_REENQ);
 			}
@@ -1848,6 +1925,7 @@ static s32 init_cpu(int cpu)
 	cpuc->id = cpu;
 	cpuc->llc_id = cpu_llc_ids[cpu];
 	cpuc->node_id = cpu_node_ids[cpu];
+	cpuc->l2_id = cpu_l2_ids[cpu];
 	cpuc->is_big = big_core_ids[cpu] == 1;
 	cpuc->slice_ns = 1;
 
@@ -1881,6 +1959,30 @@ static s32 init_cpu(int cpu)
 		bpf_rcu_read_unlock();
 		llcx->all_big = false;
 		nodec->all_big = false;
+	}
+
+	u64 dsq_id = cpu_dsq_id(cpu);
+	int ret;
+
+	cpuc->affn_dsq = dsq_id;
+	cpuc->mig_dsq = llcx->mig_dsq;
+
+	if (p2dq_config.l2_scheduling) {
+		if (cpuc->l2_id >= MAX_CPUS) {
+			scx_bpf_error("invalid L2 ID %u for CPU %d", cpuc->l2_id, cpu);
+			return -EINVAL;
+		}
+		u64 l2_dsq_id = (cpuc->l2_id | (MAX_LLCS << 1));
+		llcx->l2_dsq_ids[cpuc->l2_id] = l2_dsq_id;
+		ret = scx_bpf_create_dsq(l2_dsq_id, llcx->node_id);
+		if (ret < 0) {
+			scx_bpf_error("failed to create L2 DSQ %llu", l2_dsq_id);
+			return ret;
+		}
+		// Pre-populate cpuc->l2_dsq to avoid runtime lookups
+		cpuc->l2_dsq = l2_dsq_id;
+		trace("CFG created L2 DSQ[%llu] for CPU[%d] L2[%d]", l2_dsq_id, cpu,
+		cpuc->l2_id);
 	}
 
 	bpf_rcu_read_lock();
