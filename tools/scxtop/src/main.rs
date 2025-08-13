@@ -285,7 +285,7 @@ fn run_trace(trace_args: &TraceArgs) -> Result<()> {
 
             let trace_file_prefix = config.trace_file_prefix().to_string();
             let trace_file = trace_args.output_file.clone();
-            let mut trace_manager = PerfettoTraceManager::new(trace_file_prefix, None);
+            let mut trace_manager = PerfettoTraceManager::new(trace_file_prefix, None, trace_args.layered);
 
             info!("starting trace for {}ms", trace_args.trace_ms);
             trace_manager.start()?;

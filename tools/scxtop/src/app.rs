@@ -274,7 +274,7 @@ impl<'a> App<'a> {
         let stats_client = Some(Arc::new(TokioMutex::new(stats_client)));
         let sample_rate = skel.maps.data_data.as_ref().unwrap().sample_rate;
         let trace_file_prefix = config.trace_file_prefix().to_string();
-        let trace_manager = PerfettoTraceManager::new(trace_file_prefix, None);
+        let trace_manager = PerfettoTraceManager::new(trace_file_prefix, None, false);
 
         // There isn't a 'is_loaded' method on a prog in libbpf-rs so do the next best thing and
         // try to infer from the fd

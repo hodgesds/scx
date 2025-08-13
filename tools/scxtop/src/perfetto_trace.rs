@@ -74,11 +74,39 @@ pub struct PerfettoTraceManager {
     sys_stats: BTreeMap<u64, Vec<SysStats>>,
     mem_events: BTreeMap<String, Vec<TrackEvent>>,
     mem_uuids: HashMap<String, u64>,
+    // layer tracking
+    layered: bool,
+    layer_events: BTreeMap<i32, Vec<TrackEvent>>, // tid -> layer events
+    layer_uuids: BTreeMap<i32, u64>, // tid -> layer track uuid
 }
 
 impl PerfettoTraceManager {
+    /// Helper method to get or create a UUID for a layer track
+    fn get_or_create_layer_uuid(&mut self, tid: i32) -> u64 {
+        *self.layer_uuids.entry(tid).or_insert_with(|| self.rng.next_u64())
+    }
+
+    /// Records a layer change for a thread/process
+    fn record_layer_change(&mut self, tid: i32, layer_id: i32, ts: u64) {
+        if !self.layered {
+            return;
+        }
+
+        let track_uuid = self.get_or_create_layer_uuid(tid);
+
+        self.layer_events.entry(tid).or_default().push(TrackEvent {
+            type_: Some(track_event::Type::TYPE_COUNTER.into()),
+            track_uuid: Some(track_uuid),
+            counter_value_field: Some(track_event::Counter_value_field::CounterValue(layer_id as i64)),
+            timestamp: Some(track_event::Timestamp::TimestampAbsoluteUs(
+                (ts as i64) / 1000,
+            )),
+            ..TrackEvent::default()
+        });
+    }
+
     /// Returns a PerfettoTraceManager that is ready to start tracing.
-    pub fn new(output_file_prefix: String, seed: Option<u64>) -> Self {
+    pub fn new(output_file_prefix: String, seed: Option<u64>, layered: bool) -> Self {
         let trace_uuid = seed.unwrap_or(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -108,6 +136,9 @@ impl PerfettoTraceManager {
             sys_stats: BTreeMap::new(),
             mem_events: BTreeMap::new(),
             mem_uuids,
+            layered,
+            layer_events: BTreeMap::new(),
+            layer_uuids: BTreeMap::new(),
         }
     }
 
@@ -192,6 +223,32 @@ impl PerfettoTraceManager {
                     ..TrackDescriptor::default()
                 }],
             );
+        }
+
+        // Add layer descriptor tracks (only if layered mode is enabled)
+        if self.layered {
+            for (&tid, &layer_uuid) in &self.layer_uuids {
+                let comm = self.get_comm(tid as u32).unwrap_or_else(|| format!("tid_{}", tid));
+                desc_map.insert(
+                    layer_uuid,
+                    vec![TrackDescriptor {
+                        uuid: Some(layer_uuid),
+                        counter: Some(CounterDescriptor {
+                            unit: Some(UNIT_COUNT.into()),
+                            unit_name: Some("Layer ID".to_string()),
+                            is_incremental: Some(false),
+                            ..CounterDescriptor::default()
+                        })
+                        .into(),
+                        static_or_dynamic_name: Some(Static_or_dynamic_name::StaticName(format!(
+                            "Layer - {} (TID {})",
+                            comm,
+                            tid
+                        ))),
+                        ..TrackDescriptor::default()
+                    }],
+                );
+            }
         }
 
         desc_map
@@ -472,6 +529,26 @@ impl PerfettoTraceManager {
             }
         }
 
+        // layer events (only if layered mode is enabled)
+        if self.layered {
+            for events in self.layer_events.values_mut() {
+                let layer_sequence_id = self.rng.next_u32();
+                for layer_event in events.drain(..) {
+                    let ts: u64 = timestamp_absolute_us(&layer_event) as u64 / 1_000;
+                    self.trace.packet.push(TracePacket {
+                        data: Some(trace_packet::Data::TrackEvent(layer_event)),
+                        timestamp: Some(ts),
+                        optional_trusted_packet_sequence_id: Some(
+                            trace_packet::Optional_trusted_packet_sequence_id::TrustedPacketSequenceId(
+                                layer_sequence_id,
+                            ),
+                        ),
+                        ..TracePacket::default()
+                    });
+                }
+            }
+        }
+
         // ftrace events
         for cpu in &trace_cpus {
             self.trace.packet.push(TracePacket {
@@ -545,8 +622,18 @@ impl PerfettoTraceManager {
             child_pid,
             parent_comm,
             child_comm,
+            parent_layer_id,
+            child_layer_id,
             ..
         } = action;
+
+        // Record layer assignments for both parent and child
+        if *parent_pid > 0 && *parent_layer_id >= 0 {
+            self.record_layer_change(*parent_pid as i32, *parent_layer_id, *ts);
+        }
+        if *child_pid > 0 && *child_layer_id >= 0 {
+            self.record_layer_change(*child_pid as i32, *child_layer_id, *ts);
+        }
 
         self.ftrace_events.entry(*cpu).or_default().push({
             FtraceEvent {
@@ -572,8 +659,13 @@ impl PerfettoTraceManager {
             cpu,
             old_pid,
             pid,
-            ..
+            layer_id,
         } = action;
+
+        // Record layer assignment for the new process
+        if *pid > 0 && *layer_id >= 0 {
+            self.record_layer_change(*pid as i32, *layer_id, *ts);
+        }
 
         self.ftrace_events.entry(*cpu).or_default().push({
             FtraceEvent {
@@ -995,14 +1087,24 @@ impl PerfettoTraceManager {
             next_pid,
             next_tgid,
             next_prio,
+            next_layer_id,
             next_comm,
             prev_pid,
             prev_tgid,
             prev_prio,
+            prev_layer_id,
             prev_comm,
             prev_state,
             ..
         } = action;
+
+        // Record layer changes for both next and prev tasks
+        if *next_pid > 0 && *next_layer_id >= 0 {
+            self.record_layer_change(*next_pid as i32, *next_layer_id, *ts);
+        }
+        if *prev_pid > 0 && *prev_layer_id >= 0 {
+            self.record_layer_change(*prev_pid as i32, *prev_layer_id, *ts);
+        }
 
         self.ftrace_events.entry(*cpu).or_default().push({
             FtraceEvent {

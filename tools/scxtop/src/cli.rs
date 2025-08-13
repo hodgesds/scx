@@ -123,6 +123,9 @@ pub struct TraceArgs {
     /// Collect system statistics (CPU, memory, etc).
     #[clap(short = 's', long)]
     pub system_stats: bool,
+    /// Enable layer tracking in perfetto traces (shows layer_id changes for processes).
+    #[clap(short = 'l', long)]
+    pub layered: bool,
 }
 
 #[allow(clippy::large_enum_variant)]
