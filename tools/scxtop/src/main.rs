@@ -121,6 +121,8 @@ fn attach_progs(skel: &mut BpfSkel) -> Result<Vec<Link>> {
         skel.progs.on_sched_fork.attach()?,
         skel.progs.on_sched_exec.attach()?,
         skel.progs.on_sched_exit.attach()?,
+        skel.progs.on_futex_enter.attach()?,
+        skel.progs.on_futex_exit.attach()?,
     ];
 
     // 6.13 compatibility

@@ -1229,6 +1229,64 @@ int perf_sample_handler(struct bpf_perf_event_data *ctx)
 		}
 	}
 	event->event.perf_sample.is_kernel = event->event.perf_sample.user_stack_size <= 1;
+	bpf_ringbuf_submit(event, 0);
+
+	return 0;
+}
+
+SEC("tp/syscalls/sys_enter_futex")
+int on_futex_enter(struct trace_event_raw_sys_enter *ctx) {
+	struct bpf_event *event;
+	struct task_struct *p;
+
+	if (!enable_bpf_events || !should_sample())
+		return 0;
+
+	if (!(event = try_reserve_event()))
+		return -ENOMEM;
+
+	event->type = FUTEX_ENTER;
+	event->cpu = bpf_get_smp_processor_id();
+	event->ts = bpf_ktime_get_ns();
+	event->event.futex.op = (u32)ctx->args[1];
+	event->event.futex.uaddr = (u64)ctx->args[0];
+	p = (struct task_struct *)bpf_get_current_task();
+	if (p) {
+		event->event.futex.pid = BPF_CORE_READ(p, pid);
+		event->event.futex.tgid = BPF_CORE_READ(p, tgid);
+	} else {
+		event->event.futex.pid = 0;
+		event->event.futex.tgid = 0;
+	}
+
+	bpf_ringbuf_submit(event, 0);
+
+	return 0;
+}
+
+SEC("tp/syscalls/sys_exit_futex")
+int on_futex_exit(struct trace_event_raw_sys_exit *ctx) {
+	struct bpf_event *event;
+	struct task_struct *p;
+
+	if (!enable_bpf_events || !should_sample())
+		return 0;
+
+	if (!(event = try_reserve_event()))
+		return -ENOMEM;
+
+	event->type = FUTEX_EXIT;
+	event->cpu = bpf_get_smp_processor_id();
+	event->ts = bpf_ktime_get_ns();
+	event->event.futex.ret = ctx->ret;
+	p = (struct task_struct *)bpf_get_current_task();
+	if (p) {
+		event->event.futex.pid = BPF_CORE_READ(p, pid);
+		event->event.futex.tgid = BPF_CORE_READ(p, tgid);
+	} else {
+		event->event.futex.pid = 0;
+		event->event.futex.tgid = 0;
+	}
 
 	bpf_ringbuf_submit(event, 0);
 

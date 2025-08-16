@@ -46,6 +46,8 @@ enum event_type {
   EXEC,
   EXIT,
   FORK,
+	FUTEX_ENTER,
+	FUTEX_EXIT,
   WAIT,
   GPU_MEM,
   HW_PRESSURE,
@@ -204,6 +206,14 @@ struct perf_sample_event {
 	u64 		user_stack[MAX_STACK_DEPTH];
 };
 
+struct futex_event {
+	u32             pid;
+	u32		tgid;
+	u32		op;
+	u64		uaddr;
+	int		ret;
+};
+
 struct bpf_event {
 	int		type;
 	u64		ts;
@@ -228,6 +238,7 @@ struct bpf_event {
 		struct trace_started_event	trace;
 		struct kprobe_event		kprobe;
 		struct perf_sample_event	perf_sample;
+		struct  futex_event futex;
   } event;
 };
 

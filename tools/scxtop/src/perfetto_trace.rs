@@ -17,9 +17,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::edm::ActionHandler;
 use crate::util::get_clock_value;
 use crate::{
-    Action, CpuhpEnterAction, CpuhpExitAction, ExecAction, ExitAction, ForkAction, GpuMemAction,
-    IPIAction, KprobeAction, SchedHangAction, SchedMigrateTaskAction, SchedSwitchAction,
-    SchedWakeupAction, SchedWakingAction, SoftIRQAction, SystemStatAction, WaitAction,
+    Action, CpuhpEnterAction, CpuhpExitAction, ExecAction, ExitAction, ForkAction, FutexEnterAction, FutexExitAction,
+    GpuMemAction, IPIAction, KprobeAction, SchedHangAction, SchedMigrateTaskAction,
+    SchedSwitchAction, SchedWakeupAction, SchedWakingAction, SoftIRQAction, SystemStatAction,
+    WaitAction,
 };
 
 use perfetto_protos::{
@@ -43,6 +44,7 @@ use perfetto_protos::{
     sys_stats::{sys_stats::CpuTimes, sys_stats::MeminfoValue, SysStats},
     sys_stats_counters::MeminfoCounters,
     thread_descriptor::ThreadDescriptor,
+    raw_syscalls::{SysExitFtraceEvent, SysEnterFtraceEvent},
     trace::Trace,
     trace_packet::{trace_packet, TracePacket},
     track_descriptor::{track_descriptor::Static_or_dynamic_name, TrackDescriptor},
@@ -565,6 +567,58 @@ impl PerfettoTraceManager {
             }
         });
     }
+
+    pub fn on_futex_enter(&mut self, action: &FutexEnterAction) {
+        let FutexEnterAction {
+            ts,
+            cpu,
+            pid,
+            op,
+            uaddr,
+            ..
+        } = action;
+
+        self.ftrace_events.entry(*cpu).or_default().push({
+            FtraceEvent {
+                timestamp: Some(*ts),
+                pid: Some(*pid),
+                event: Some(ftrace_event::Event::SysEnter(
+                    SysEnterFtraceEvent {
+                        id: Some(202),
+                        args: vec![*uaddr, *op as u64],
+                        special_fields: SpecialFields::new(),
+                    },
+                )),
+                ..FtraceEvent::default()
+            }
+        });
+    }
+
+    pub fn on_futex_exit(&mut self, action: &FutexExitAction) {
+        let FutexExitAction {
+            ts,
+            cpu,
+            pid,
+            ret,
+            ..
+        } = action;
+
+        self.ftrace_events.entry(*cpu).or_default().push({
+            FtraceEvent {
+                timestamp: Some(*ts),
+                pid: Some(*pid),
+                event: Some(ftrace_event::Event::SysExit(
+                    SysExitFtraceEvent {
+                        id: Some(202),
+                        ret: Some(*ret as i64),
+                        special_fields: SpecialFields::new(),
+                    },
+                )),
+                ..FtraceEvent::default()
+            }
+        });
+    }
+
 
     pub fn on_exec(&mut self, action: &ExecAction) {
         let ExecAction {
@@ -1098,6 +1152,12 @@ impl ActionHandler for PerfettoTraceManager {
             }
             Action::Fork(a) => {
                 self.on_fork(a);
+            }
+            Action::FutexEnter(a) => {
+                    self.on_futex_enter(a);
+            }
+            Action::FutexExit(a) => {
+                    self.on_futex_exit(a);
             }
             Action::GpuMem(a) => {
                 self.on_gpu_mem(a);

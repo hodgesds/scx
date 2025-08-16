@@ -240,6 +240,25 @@ pub struct ForkAction {
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FutexEnterAction {
+    pub ts: u64,
+    pub cpu: u32,
+    pub pid: u32,
+    pub tgid: u32,
+    pub op: u32,
+    pub uaddr: u64,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FutexExitAction {
+    pub ts: u64,
+    pub cpu: u32,
+    pub pid: u32,
+    pub tgid: u32,
+    pub ret: i32,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ExecAction {
     pub ts: u64,
     pub cpu: u32,
@@ -448,6 +467,8 @@ pub enum Action {
     Exit(ExitAction),
     Filter,
     Fork(ForkAction),
+    FutexEnter(FutexEnterAction),
+    FutexExit(FutexExitAction),
     Kprobe(KprobeAction),
     GpuMem(GpuMemAction),
     Help,
@@ -673,6 +694,31 @@ impl TryFrom<&bpf_event> for Action {
                     child_comm: child_comm.into(),
                     parent_layer_id: fork.parent_layer_id,
                     child_layer_id: fork.child_layer_id,
+                }))
+            }
+            #[allow(non_upper_case_globals)]
+            bpf_intf::event_type_FUTEX_ENTER => {
+                let futex = unsafe { &event.event.futex };
+
+                Ok(Action::FutexEnter(FutexEnterAction {
+                    ts: event.ts,
+                    cpu: event.cpu,
+                    pid: futex.pid,
+                    tgid: futex.tgid,
+                    op: futex.op,
+                    uaddr: futex.uaddr,
+                }))
+            }
+            #[allow(non_upper_case_globals)]
+            bpf_intf::event_type_FUTEX_EXIT => {
+                let futex = unsafe { &event.event.futex };
+
+                Ok(Action::FutexExit(FutexExitAction {
+                    ts: event.ts,
+                    cpu: event.cpu,
+                    pid: futex.pid,
+                    tgid: futex.tgid,
+                    ret: futex.ret,
                 }))
             }
             #[allow(non_upper_case_globals)]
