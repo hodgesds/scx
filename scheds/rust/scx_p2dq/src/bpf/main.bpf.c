@@ -83,27 +83,25 @@ const volatile struct {
 	u64 slack_factor;
 	u64 backoff_ns;
 	u64 min_nr_queued_pick2;
+	u64 wakeup_lb_busy;
+	u64 dispatch_lb_busy;
+
 	bool max_dsq_pick2;
 	bool eager_load_balance;
-
-	u64 dispatch_lb_busy;
 	bool dispatch_pick2_disable;
 	bool dispatch_lb_interactive;
-
-	u64 wakeup_lb_busy;
 	bool wakeup_llc_migrations;
 } lb_config = {
 	.slack_factor = LOAD_BALANCE_SLACK,
 	.backoff_ns = 5LLU * NSEC_PER_MSEC,
 	.min_nr_queued_pick2 = 10,
+	.dispatch_lb_busy = 75,
+	.wakeup_lb_busy = 90,
+
 	.max_dsq_pick2 = false,
 	.eager_load_balance = true,
-
-	.dispatch_lb_busy = 75,
 	.dispatch_pick2_disable = false,
 	.dispatch_lb_interactive = false,
-
-	.wakeup_lb_busy = 90,
 	.wakeup_llc_migrations = false,
 };
 
@@ -114,6 +112,7 @@ const volatile struct {
 	u32 interactive_ratio;
 	u32 saturated_percent;
 
+	bool soft_affinity;
 	bool atq_enabled;
 	bool cpu_priority;
 	bool freq_control;
@@ -128,6 +127,7 @@ const volatile struct {
 	.interactive_ratio = 10,
 	.saturated_percent = 5,
 
+	.soft_affinity = false,
 	.atq_enabled = false,
 	.cpu_priority = false,
 	.freq_control = false,
@@ -146,6 +146,7 @@ const u64 lb_timer_intvl_ns = 250LLU * NSEC_PER_MSEC;
 static u32 llc_lb_offset = 1;
 static u32 min_llc_runs_pick2 = 1;
 static bool saturated = false;
+static u64 load_epoch = 0;
 
 u64 llc_ids[MAX_LLCS];
 u64 cpu_llc_ids[MAX_CPUS];
@@ -390,6 +391,105 @@ static struct node_ctx *lookup_node_ctx(u32 node_id)
 	return nodec;
 }
 
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__uint(max_entries, 1<<17);
+	__type(key, u32);
+	__type(value, struct tgid_ctx);
+} tgid_ctxs SEC(".maps");
+
+static struct tgid_ctx *lookup_tgid_ctx(u32 tgid)
+{
+	struct tgid_ctx *tgidc;
+	int ret;
+
+	tgidc = bpf_map_lookup_elem(&tgid_ctxs, &tgid);
+	if (tgidc)
+		return tgidc;
+
+	struct tgid_ctx new_tgidc = {};
+	if (bpf_map_update_elem(&tgid_ctxs, &tgid, &new_tgidc, BPF_NOEXIST))
+		return NULL; // Map may be full
+
+	tgidc = bpf_map_lookup_elem(&tgid_ctxs, &tgid);
+	if (!tgidc) {
+		scx_bpf_error("failed to allocate tgid_ctx");
+		return NULL;
+	}
+
+	ret = init_cpumask(&tgidc->pref_cpus);
+	if (ret) {
+		scx_bpf_error("failed to create tgid_ctx cpumask");
+		return NULL;
+	}
+
+	tgidc->pref_llc = 0;
+	if (tgid > 0) {
+	    u32 llc_idx = ((u32)tgid % topo_config.nr_llcs) & 0xFFFFFFFF;
+	    if (llc_idx < topo_config.nr_llcs && llc_idx > 0)
+		    tgidc->pref_llc = llc_ids[llc_idx];
+	}
+
+	return tgidc;
+}
+
+static void tgid_ctx_add_load(struct tgid_ctx *tgidc, u64 load)
+{
+	if (tgidc->load_epoch != load_epoch) {
+		tgidc->load_epoch = load_epoch;
+		tgidc->load = 0;
+	}
+	tgidc->load += load;
+}
+
+static u32 tgid_ctx_nr_cpus(struct tgid_ctx *tgidc, u64 now)
+{
+	return (u32)min((load_epoch * topo_config.nr_cpus) / tgidc->load, topo_config.nr_cpus);
+}
+
+static void tgid_ctx_rebalance(struct tgid_ctx *tgidc, u64 now)
+{
+	struct llc_ctx *pref_llcx, *lb_llcx;
+	u32 cpu;
+	int i;
+
+	if (!tgidc->pref_cpus) {
+		scx_bpf_error("tgid_ctx missing cpumask");
+		return;
+	}
+
+	// u32 new_nr_cpus = tgid_ctx_nr_cpus(tgidc, now);
+	// u32 cur_cpus = bpf_cpumask_weight(tgidc->pref_cpus);
+
+	// if (cur_cpus == new_nr_cpus)
+	// 	return;
+
+	// if (cur_cpus > new_nr_cpus) {
+	// 	bpf_for(i, 0, new_nr_cpus - cur_cpus) {
+	// 		if (!tgidc->pref_cpus) {
+	// 			scx_bpf_error("tgid_ctx missing cpumask");
+	// 			return;
+	// 		}
+	// 		cpu = bpf_cpumask_any_distribute(tgidc->pref_cpus);
+	// 		if (!tgidc->pref_cpus) {
+	// 			scx_bpf_error("tgid_ctx missing cpumask");
+	// 			return;
+	// 		}
+
+	// 		if (cpu < topo_config.nr_cpus && tgidc->pref_cpus)
+	// 			bpf_cpumask_clear_cpu(cpu);
+	// 	}
+	// 	return;
+	// }
+
+	if (!(pref_llcx = lookup_llc_ctx(tgidc->pref_llc)) ||
+	    !pref_llcx->cpumask)
+		return;
+
+	bpf_cpumask_copy(tgidc->pref_cpus, cast_mask(pref_llcx->cpumask));
+}
+
 struct mask_wrapper {
 	struct bpf_cpumask __kptr *mask;
 };
@@ -620,6 +720,7 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 			 s32 prev_cpu, u64 wake_flags, bool *is_idle)
 {
 	const struct cpumask *idle_smtmask, *idle_cpumask;
+	struct tgid_ctx *tgidc;
 	struct llc_ctx *llcx;
 	s32 pref_cpu, cpu = prev_cpu;
 
@@ -766,6 +867,28 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 			if (cpu >= 0) {
 				*is_idle = true;
 				goto found_cpu;
+			}
+		}
+	}
+
+	// soft affinity tries to keep tasks grouped
+	if (p2dq_config.soft_affinity) {
+		tgidc = lookup_tgid_ctx(p->tgid);
+		if (tgidc && tgidc->pref_cpus) {
+			// First see if there is an idle core in the tgid
+			// preferred CPUs.
+			cpu = __pick_idle_cpu(tgidc->pref_cpus, SCX_PICK_IDLE_CORE);
+			if (cpu >= 0) {
+				*is_idle = true;
+				goto found_cpu;
+			}
+
+			if (tgidc->pref_cpus) {
+				cpu = __pick_idle_cpu(tgidc->pref_cpus, 0);
+				if (cpu >= 0) {
+					*is_idle = true;
+					goto found_cpu;
+				}
 			}
 		}
 	}
@@ -1190,6 +1313,7 @@ static int p2dq_running_impl(struct task_struct *p)
 void BPF_STRUCT_OPS(p2dq_stopping, struct task_struct *p, bool runnable)
 {
 	task_ctx *taskc;
+	struct tgid_ctx *tgidc;
 	struct llc_ctx *llcx;
 	struct cpu_ctx *cpuc;
 	u64 used, scaled_used, last_dsq_slice_ns;
@@ -1276,6 +1400,20 @@ void BPF_STRUCT_OPS(p2dq_stopping, struct task_struct *p, bool runnable)
 		taskc->slice_ns = task_dsq_slice_ns(p, taskc->dsq_index);
 		taskc->last_run_started = 0;
 		taskc->interactive = is_interactive(taskc);
+
+		if (p2dq_config.soft_affinity) {
+			tgidc = lookup_tgid_ctx(p->tgid);
+			if (!tgidc || !tgidc->pref_cpus)
+				return;
+
+			tgid_ctx_add_load(tgidc, used);
+
+			// only rebalance at epoch boundaries
+			if (tgidc->load_epoch == load_epoch)
+				return;
+
+			tgid_ctx_rebalance(tgidc, now);
+		}
 	}
 }
 
@@ -1978,6 +2116,7 @@ static bool load_balance_timer(void)
 
 reset_load:
 
+	load_epoch = scx_bpf_now();
 	bpf_for(llc_index, 0, topo_config.nr_llcs) {
 		llc_id = *MEMBER_VPTR(llc_ids, [llc_index]);
 		if (!(llcx = lookup_llc_ctx(llc_id)))

@@ -125,6 +125,10 @@ pub struct SchedulerOpts {
     #[clap(long, action = clap::ArgAction::SetTrue)]
     pub select_idle_in_enqueue: bool,
 
+    /// Enables soft affinity to keep groups of tasks sticky
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    pub soft_affinity: bool,
+
     /// Allow queued wakeup.
     #[clap(long, action = clap::ArgAction::SetTrue)]
     pub queued_wakeup: bool,
@@ -275,6 +279,7 @@ macro_rules! init_open_skel {
             rodata.p2dq_config.nr_dsqs_per_llc = opts.dumb_queues as u32;
             rodata.p2dq_config.init_dsq_index = opts.init_dsq_index as i32;
             rodata.p2dq_config.saturated_percent = opts.saturated_percent;
+            rodata.p2dq_config.soft_affinity = MaybeUninit::new(opts.soft_affinity);
 
             rodata.p2dq_config.atq_enabled = MaybeUninit::new(
                 opts.atq_enabled && compat::ksym_exists("bpf_spin_unlock").unwrap_or(false),
