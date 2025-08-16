@@ -64,12 +64,20 @@ struct node_ctx {
 	struct bpf_cpumask __kptr	*big_cpumask;
 };
 
+struct tgid_ctx {
+	u32				pref_llc;
+	u64				load;
+	u64				load_epoch;
+	struct bpf_cpumask __kptr	*pref_cpus;
+};
+
 struct task_p2dq {
 	u64			dsq_id;
 	u64			slice_ns;
 	int			dsq_index;
 	u32			llc_id;
 	u32			node_id;
+	u32			pref_llc;
 	u64			used;
 	u64			last_dsq_id;
 	u64 			last_run_started;
@@ -99,18 +107,18 @@ enum enqueue_promise_kind {
 };
 
 struct enqueue_promise_vtime {
-	u64	dsq_id;
-	u64	enq_flags;
-	u64	slice_ns;
-	u64	vtime;
+	u64		dsq_id;
+	u64		enq_flags;
+	u64		slice_ns;
+	u64		vtime;
 
 	scx_atq_t	*atq;
 };
 
 struct enqueue_promise_fifo {
-	u64	dsq_id;
-	u64	enq_flags;
-	u64	slice_ns;
+	u64		dsq_id;
+	u64		enq_flags;
+	u64		slice_ns;
 
 	scx_atq_t	*atq;
 };
