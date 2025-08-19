@@ -83,6 +83,7 @@ struct task_p2dq {
 	u64			nr_wakers;
 	int			wakee_mask;
 	int			waker_mask;
+	bool			crit_waker;
 
 	bool			interactive;
 	bool			was_nice;
