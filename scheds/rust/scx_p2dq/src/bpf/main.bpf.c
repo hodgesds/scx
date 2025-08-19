@@ -275,8 +275,9 @@ static void task_refresh_epoch(task_ctx *taskc)
 		return;
 
 	taskc->epoch = task_epoch;
-	taskc->waker_mask = 0;
-	taskc->wakee_mask = 0;
+	taskc->crit_waker = false;
+	WRITE_ONCE(taskc->waker_mask, 0);
+	WRITE_ONCE(taskc->wakee_mask, 0);
 	WRITE_ONCE(taskc->nr_wakees, 0ULL);
 	WRITE_ONCE(taskc->nr_wakers, 0ULL);
 }
@@ -473,7 +474,7 @@ static bool can_migrate(task_ctx *taskc, struct llc_ctx *llcx)
 	    taskc->dsq_index != p2dq_config.nr_dsqs_per_llc - 1)
 		return false;
 
-	if (taskc->llc_runs > 0)
+	if (taskc->crit_waker || taskc->llc_runs > 0)
 		return false;
 
 	if (saturated)
@@ -684,8 +685,6 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 		}
 
 		task_ctx *waker_taskc = scx_task_data(waker);
-
-		// Shouldn't happen, but makes code easier to follow
 		if (!waker_taskc) {
 			stat_inc(P2DQ_STAT_WAKE_PREV);
 			goto found_cpu;
@@ -699,6 +698,9 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 		if (!((waker_taskc->wakee_mask & p->pid) == p->pid)) {
 			waker_taskc->nr_wakees += 1;
 			waker_taskc->wakee_mask |= p->pid;
+			if (waker_taskc->nr_wakees > 2 * waker_taskc->nr_wakers) {
+				waker_taskc->crit_waker = true;
+			}
 		}
 
 		trace("WAKE [%s-%d](%llu)->[%s-%d](%llu)",
@@ -707,6 +709,7 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 
 		// Interactive tasks aren't worth migrating across LLCs.
 		if (taskc->interactive ||
+		    waker_taskc->nr_wakees > taskc->nr_wakers ||
 		    (topo_config.nr_llcs == 2 && topo_config.nr_nodes == 2)) {
 			// Try an idle CPU in the LLC.
 			if (llcx->cpumask &&
