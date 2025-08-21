@@ -114,6 +114,7 @@ const volatile struct {
 	u32 interactive_ratio;
 	u32 saturated_percent;
 
+	bool cpu_max_enabled;
 	bool atq_enabled;
 	bool cpu_priority;
 	bool task_slice;
@@ -129,6 +130,7 @@ const volatile struct {
 	.interactive_ratio = 10,
 	.saturated_percent = 5,
 
+	.cpu_max_enabled = false,
 	.atq_enabled = false,
 	.cpu_priority = false,
 	.task_slice = true,
@@ -139,6 +141,7 @@ const volatile struct {
 	.select_idle_in_enqueue = true,
 };
 
+
 const volatile u32 debug = 2;
 const u32 zero_u32 = 0;
 extern const volatile u32 nr_cpu_ids;
@@ -148,6 +151,7 @@ const u64 lb_timer_intvl_ns = 250LLU * NSEC_PER_MSEC;
 static u32 llc_lb_offset = 1;
 static u32 min_llc_runs_pick2 = 1;
 static bool saturated = false;
+static u64 throttle_dsq_id = P2DQ_THROTTLE_DSQ;
 
 u64 llc_ids[MAX_LLCS];
 u64 cpu_llc_ids[MAX_CPUS];
@@ -437,6 +441,238 @@ static inline void stat_inc(enum stat_idx idx)
 {
 	stat_add(idx, 1);
 }
+
+struct {
+	__uint(type, BPF_MAP_TYPE_CGRP_STORAGE);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__type(key, int);
+	__type(value, struct cgrp_ctx);
+} cgrp_ctxs SEC(".maps");
+
+static inline struct cgrp_ctx *lookup_cgrp_ctx(struct cgroup *cgrp)
+{
+	struct cgrp_ctx *cgc;
+
+	if (!(cgc = bpf_cgrp_storage_get(&cgrp_ctxs, cgrp, 0, 0)))
+		return NULL;
+
+	return cgc;
+}
+
+static inline struct cgroup *task_cgroup(struct task_struct *p)
+{
+	struct cgroup *cgrp = __COMPAT_scx_bpf_task_cgroup(p);
+	if (!cgrp) {
+		bpf_cgroup_release(cgrp);
+		return NULL;
+	}
+
+	return cgrp;
+}
+
+static inline struct cgrp_ctx *task_cgrp_ctx(struct task_struct *p)
+{
+	struct cgrp_ctx *cgc;
+	struct cgroup *cgrp;
+
+	if (!(cgrp = task_cgroup(p))) {
+		bpf_cgroup_release(cgrp);
+		return NULL;
+	}
+
+	if (!(cgc = lookup_cgrp_ctx(cgrp))) {
+		bpf_cgroup_release(cgrp);
+		return NULL;
+	}
+
+	bpf_cgroup_release(cgrp);
+	return cgc;
+}
+
+static inline struct cgroup *lookup_cgrp_ancestor(struct cgroup *cgrp, u32 ancestor)
+{
+	struct cgroup *cg;
+
+	if (!(cg = bpf_cgroup_ancestor(cgrp, ancestor)))
+		return NULL;
+
+	return cg;
+}
+
+
+static int read_cgrp_hlimits(struct task_struct *p, struct cgrp_hlimit *limit)
+{
+	struct cgroup *cgrp, *parent_cgrp;
+	struct cgroup_subsys_state *cpu_css;
+	struct task_group *tg;
+	u64 quota_ns, period_ns;
+	u64 min_quota_ns = 0;
+	u64 min_period_ns = CPU_MAX_PERIOD_NS;
+	u64 limiting_cgroup_id = 0;
+	int depth = 0;
+	const int max_depth = 10; // Prevent infinite loops
+
+	__builtin_memset(limit, 0, sizeof(*limit));
+
+	cgrp = task_cgroup(p);
+	if (!cgrp)
+		return -1;
+
+	// Walk up the hierarchy
+	bpf_for(depth, 0, max_depth) {
+		if (!cgrp)
+			break;
+
+	}
+
+	// Fill in the limit structure
+	limit->quota_ns = min_quota_ns;
+	limit->period_ns = min_period_ns;
+	limit->effective_quota_ns = min_quota_ns;
+	limit->cgroup_id = limiting_cgroup_id;
+	limit->depth = depth;
+
+	bpf_cgroup_release(cgrp);
+
+	// Return success if we found at least one limit
+	return (min_quota_ns > 0) ? 0 : -1;
+}
+
+// Simplified version for when we just need current cgroup's limit
+static int read_cgroup_cpu_max_alt(struct task_struct *p, u64 *quota_ns, u64 *period_ns)
+{
+	struct cgrp_hlimit limit;
+
+	if (read_cgrp_hlimits(p, &limit) < 0)
+		return -1;
+
+	*quota_ns = limit.effective_quota_ns;
+	*period_ns = limit.period_ns;
+
+	return 0;
+}
+
+static int read_cgroup_cpu_max(struct task_struct *p, u64 *quota_ns, u64 *period_ns)
+{
+	// This function is now replaced by read_cgroup_hierarchy_limits
+	// Keep for compatibility if needed elsewhere
+	return read_cgroup_cpu_max_alt(p, quota_ns, period_ns);
+}
+
+
+static bool cgroup_should_throttle(struct task_struct *p, struct cgrp_ctx *cgroupc, u64 now)
+{
+	struct cgrp_hlimit limit;
+
+	if (!p2dq_config.cpu_max_enabled)
+		return false;
+
+	// Read hierarchical limits (cache for a short time to avoid overhead)
+	if (now - cgroupc->last_update_ns > 10 * NSEC_PER_MSEC) { // Update every 10ms
+		if (read_cgrp_hlimits(p, &limit) < 0)
+			return false;
+
+		// Update cached hierarchy information
+		cgroupc->hlimit = limit;
+		cgroupc->last_update_ns = now;
+
+		// If no quota set anywhere in hierarchy, no throttling
+		if (limit.effective_quota_ns == 0)
+			return false;
+
+		trace("HIERARCHY cgroup %llu effective_quota %llu period %llu limiting_cgroup %llu depth %d",
+		      cgroupc->cgroup_id, limit.effective_quota_ns, limit.period_ns,
+		      limit.cgroup_id, limit.depth);
+	} else {
+		// Use cached values
+		limit = cgroupc->hlimit;
+		if (limit.effective_quota_ns == 0)
+			return false;
+	}
+
+	// Check if we need to start a new period
+	if (now - cgroupc->period_start_ns >= limit.period_ns) {
+		cgroupc->period_start_ns = now;
+		cgroupc->cpu_usage_ns = 0;
+		cgroupc->throttled = false;
+		return false;
+	}
+
+	// Check if effective quota is exceeded
+	bool should_throttle = cgroupc->cpu_usage_ns >= limit.effective_quota_ns;
+
+	if (should_throttle) {
+		trace("THROTTLE_CHECK cgroup %llu usage %llu >= quota %llu (from cgroup %llu)",
+		      cgroupc->cgroup_id, cgroupc->cpu_usage_ns, limit.effective_quota_ns, limit.cgroup_id);
+	}
+
+	return should_throttle;
+}
+
+static void cgroup_account_usage(struct cgrp_ctx *cgroupc, u64 usage_ns)
+{
+	cgroupc->cpu_usage_ns += usage_ns;
+}
+
+static bool task_should_be_throttled(struct task_struct *p, task_ctx *taskc)
+{
+	struct cgrp_ctx *cgc;
+	bool throttle;
+	u64 now;
+
+	if (!p2dq_config.cpu_max_enabled || !(cgc = task_cgrp_ctx(p)))
+		return false;
+
+	now = bpf_ktime_get_ns();
+	throttle = cgroup_should_throttle(p, cgc, now);
+
+	return throttle;
+}
+
+static void throttle_task(struct task_struct *p, task_ctx *taskc)
+{
+	struct cgrp_ctx *cgc;
+
+	if (taskc->throttled)
+		return;
+
+	cgc = task_cgrp_ctx(p);
+	if (!cgc)
+		return;
+
+	taskc->throttled = true;
+	taskc->throttle_start_ns = bpf_ktime_get_ns();
+	cgc->nr_throttled_tasks++;
+	cgc->throttled = true;
+
+	stat_inc(P2DQ_STAT_CGROUP_THROTTLED);
+	trace("THROTTLE task %s (pid %d) cgroup %llu", p->comm, p->pid, taskc->cgroup_id);
+}
+
+static void unthrottle_task(struct task_struct *p, task_ctx *taskc)
+{
+	struct cgrp_ctx *cgroupc;
+
+	if (!taskc->throttled)
+		return;
+
+	cgroupc = task_cgrp_ctx(p);
+	if (!cgroupc)
+		return;
+
+	taskc->throttled = false;
+	taskc->throttle_start_ns = 0;
+
+	if (cgroupc->nr_throttled_tasks > 0)
+		cgroupc->nr_throttled_tasks--;
+
+	if (cgroupc->nr_throttled_tasks == 0)
+		cgroupc->throttled = false;
+
+	stat_inc(P2DQ_STAT_CGROUP_UNTHROTTLED);
+	trace("UNTHROTTLE task %s (pid %d) cgroup %llu", p->comm, p->pid, taskc->cgroup_id);
+}
+
 
 /*
  * Returns if the task is interactive based on the tasks DSQ index.
@@ -1074,6 +1310,40 @@ static void async_p2dq_enqueue(struct enqueue_promise *ret,
 	ret->vtime.vtime = p->scx.dsq_vtime;
 }
 
+static void async_p2dq_enqueue_with_throttling(struct enqueue_promise *ret,
+					       struct task_struct *p, u64 enq_flags)
+{
+	task_ctx *taskc;
+
+	// Default to failed and set properly later
+	__builtin_memset(ret, 0, sizeof(*ret));
+	ret->kind = P2DQ_ENQUEUE_PROMISE_FAILED;
+
+	if (!(taskc = lookup_task_ctx(p)))
+		return;
+
+	// Check if task should be throttled
+	if (task_should_be_throttled(p, taskc)) {
+		throttle_task(p, taskc);
+
+		// Enqueue to throttle DSQ
+		ret->kind = P2DQ_ENQUEUE_PROMISE_FIFO;
+		ret->fifo.dsq_id = throttle_dsq_id;
+		ret->fifo.slice_ns = 1000000; // 1ms minimal slice for throttled tasks
+		ret->fifo.enq_flags = enq_flags;
+		ret->kick_idle = false;
+		return;
+	}
+
+	// If task was throttled but now can run, unthrottle it
+	if (taskc->throttled) {
+		unthrottle_task(p, taskc);
+	}
+
+	// Continue with normal enqueue logic
+	async_p2dq_enqueue(ret, p, enq_flags);
+}
+
 static void complete_p2dq_enqueue(struct enqueue_promise *pro, struct task_struct *p)
 {
 	int ret;
@@ -1146,6 +1416,18 @@ static void complete_p2dq_enqueue(struct enqueue_promise *pro, struct task_struc
 	pro->kind = P2DQ_ENQUEUE_PROMISE_COMPLETE;
 }
 
+static int p2dq_running_with_cgroups(struct task_struct *p, task_ctx *taskc)
+{
+	struct cgrp_ctx *cgroupc;
+
+	// Ensure cgroup context exists
+	cgroupc = task_cgrp_ctx(p);
+	if (!cgroupc)
+		return 0;
+
+	return 0;
+}
+
 static int p2dq_running_impl(struct task_struct *p)
 {
 	task_ctx *taskc;
@@ -1202,10 +1484,41 @@ static int p2dq_running_impl(struct task_struct *p)
 
 	taskc->last_run_at = now;
 
+	if (p2dq_config.cpu_max_enabled)
+		return p2dq_running_with_cgroups(p, taskc);
+
 	return 0;
 }
 
-void BPF_STRUCT_OPS(p2dq_stopping, struct task_struct *p, bool runnable)
+
+static void p2dq_stopping_with_accounting(struct task_struct *p, task_ctx *taskc, bool runnable, u64 now)
+{
+	struct cgrp_ctx *cgc;
+	struct cgrp_hlimit limit;
+	u64 usage_ns;
+
+
+	// Account CPU usage for cgroup
+	if (taskc->last_run_at > 0) {
+		usage_ns = now - taskc->last_run_at;
+
+		cgc = task_cgrp_ctx(p);
+		if (!cgc)
+			return;
+
+		cgroup_account_usage(cgc, usage_ns);
+
+		// Read current hierarchy limits for tracing
+		if (read_cgrp_hlimits(p, &limit) == 0) {
+			trace("ACCOUNT cgroup %llu used %llu total %llu effective_quota %llu (from cgroup %llu) period %llu depth %d",
+			      taskc->cgroup_id, usage_ns, cgc->cpu_usage_ns,
+			      limit.effective_quota_ns, limit.cgroup_id, limit.period_ns, limit.depth);
+		}
+	}
+}
+
+
+static void p2dq_stopping_impl(struct task_struct *p, bool runnable)
 {
 	task_ctx *taskc;
 	struct llc_ctx *llcx;
@@ -1303,6 +1616,15 @@ void BPF_STRUCT_OPS(p2dq_stopping, struct task_struct *p, bool runnable)
 		taskc->last_run_started = 0;
 		taskc->interactive = is_interactive(taskc);
 	}
+
+	if (p2dq_config.cpu_max_enabled)
+		p2dq_stopping_with_accounting(p, taskc, runnable, now);
+}
+
+
+void BPF_STRUCT_OPS(p2dq_stopping, struct task_struct *p, bool runnable)
+{
+	p2dq_stopping_impl(p, runnable);
 }
 
 static bool consume_llc(struct llc_ctx *llcx)
@@ -1600,6 +1922,43 @@ static void p2dq_dispatch_impl(s32 cpu, struct task_struct *prev)
 	dispatch_pick_two(cpu, llcx, cpuc);
 }
 
+static bool p2dq_dispatch_with_throttling(s32 cpu, struct task_struct *prev)
+{
+	struct task_struct *p;
+	task_ctx *taskc;
+
+	u64 now = bpf_ktime_get_ns();
+
+	bpf_for_each(scx_dsq, p, P2DQ_THROTTLE_DSQ, 0) {
+		p = bpf_task_from_pid(p->pid);
+		if (!p)
+			continue;
+
+		if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+			bpf_task_release(p);
+			continue;
+		}
+
+		if (!(taskc = lookup_task_ctx(p))) {
+			bpf_task_release(p);
+			continue;
+		}
+
+		if (!task_should_be_throttled(p, taskc)) {
+			unthrottle_task(p, taskc);
+
+			if (!__COMPAT_scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p, SCX_DSQ_LOCAL_ON | cpu, 0)) {
+				bpf_task_release(p);
+				return true;
+			}
+		}
+		bpf_task_release(p);
+		break; // Only check first task to avoid spending too much time
+	}
+
+	return false;
+}
+
 void BPF_STRUCT_OPS(p2dq_set_cpumask, struct task_struct *p,
 		    const struct cpumask *cpumask)
 {
@@ -1757,6 +2116,23 @@ void BPF_STRUCT_OPS(p2dq_exit_task, struct task_struct *p,
 {
 	scx_task_free(p);
 }
+
+
+//void BPF_STRUCT_OPS(p2dq_cgroup_set_bandwidth, struct cgroup *cgrp,
+//		    u64 period_us, u64 quota_us, u64 burst_us)
+//{
+//	struct cgrp_ctx *cgroupc;
+//
+//	cgroupc = lookup_cgrp_ctx(cgrp);
+//	if (!cgroupc)
+//		return;
+//
+//	cgroupc->hlimit.quota_ns = quota_us * 1000ULL;
+//	cgroupc->hlimit.period_ns = period_us * 1000ULL;
+//
+//	trace("UPDATE cgroup quota %lluus period %lluus",
+//	      quota_us, period_us);
+//}
 
 static int init_llc(u32 llc_index)
 {
@@ -2112,16 +2488,15 @@ s32 static start_timers(void)
 
 static s32 p2dq_init_impl()
 {
-	struct bpf_cpumask *tmp_big_cpumask;
 	struct llc_ctx *llcx;
 	struct cpu_ctx *cpuc;
 	int i, ret;
 	u64 dsq_id;
 
-	tmp_big_cpumask = bpf_cpumask_create();
-	if (!tmp_big_cpumask) {
+	ret = init_cpumask(&big_cpumask);
+	if (ret) {
 		scx_bpf_error("failed to create big cpumask");
-		return -ENOMEM;
+		return ret;
 	}
 
 	if (p2dq_config.init_dsq_index >= p2dq_config.nr_dsqs_per_llc) {
@@ -2129,9 +2504,8 @@ static s32 p2dq_init_impl()
 		return -EINVAL;
 	}
 
-	tmp_big_cpumask = bpf_kptr_xchg(&big_cpumask, tmp_big_cpumask);
-	if (tmp_big_cpumask)
-		bpf_cpumask_release(tmp_big_cpumask);
+	if (scx_bpf_create_dsq(P2DQ_THROTTLE_DSQ, 0))
+		return -ENOMEM;
 
 	// First we initialize LLCs because DSQs are created at the LLC level.
 	bpf_for(i, 0, topo_config.nr_llcs) {
@@ -2216,13 +2590,20 @@ void BPF_STRUCT_OPS(p2dq_running, struct task_struct *p)
 void BPF_STRUCT_OPS(p2dq_enqueue, struct task_struct *p __arg_trusted, u64 enq_flags)
 {
 	struct enqueue_promise pro;
-	async_p2dq_enqueue(&pro, p, enq_flags);
+	if (p2dq_config.cpu_max_enabled)
+		async_p2dq_enqueue_with_throttling(&pro, p, enq_flags);
+	else
+		async_p2dq_enqueue(&pro, p, enq_flags);
+
 	complete_p2dq_enqueue(&pro, p);
 }
 
 void BPF_STRUCT_OPS(p2dq_dispatch, s32 cpu, struct task_struct *prev)
 {
-	return p2dq_dispatch_impl(cpu, prev);
+	if (p2dq_config.cpu_max_enabled && p2dq_dispatch_with_throttling(cpu, prev))
+		return;
+
+	p2dq_dispatch_impl(cpu, prev);
 }
 
 s32 BPF_STRUCT_OPS(p2dq_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
@@ -2242,6 +2623,7 @@ SCX_OPS_DEFINE(p2dq,
 	       .enqueue			= (void *)p2dq_enqueue,
 	       .dispatch		= (void *)p2dq_dispatch,
 	       .running			= (void *)p2dq_running,
+	       //.cgroup_set_bandwidth	= (void *)p2dq_cgroup_set_bandwidth,
 	       .stopping		= (void *)p2dq_stopping,
 	       .set_cpumask		= (void *)p2dq_set_cpumask,
 	       .update_idle		= (void *)p2dq_update_idle,

@@ -64,6 +64,26 @@ struct node_ctx {
 	struct bpf_cpumask __kptr	*big_cpumask;
 };
 
+struct cgrp_hlimit {
+	u64				quota_ns;
+	u64 				period_ns;
+	u64 				effective_quota_ns;
+	u64 				cgroup_id;
+	int 				depth;
+};
+
+struct cgrp_ctx {
+	u64				cgroup_id;
+	u64				cpu_usage_ns;
+	u64				period_start_ns;
+	bool				throttled;
+	u32				nr_throttled_tasks;
+	u64				last_update_ns;
+
+	u64				parent_cgroup_id;
+	struct				cgrp_hlimit hlimit;
+};
+
 struct task_p2dq {
 	u64			dsq_id;
 	u64			slice_ns;
@@ -85,6 +105,10 @@ struct task_p2dq {
 
 	/* Allowed to run on all CPUs */
 	bool			all_cpus;
+
+	u64			cgroup_id;
+	bool			throttled;
+	u64			throttle_start_ns;
 };
 
 typedef struct task_p2dq __arena task_ctx;

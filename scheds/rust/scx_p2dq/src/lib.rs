@@ -62,6 +62,10 @@ pub struct SchedulerOpts {
     #[clap(long, action = clap::ArgAction::SetTrue)]
     pub deadline: bool,
 
+    /// Enables cpu.max support for cgroups
+    #[clap(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub cpu_max: bool,
+
     /// ***DEPRECATED*** Disables eager pick2 load balancing.
     #[clap(short = 'e', long, help="DEPRECATED", action = clap::ArgAction::SetTrue)]
     pub eager_load_balance: bool,
@@ -284,6 +288,7 @@ macro_rules! init_open_skel {
             rodata.p2dq_config.atq_enabled = MaybeUninit::new(
                 opts.atq_enabled && compat::ksym_exists("bpf_spin_unlock").unwrap_or(false),
             );
+            rodata.p2dq_config.cpu_max_enabled = MaybeUninit::new(opts.cpu_max);
             rodata.p2dq_config.cpu_priority = MaybeUninit::new(opts.cpu_priority);
             rodata.p2dq_config.freq_control = MaybeUninit::new(opts.freq_control);
             rodata.p2dq_config.interactive_sticky = MaybeUninit::new(opts.interactive_sticky);
