@@ -95,6 +95,13 @@ fn handle_input_entry(app: &App, s: String) -> Option<Action> {
                 None
             }
         }
+        AppState::BpfPrograms => {
+            if app.filtering() {
+                Some(Action::InputEntry(s))
+            } else {
+                None
+            }
+        }
         AppState::PerfTop => {
             if app.filtering() {
                 Some(Action::InputEntry(s))
