@@ -209,6 +209,10 @@ pub struct SchedulerOpts {
     /// Initial DSQ for tasks.
     #[clap(short = 'i', long, default_value = "0")]
     pub init_dsq_index: usize,
+
+    /// Number of CPU shards for LLC DSQ splitting. Default 0 means use single LLC DSQ.
+    #[clap(long, default_value = "0")]
+    pub cpu_shards: usize,
 }
 
 pub fn dsq_slice_ns(dsq_index: u64, min_slice_us: u64, dsq_shift: u64) -> u64 {
@@ -306,6 +310,7 @@ macro_rules! init_open_skel {
             rodata.p2dq_config.init_dsq_index = opts.init_dsq_index as i32;
             rodata.p2dq_config.saturated_percent = opts.saturated_percent;
             rodata.p2dq_config.sched_mode = opts.sched_mode.clone() as u32;
+            rodata.p2dq_config.cpu_shards = opts.cpu_shards as u32;
 
             rodata.p2dq_config.atq_enabled = MaybeUninit::new(
                 opts.atq_enabled && compat::ksym_exists("bpf_spin_unlock").unwrap_or(false),

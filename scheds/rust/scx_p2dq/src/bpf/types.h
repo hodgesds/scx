@@ -46,6 +46,11 @@ struct llc_ctx {
 	bool				saturated;
 	bool				all_big;
 
+	/* CPU sharding related fields */
+	u32				nr_shard_dsqs;
+	u64				shard_dsqs[MAX_DSQS_PER_LLC];
+	u32				cpu_to_shard[MAX_CPUS];
+
 	struct bpf_cpumask __kptr	*cpumask;
 	struct bpf_cpumask __kptr	*big_cpumask;
 	struct bpf_cpumask __kptr	*little_cpumask;
