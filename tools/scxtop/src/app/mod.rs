@@ -3,6 +3,10 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2.
 
+pub mod events;
+pub mod render;
+pub mod tick;
+
 use crate::available_kprobe_events;
 use crate::available_perf_events;
 use crate::bpf_intf;
