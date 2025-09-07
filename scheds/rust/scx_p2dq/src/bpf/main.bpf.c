@@ -1680,9 +1680,12 @@ void BPF_STRUCT_OPS(p2dq_update_idle, s32 cpu, bool idle)
 		return;
 	}
 
-	if (idle)
+	if (idle) {
 		llcx->saturated = false;
-	else if (!idle && llcx->cpumask && idle_cpumask && llcx->tmp_cpumask) {
+		if (p2dq_config.sched_mode == MODE_EFFICIENCY &&
+		    p2dq_config.freq_control)
+			scx_bpf_cpuperf_set(cpu, 0);
+	} else if (!idle && llcx->cpumask && idle_cpumask && llcx->tmp_cpumask) {
 		bpf_cpumask_and(llcx->tmp_cpumask,
 				cast_mask(llcx->cpumask),
 				idle_cpumask);
