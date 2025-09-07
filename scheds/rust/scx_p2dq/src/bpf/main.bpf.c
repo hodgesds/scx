@@ -489,6 +489,9 @@ static void set_deadline_slice(struct task_struct *p, task_ctx *taskc,
 	else
 		taskc->slice_ns = max_ns;
 
+	if (p2dq_config.sched_mode == MODE_PERF && llcx->saturated)
+		taskc->slice_ns /= 2;
+
 	taskc->slice_ns = clamp_slice(taskc->slice_ns);
 }
 
