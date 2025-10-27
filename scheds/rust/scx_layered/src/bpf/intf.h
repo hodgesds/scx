@@ -153,6 +153,12 @@ enum layer_stat_id {
 	LSTAT_LLC_DRAIN_TRY,
 	LSTAT_LLC_DRAIN,
 	LSTAT_SKIP_REMOTE_NODE,
+
+	/* Load balancing statistics (Phase 2 & 3) */
+	LSTAT_LOAD_IMBAL,        /* Cross-LLC load imbalance detected */
+	LSTAT_VICTIM_SCORE,      /* Victim selected by load scoring */
+	LSTAT_THRESHOLD_ADJ,     /* Dynamic threshold adjustment */
+
 	NR_LSTATS,
 };
 
@@ -235,6 +241,14 @@ struct llc_ctx {
 	u32			nr_cpus;
 	u64			vtime_now[MAX_LAYERS];
 	u64			queued_runtime[MAX_LAYERS];
+
+	/* Enhanced load tracking per layer */
+	u32			nr_queued_tasks[MAX_LAYERS];   /* Task count */
+	u64			weighted_load[MAX_LAYERS];     /* Sum of task weights */
+	u32			cur_util;                      /* Current utilization (fixed-point) */
+	u32			avg_util;                      /* Average utilization (EWMA) */
+	u64			util_update_at;                /* Timestamp of last util update */
+
 	u64			lo_fb_seq;
 	u64			lstats[MAX_LAYERS][NR_LLC_LSTATS];
 	struct llc_prox_map	prox_map;

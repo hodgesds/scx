@@ -27,6 +27,11 @@ char _license[] SEC("license") = "GPL";
 
 extern unsigned CONFIG_HZ __kconfig;
 
+/* Minimum value for signed 64-bit integer */
+#define S64_MIN ((s64)(-9223372036854775807LL - 1))
+/* Maximum value for unsigned 64-bit integer */
+#define U64_MAX ((u64)(18446744073709551615ULL))
+
 static u32 do_refresh_layer_cpumasks = 0;
 
 const volatile u32 debug;
@@ -1368,6 +1373,266 @@ bool maybe_update_task_llc(struct task_struct *p, struct task_ctx *taskc, s32 ne
 	return true;
 }
 
+/*
+ * Update per-LLC load metrics when task is enqueued to layer DSQ.
+ * Called from layered_enqueue() before scx_bpf_dispatch_vtime().
+ */
+static void llc_load_adj(struct llc_ctx *llcc, u32 layer_id,
+			  struct task_ctx *taskc, s64 adj)
+{
+	const u32 weight = 100;  /* Use constant weight for Phase 1 */
+
+	if (!llcc || layer_id >= MAX_LAYERS)
+		return;
+
+	/* Adjust queue depth */
+	if (adj > 0)
+		llcc->nr_queued_tasks[layer_id]++;
+	else if (llcc->nr_queued_tasks[layer_id] > 0)
+		llcc->nr_queued_tasks[layer_id]--;
+
+	/* Adjust weighted load */
+	if (adj > 0)
+		llcc->weighted_load[layer_id] += weight;
+	else if (llcc->weighted_load[layer_id] >= weight)
+		llcc->weighted_load[layer_id] -= weight;
+}
+
+/*
+ * Update LLC utilization based on time delta.
+ * Called periodically from dispatch or timer context.
+ */
+static void llc_update_util(struct llc_ctx *llcc, u64 now)
+{
+	u64 delta_ns, compute_ns;
+	u32 nr_running = 0;
+	u32 cpu, util;
+
+	if (!llcc || llcc->nr_cpus == 0)
+		return;
+
+	delta_ns = now - llcc->util_update_at;
+	if (delta_ns < 1000000)  /* Update at most every 1ms */
+		return;
+
+	/* Count running vs idle CPUs in this LLC */
+	bpf_for(cpu, 0, nr_possible_cpus) {
+		struct cpu_ctx *cpuc;
+
+		if (cpu_to_llc_id(cpu) != llcc->id)
+			continue;
+
+		if (!(cpuc = lookup_cpu_ctx(cpu)))
+			continue;
+
+		if (cpuc->current_preempt || cpuc->current_excl)
+			nr_running++;
+	}
+
+	/* Calculate utilization as fixed-point: (running / total) << 10 */
+	if (llcc->nr_cpus > 0) {
+		compute_ns = delta_ns * nr_running;
+		util = (compute_ns << 10) / (delta_ns * llcc->nr_cpus);  /* 10-bit fixed-point */
+
+		/* Update current utilization */
+		llcc->cur_util = util;
+
+		/* Update average utilization using simple EWMA: avg = 0.75*avg + 0.25*cur */
+		llcc->avg_util = (llcc->avg_util * 3 + util) / 4;
+	}
+
+	llcc->util_update_at = now;
+}
+
+/*
+ * Calculate combined scaled load for an LLC layer.
+ * Returns fixed-point value combining utilization, queue depth, and weighted load.
+ */
+static u64 llc_layer_scaled_load(struct llc_ctx *llcc, u32 layer_id)
+{
+	u64 util_load, queue_load, weight_load, scaled_load;
+	u32 nr_tasks;
+
+	if (!llcc || layer_id >= MAX_LAYERS || llcc->nr_cpus == 0)
+		return 0;
+
+	/* Utilization component (already fixed-point) */
+	util_load = llcc->avg_util;
+
+	/* Queue depth component: scale by CPU count */
+	nr_tasks = llcc->nr_queued_tasks[layer_id];
+	queue_load = (nr_tasks << 13) / llcc->nr_cpus;  /* 13-bit shift for emphasis */
+
+	/* Weighted load component */
+	weight_load = (llcc->weighted_load[layer_id] << 10) / (llcc->nr_cpus * 100);
+
+	/* Combined load: util + queue + weight */
+	scaled_load = util_load + queue_load + weight_load;
+
+	return scaled_load;
+}
+
+/*
+ * Calculate load imbalance between two LLCs for a given layer.
+ * Returns: (source_load - dest_load) as signed value.
+ * Positive = source has more load, negative = dest has more load.
+ */
+static s64 llc_load_imbalance(struct llc_ctx *src_llcc, struct llc_ctx *dst_llcc,
+			       u32 layer_id)
+{
+	u64 src_load, dst_load;
+
+	if (!src_llcc || !dst_llcc || layer_id >= MAX_LAYERS)
+		return 0;
+
+	src_load = llc_layer_scaled_load(src_llcc, layer_id);
+	dst_load = llc_layer_scaled_load(dst_llcc, layer_id);
+
+	return (s64)src_load - (s64)dst_load;
+}
+
+/*
+ * Calculate average load across all LLCs for a layer.
+ * Used as reference point for determining if LLC is overloaded.
+ */
+static u64 layer_avg_load(u32 layer_id)
+{
+	u64 total_load = 0;
+	u32 valid_llcs = 0;
+	u32 llc_id;
+
+	if (layer_id >= MAX_LAYERS)
+		return 0;
+
+	bpf_for(llc_id, 0, nr_llcs) {
+		struct llc_ctx *llcc;
+
+		if (!(llcc = lookup_llc_ctx(llc_id)))
+			continue;
+
+		if (llcc->nr_cpus == 0)
+			continue;
+
+		total_load += llc_layer_scaled_load(llcc, layer_id);
+		valid_llcs++;
+	}
+
+	if (valid_llcs == 0)
+		return 0;
+
+	return total_load / valid_llcs;
+}
+
+/*
+ * Score a potential steal victim LLC.
+ * Higher score = better steal target.
+ *
+ * Formula: score = (load_imbalance * 1000) / distance_cost
+ *
+ * Where:
+ *   load_imbalance = src_load - dst_load (positive favors stealing)
+ *   distance_cost  = 1 (same LLC), 4 (same node), 16 (cross-node)
+ */
+static s64 llc_steal_score(struct llc_ctx *src_llcc, struct llc_ctx *dst_llcc,
+			    u32 layer_id, u32 distance_level, u32 node_end)
+{
+	s64 imbalance;
+	u32 distance_cost;
+	s64 score;
+
+	if (!src_llcc || !dst_llcc)
+		return S64_MIN;  /* Invalid, never select */
+
+	/* Calculate load imbalance */
+	imbalance = llc_load_imbalance(src_llcc, dst_llcc, layer_id);
+
+	/* No benefit if destination has more load */
+	if (imbalance <= 0)
+		return S64_MIN;
+
+	/* Distance cost based on proximity map level:
+	 * 0 = same LLC (cost 1)
+	 * 1..node_end = same node (cost 4)
+	 * node_end..sys_end = cross-node (cost 16)
+	 */
+	if (distance_level == 0)
+		distance_cost = 1;
+	else if (distance_level < node_end)
+		distance_cost = 4;
+	else
+		distance_cost = 16;
+
+	/* Score = imbalance / cost, scaled by 1000 to avoid precision loss */
+	score = (imbalance * 1000) / distance_cost;
+
+	return score;
+}
+
+/*
+ * Calculate dynamic cross-LLC migration threshold for a layer.
+ *
+ * Strategy:
+ * - Start with base threshold (layer->xllc_mig_min_ns)
+ * - Reduce threshold when high load imbalance detected (more aggressive)
+ * - Increase threshold when system is balanced (more conservative)
+ *
+ * Returns: adjusted threshold in nanoseconds
+ */
+static u64 calc_dynamic_xllc_threshold(struct layer *layer, u32 layer_id,
+				       struct llc_ctx *src_llcc,
+				       struct llc_ctx *dst_llcc)
+{
+	u64 base_threshold, adjusted_threshold;
+	u64 avg_load, src_load, imbalance_ratio;
+	s64 imbalance;
+
+	if (!layer || !src_llcc || !dst_llcc || layer_id >= MAX_LAYERS)
+		return U64_MAX;  /* No migration */
+
+	base_threshold = layer->xllc_mig_min_ns;
+
+	/* If base threshold is 0, migration is always allowed */
+	if (base_threshold == 0)
+		return 0;
+
+	/* Calculate load imbalance */
+	avg_load = layer_avg_load(layer_id);
+	if (avg_load == 0)
+		return base_threshold;  /* No load, use base threshold */
+
+	src_load = llc_layer_scaled_load(src_llcc, layer_id);
+	imbalance = (s64)src_load - (s64)avg_load;
+
+	/* No imbalance, use conservative threshold */
+	if (imbalance <= 0)
+		return base_threshold << 1;  /* 2x base (more conservative) */
+
+	/* Calculate imbalance as percentage of average load (scaled by 100) */
+	imbalance_ratio = (imbalance * 100) / avg_load;
+
+	/*
+	 * Adjust threshold based on imbalance severity:
+	 * - imbalance > 50% of avg: threshold / 4 (very aggressive)
+	 * - imbalance > 25% of avg: threshold / 2 (aggressive)
+	 * - imbalance > 10% of avg: threshold * 0.75 (slightly aggressive)
+	 * - imbalance <= 10%: base_threshold (neutral)
+	 */
+	if (imbalance_ratio >= 50)
+		adjusted_threshold = base_threshold >> 2;  /* Divide by 4 */
+	else if (imbalance_ratio >= 25)
+		adjusted_threshold = base_threshold >> 1;  /* Divide by 2 */
+	else if (imbalance_ratio >= 10)
+		adjusted_threshold = (base_threshold * 3) >> 2;  /* Multiply by 0.75 */
+	else
+		adjusted_threshold = base_threshold;
+
+	/* Ensure minimum threshold (100us) to prevent thrashing */
+	if (adjusted_threshold < 100000)  /* 100us in nanoseconds */
+		adjusted_threshold = 100000;
+
+	return adjusted_threshold;
+}
+
 s32 BPF_STRUCT_OPS(layered_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
 	struct cpu_ctx *cpuc;
@@ -1545,6 +1810,10 @@ static void task_uncharge_qrt(struct task_ctx *taskc)
 		return;
 
 	__sync_fetch_and_sub(&llcc->queued_runtime[layer_id], taskc->runtime_avg);
+
+	/* Update load tracking metrics */
+	llc_load_adj(llcc, layer_id, taskc, -1);  /* adj=-1 for dequeue */
+
 	taskc->qrt_layer_id = MAX_LAYERS;
 	taskc->qrt_llc_id = MAX_LLCS;
 }
@@ -1818,6 +2087,9 @@ skip_ddsp:
 	queued_runtime = __sync_fetch_and_add(&llcc->queued_runtime[layer_id],
 					      taskc->runtime_avg);
 	queued_runtime += taskc->runtime_avg;
+
+	/* Update load tracking metrics */
+	llc_load_adj(llcc, layer_id, taskc, 1);  /* adj=1 for enqueue */
 
 	lstats = llcc->lstats[layer_id];
 
@@ -2172,49 +2444,103 @@ static __always_inline bool try_consume_layer(u32 layer_id, struct cpu_ctx *cpuc
 	struct llc_prox_map *llc_pmap = &llcc->prox_map;
 	struct layer *layer;
 	u32 nid = llc_node_id(llcc->id);
-	bool xllc_mig_skipped = false;
 	bool skip_remote_node;
+
+	/* Best victim tracking */
+	s64 best_score = S64_MIN;
+	u16 best_llc_id = 0;
+	bool found_victim = false;
+
+	/* Threshold gating */
+	u64 avg_load;
+	bool xllc_mig_skipped = false;
 	u32 u;
 
 	if (!(layer = lookup_layer(layer_id)))
 		return false;
 
-	/*
-	 * If a layer is confined, and the CPU doens't belong to it, we shouldn't
-	 * consume from it.
-	 */
+	/* Confined layer check */
 	if (layer->kind == LAYER_KIND_CONFINED && cpuc->layer_id != layer_id)
 		return false;
 
 	skip_remote_node = layer->skip_remote_node;
+	avg_load = layer_avg_load(layer_id);
 
+	/* Phase 1: Score all potential victims and find the best */
 	bpf_for(u, 0, llc_pmap->sys_end) {
 		u16 *llc_idp;
+		struct llc_ctx *remote_llcc;
+		s64 score;
 
 		if (!(llc_idp = MEMBER_VPTR(llc_pmap->llcs, [u]))) {
 			scx_bpf_error("llc_pmap->sys_end=%u too big", llc_pmap->sys_end);
 			return false;
 		}
 
-		if (u > 0) {
-			struct llc_ctx *remote_llcc;
+		if (!(remote_llcc = lookup_llc_ctx(*llc_idp)))
+			continue;
 
-			if (!(remote_llcc = lookup_llc_ctx(*llc_idp)))
-				return false;
+		/* Skip if distance level 0 (same LLC - shouldn't happen) */
+		if (u == 0)
+			continue;
 
-			if (skip_remote_node && nid != llc_node_id(remote_llcc->id)) {
-				lstat_inc(LSTAT_SKIP_REMOTE_NODE, layer, cpuc);
-				continue;
-			}
-
-			if (remote_llcc->queued_runtime[layer_id] < layer->xllc_mig_min_ns) {
-				xllc_mig_skipped = true;
-				continue;
-			}
+		/* Apply existing filters */
+		if (skip_remote_node && nid != llc_node_id(remote_llcc->id)) {
+			lstat_inc(LSTAT_SKIP_REMOTE_NODE, layer, cpuc);
+			continue;
 		}
 
-		if (scx_bpf_dsq_move_to_local(layer_dsq_id(layer_id, *llc_idp)))
+		/* Phase 3: Dynamic threshold */
+		u64 dynamic_threshold = calc_dynamic_xllc_threshold(layer, layer_id,
+								     remote_llcc, llcc);
+
+		/* Debug trace for threshold adjustment */
+		if (debug >= 2 && dynamic_threshold != layer->xllc_mig_min_ns) {
+			u64 src_load = llc_layer_scaled_load(remote_llcc, layer_id);
+			bpf_printk("THRESH_ADJ layer=%d src_llc=%u base=%llu adj=%llu load=%llu",
+				   layer_id, remote_llcc->id, layer->xllc_mig_min_ns,
+				   dynamic_threshold, src_load);
+		}
+
+		if (remote_llcc->queued_runtime[layer_id] < dynamic_threshold) {
+			xllc_mig_skipped = true;
+
+			/* Track when threshold adjusted */
+			if (dynamic_threshold != layer->xllc_mig_min_ns)
+				lstat_inc(LSTAT_THRESHOLD_ADJ, layer, cpuc);
+
+			continue;
+		}
+
+		/* Phase 2: Calculate steal score */
+		score = llc_steal_score(remote_llcc, llcc, layer_id, u, llc_pmap->node_end);
+
+		if (score > best_score) {
+			best_score = score;
+			best_llc_id = *llc_idp;
+			found_victim = true;
+		}
+	}
+
+	/* Phase 2: Attempt to steal from best victim if found */
+	if (found_victim && best_score > S64_MIN) {
+		lstat_inc(LSTAT_VICTIM_SCORE, layer, cpuc);
+
+		/* Debug trace for victim selection */
+		if (debug >= 2) {
+			bpf_printk("STEAL cpu=%d layer=%d best_llc=%u score=%lld avg_load=%llu",
+				   cpuc->cpu, layer_id, best_llc_id, best_score, avg_load);
+		}
+
+		if (scx_bpf_dsq_move_to_local(layer_dsq_id(layer_id, best_llc_id))) {
+			lstat_inc(LSTAT_XLLC_MIGRATION, layer, cpuc);
+
+			/* Track load imbalance stat */
+			if (best_score > (avg_load >> 1))  /* Imbalance > 50% of avg */
+				lstat_inc(LSTAT_LOAD_IMBAL, layer, cpuc);
+
 			return true;
+		}
 	}
 
 	if (xllc_mig_skipped)
@@ -2322,6 +2648,9 @@ void BPF_STRUCT_OPS(layered_dispatch, s32 cpu, struct task_struct *prev)
 
 	if (!(llcc = lookup_llc_ctx(cpuc->llc_id)))
 		return;
+
+	/* Update LLC utilization periodically */
+	llc_update_util(llcc, bpf_ktime_get_ns());
 
 	/* always consume hi_fb_dsq_id first for kthreads */
 	if (scx_bpf_dsq_move_to_local(cpuc->hi_fb_dsq_id))
