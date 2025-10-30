@@ -37,6 +37,10 @@ struct p2dq_timer {
 #define cpu_ctx_clear_flag(cpuc, flag)	((cpuc)->flags &= ~(flag))
 #define cpu_ctx_test_flag(cpuc, flag)	((cpuc)->flags & (flag))
 
+/* Arena-backed LLC context pointer */
+struct llc_ctx;
+typedef struct llc_ctx __arena *llc_ptr;
+
 struct cpu_ctx {
 	int				id;
 	u32				llc_id;
@@ -53,7 +57,10 @@ struct cpu_ctx {
 	u64				max_load_dsq;
 
 	scx_atq_t			*mig_atq;
-};
+
+	u64				idle_start_clk;  /* timestamp when CPU went idle, 0 if busy */
+	u64				idle_total;      /* accumulated idle time in current period */
+} __attribute__((aligned(CACHE_LINE_SIZE)));
 
 /* llc_ctx state flag bits */
 #define LLC_CTX_F_SATURATED	(1 << 0)
@@ -109,20 +116,26 @@ struct llc_ctx {
 	 * Accessed during CPU selection but not updated frequently
 	 */
 	char				__pad4[CACHE_LINE_SIZE - sizeof(arena_spinlock_t)];
-	struct bpf_cpumask __kptr	*cpumask;
-	struct bpf_cpumask __kptr	*big_cpumask;
-	struct bpf_cpumask __kptr	*little_cpumask;
-	struct bpf_cpumask __kptr	*node_cpumask;
-	struct bpf_cpumask __kptr	*tmp_cpumask;
+	scx_bitmap_t			cpumask;
+	scx_bitmap_t			big_cpumask;
+	scx_bitmap_t			little_cpumask;
+	scx_bitmap_t			node_cpumask;
+	scx_bitmap_t			tmp_cpumask;
+
+	/* Cached idle masks - updated in update_idle, read in hot path */
+	scx_bitmap_t			idle_cpumask;    /* Idle CPUs in this LLC */
+	scx_bitmap_t			idle_smtmask;    /* Idle SMT cores in this LLC */
 
 	scx_atq_t			*mig_atq;
 	scx_minheap_t			*idle_cpu_heap;
+	u64				dsq_load[MAX_DSQS_PER_LLC];
+	u64				shard_dsqs[MAX_LLC_SHARDS];
 };
 
 struct node_ctx {
 	u32				id;
-	struct bpf_cpumask __kptr	*cpumask;
-	struct bpf_cpumask __kptr	*big_cpumask;
+	scx_bitmap_t			cpumask;
+	scx_bitmap_t			big_cpumask;
 };
 
 /* task_ctx flag bits */

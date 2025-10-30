@@ -425,8 +425,8 @@ static int chaos_timer_check_queues_callback(void *map, int key,
 s32 BPF_STRUCT_OPS_SLEEPABLE(chaos_init)
 {
 	struct timer_wrapper *timerw;
-	struct llc_ctx	     *llcx;
-	struct cpu_ctx	     *cpuc;
+	llc_ptr		      llcx;
+	struct cpu_ctx __arena *cpuc;
 	int		      timer_id, ret, i;
 
 	bpf_for(i, 0, topo_config.nr_cpus)

@@ -223,15 +223,66 @@ impl<'a> Scheduler<'a> {
             );
         }
 
+        // Initialize LLCs via syscall program to avoid verifier complexity in main init
+        let input = ProgramInput {
+            ..Default::default()
+        };
+
+        let output = self.skel.progs.init_llcs.test_run(input)?;
+        if output.return_value != 0 {
+            bail!(
+                "Failed to initialize LLCs, init_llcs returned {}",
+                output.return_value as i32
+            );
+        }
+
+        // Initialize CPUs and NUMA nodes via syscall program
+        let input = ProgramInput {
+            ..Default::default()
+        };
+
+        let output = self.skel.progs.init_cpus_and_nodes.test_run(input)?;
+        if output.return_value != 0 {
+            bail!(
+                "Failed to initialize CPUs and nodes, init_cpus_and_nodes returned {}",
+                output.return_value as i32
+            );
+        }
+
+        // Create DSQs and configure CPU contexts via syscall program
+        let input = ProgramInput {
+            ..Default::default()
+        };
+
+        let output = self.skel.progs.init_dsqs.test_run(input)?;
+        if output.return_value != 0 {
+            bail!(
+                "Failed to create DSQs, init_dsqs returned {}",
+                output.return_value as i32
+            );
+        }
+
+        // Initialize idle masks via syscall program to avoid verifier complexity in main init
+        let input = ProgramInput {
+            ..Default::default()
+        };
+
+        let output = self.skel.progs.init_idle_masks.test_run(input)?;
+        if output.return_value != 0 {
+            bail!(
+                "Failed to initialize idle masks, init_idle_masks returned {}",
+                output.return_value as i32
+            );
+        }
+
         Ok(())
     }
 
     fn start(&mut self) -> Result<()> {
-        self.struct_ops = Some(scx_ops_attach!(self.skel, p2dq)?);
+        // Initialize topology via syscall programs (ALWAYS required)
+        self.print_topology()?;
 
-        if self.verbose > 1 {
-            self.print_topology()?;
-        }
+        self.struct_ops = Some(scx_ops_attach!(self.skel, p2dq)?);
 
         info!("P2DQ scheduler started! Run `scx_p2dq --monitor` for metrics.");
 
