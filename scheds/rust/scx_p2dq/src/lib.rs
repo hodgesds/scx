@@ -303,6 +303,12 @@ pub struct SchedulerOpts {
     #[clap(long, action = clap::ArgAction::SetTrue)]
     pub single_llc_fast_path: bool,
 
+    /// Enable arena-based idle CPU tracking (cached idle masks updated in update_idle).
+    /// When disabled, always uses kernel idle masks for idle CPU selection.
+    /// Useful for comparing accuracy vs. performance of arena idle tracking.
+    #[clap(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub arena_idle_tracking: bool,
+
     #[clap(flatten, next_help_heading = "Topology Options")]
     pub topo: TopologyArgs,
 }
@@ -423,6 +429,7 @@ macro_rules! init_open_skel {
             rodata.p2dq_config.freq_control = MaybeUninit::new(opts.freq_control);
             rodata.p2dq_config.interactive_sticky = MaybeUninit::new(opts.interactive_sticky);
             rodata.p2dq_config.keep_running_enabled = MaybeUninit::new(opts.keep_running);
+            rodata.p2dq_config.arena_idle_tracking = MaybeUninit::new(opts.arena_idle_tracking);
 
             rodata.debug = verbose as u32;
             rodata.nr_cpu_ids = *NR_CPU_IDS as u32;

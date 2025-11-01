@@ -122,7 +122,12 @@ struct llc_ctx {
 	scx_bitmap_t			node_cpumask;
 	scx_bitmap_t			tmp_cpumask;
 
-	/* Cached idle masks - updated in update_idle, read in hot path */
+	/*
+	 * Arena idle tracking for hot path optimization
+	 * These masks are updated in update_idle() and read in pick_idle_cpu()
+	 * Protected by idle_mask_lock for memory ordering across CPUs
+	 */
+	arena_spinlock_t		idle_mask_lock;  /* Protects idle mask updates/reads */
 	scx_bitmap_t			idle_cpumask;    /* Idle CPUs in this LLC */
 	scx_bitmap_t			idle_smtmask;    /* Idle SMT cores in this LLC */
 

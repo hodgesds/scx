@@ -97,7 +97,6 @@ struct CliOpts {
 struct Scheduler<'a> {
     skel: BpfSkel<'a>,
     struct_ops: Option<libbpf_rs::Link>,
-    verbose: u8,
 
     stats_server: StatsServer<(), Metrics>,
 }
@@ -154,7 +153,6 @@ impl<'a> Scheduler<'a> {
         Ok(Self {
             skel,
             struct_ops: None,
-            verbose,
             stats_server,
         })
     }
