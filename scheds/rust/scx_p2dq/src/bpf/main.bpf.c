@@ -477,6 +477,9 @@ static bool is_interactive(task_ctx *taskc)
 	return taskc->dsq_index == 0;
 }
 
+// Forward declaration
+static bool should_migrate_for_slice(task_ctx *taskc, struct llc_ctx *cur_llcx, u64 slice_ns);
+
 static bool can_migrate(task_ctx *taskc, struct llc_ctx *llcx)
 {
 	// Single-LLC fast path: never migrate
@@ -499,6 +502,11 @@ static bool can_migrate(task_ctx *taskc, struct llc_ctx *llcx)
 		return true;
 
 	if (unlikely(llc_ctx_test_flag(llcx, LLC_CTX_F_SATURATED)))
+		return true;
+
+	// Check if task slice suggests migration would be beneficial
+	// This is especially useful for long-running tasks under load imbalance
+	if (taskc->slice_ns > 0 && should_migrate_for_slice(taskc, llcx, taskc->slice_ns))
 		return true;
 
 	return false;
@@ -560,6 +568,52 @@ static void update_vtime(struct task_struct *p, struct cpu_ctx *cpuc,
 static struct llc_ctx *rand_llc_ctx(void)
 {
 	return lookup_llc_ctx(bpf_get_prandom_u32() % topo_config.nr_llcs);
+}
+
+/*
+ * Check if migration is beneficial based on task timeslice and LLC load imbalance.
+ * Uses only cached values for minimal overhead.
+ * Long-running tasks (larger timeslices) benefit more from migration since the
+ * migration cost is amortized over longer execution time.
+ */
+static bool should_migrate_for_slice(task_ctx *taskc, struct llc_ctx *cur_llcx, u64 slice_ns)
+{
+	struct llc_ctx *other_llcx;
+	u64 cur_load, other_load;
+
+	// Early exits using cached values only
+
+	// Only consider for longer-running tasks (> 1.5x max slice)
+	// Avoid division: instead of slice_ns < (3 * max / 2), use 2 * slice_ns < 3 * max
+	if ((slice_ns << 1) < (3 * max_dsq_time_slice()))
+		return false;
+
+	// Quick check: use cached load - if current LLC isn't loaded, no benefit
+	cur_load = cur_llcx->load;
+	if (cur_load == 0)
+		return false;
+
+	// Sample one random LLC for load comparison (minimal overhead)
+	other_llcx = rand_llc_ctx();
+	if (!other_llcx || other_llcx->id == cur_llcx->id)
+		return false;
+
+	// Use cached load value from other LLC
+	other_load = other_llcx->load;
+
+	// Check if other LLC has significantly less load
+	// Calculate threshold once: threshold = cur_load * (100 - slack) / 100
+	// Rewrite to avoid division in comparison:
+	//   other_load < threshold
+	//   other_load * 100 < cur_load * (100 - slack)
+	if ((other_load * 100) < (cur_load * (100 - lb_config.slack_factor))) {
+		stat_inc(P2DQ_STAT_ENQ_SLICE_MIG);
+		trace("SLICE_MIG slice=%llu cur[%u]=%llu other[%u]=%llu",
+		      slice_ns, cur_llcx->id, cur_load, other_llcx->id, other_load);
+		return true;
+	}
+
+	return false;
 }
 
 static bool keep_running(struct cpu_ctx *cpuc, struct llc_ctx *llcx,
