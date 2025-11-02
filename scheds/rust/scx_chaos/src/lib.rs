@@ -10,6 +10,7 @@ use bpf_skel::BpfSkel;
 use stats::Metrics;
 
 use scx_p2dq::SchedulerOpts as P2dqOpts;
+use scx_p2dq::TimesliceMethod;
 use scx_userspace_arena::alloc::Allocator;
 use scx_userspace_arena::alloc::HeapAllocator;
 use scx_utils::build_id;

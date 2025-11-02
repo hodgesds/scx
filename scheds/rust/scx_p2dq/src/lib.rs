@@ -78,6 +78,29 @@ impl SchedMode {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+pub enum TimesliceMethod {
+    /// Default static timeslice based on DSQ index
+    Default,
+    /// Deadline-based dynamic timeslice calculation
+    Deadline,
+    /// Survival analysis (Kaplan-Meier) based timeslice
+    Survival,
+    /// Adaptive: automatically switches between methods based on load
+    Adaptive,
+}
+
+impl TimesliceMethod {
+    pub fn as_i32(&self) -> i32 {
+        match self {
+            TimesliceMethod::Default => bpf_intf::timeslice_method_TIMESLICE_DEFAULT as i32,
+            TimesliceMethod::Deadline => bpf_intf::timeslice_method_TIMESLICE_DEADLINE as i32,
+            TimesliceMethod::Survival => bpf_intf::timeslice_method_TIMESLICE_SURVIVAL as i32,
+            TimesliceMethod::Adaptive => bpf_intf::timeslice_method_TIMESLICE_ADAPTIVE as i32,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HardwareProfile {
     pub single_llc: bool,
@@ -155,8 +178,8 @@ pub struct SchedulerOpts {
     #[clap(short = 'r', long, default_value = "10")]
     pub interactive_ratio: usize,
 
-    /// Enables deadline scheduling
-    #[clap(long, action = clap::ArgAction::SetTrue)]
+    /// ***DEPRECATED*** Enables deadline scheduling (use --timeslice-method deadline instead)
+    #[clap(long, help="DEPRECATED: use --timeslice-method deadline", action = clap::ArgAction::SetTrue)]
     pub deadline: bool,
 
     /// ***DEPRECATED*** Disables eager pick2 load balancing.
@@ -250,6 +273,10 @@ pub struct SchedulerOpts {
     /// Scheduler mode
     #[arg(value_enum, long, default_value_t = SchedMode::Default)]
     pub sched_mode: SchedMode,
+
+    /// Timeslice calculation method
+    #[arg(value_enum, long, default_value_t = TimesliceMethod::Default)]
+    pub timeslice_method: TimesliceMethod,
 
     /// Slack factor for load balancing, load balancing is not performed if load is within slack
     /// factor percent.
@@ -379,7 +406,14 @@ macro_rules! init_open_skel {
             rodata.timeline_config.max_exec_ns =
                 2 * skel.maps.bss_data.as_ref().unwrap().dsq_time_slices[opts.dumb_queues - 1];
             rodata.timeline_config.autoslice = MaybeUninit::new(opts.autoslice);
-            rodata.timeline_config.deadline = MaybeUninit::new(opts.deadline);
+
+            // Handle backwards compatibility: --deadline maps to --timeslice-method deadline
+            let timeslice_method = if opts.deadline {
+                TimesliceMethod::Deadline
+            } else {
+                opts.timeslice_method.clone()
+            };
+            rodata.timeline_config.timeslice_method = timeslice_method.as_i32() as u32;
 
             // load balance config
             rodata.lb_config.slack_factor = opts.lb_slack_factor;
@@ -450,4 +484,112 @@ macro_rules! init_skel {
             $skel.maps.bss_data.as_mut().unwrap().llc_ids[llc.id] = llc.id as u64;
         }
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_timeslice_method_conversion() {
+        assert_eq!(
+            TimesliceMethod::Default.as_i32(),
+            bpf_intf::timeslice_method_TIMESLICE_DEFAULT as i32
+        );
+        assert_eq!(
+            TimesliceMethod::Deadline.as_i32(),
+            bpf_intf::timeslice_method_TIMESLICE_DEADLINE as i32
+        );
+        assert_eq!(
+            TimesliceMethod::Survival.as_i32(),
+            bpf_intf::timeslice_method_TIMESLICE_SURVIVAL as i32
+        );
+        assert_eq!(
+            TimesliceMethod::Adaptive.as_i32(),
+            bpf_intf::timeslice_method_TIMESLICE_ADAPTIVE as i32
+        );
+    }
+
+    #[test]
+    fn test_timeslice_method_enum_values() {
+        // Verify enum values match expected BPF constants
+        assert_eq!(bpf_intf::timeslice_method_TIMESLICE_DEFAULT, 0);
+        assert_eq!(bpf_intf::timeslice_method_TIMESLICE_DEADLINE, 1);
+        assert_eq!(bpf_intf::timeslice_method_TIMESLICE_SURVIVAL, 2);
+        assert_eq!(bpf_intf::timeslice_method_TIMESLICE_ADAPTIVE, 3);
+    }
+
+    #[test]
+    fn test_timeslice_method_clone() {
+        let method = TimesliceMethod::Survival;
+        let cloned = method.clone();
+        assert_eq!(method, cloned);
+    }
+
+    #[test]
+    fn test_timeslice_method_debug() {
+        let method = TimesliceMethod::Default;
+        let debug_str = format!("{:?}", method);
+        assert!(debug_str.contains("Default"));
+    }
+
+    #[test]
+    fn test_timeslice_method_ord() {
+        // Test ordering
+        assert!(TimesliceMethod::Default < TimesliceMethod::Deadline);
+        assert!(TimesliceMethod::Deadline < TimesliceMethod::Survival);
+        assert!(TimesliceMethod::Survival < TimesliceMethod::Adaptive);
+    }
+
+    #[test]
+    fn test_dsq_slice_ns() {
+        // Test DSQ slice calculation
+        let min_slice_us = 100;
+        let dsq_shift = 4;
+
+        // Index 0 should return min_slice_us in nanoseconds
+        assert_eq!(dsq_slice_ns(0, min_slice_us, dsq_shift), 100_000);
+
+        // Index 1 should be min_slice_us << 1 << dsq_shift
+        assert_eq!(
+            dsq_slice_ns(1, min_slice_us, dsq_shift),
+            100_000 << 1 << dsq_shift
+        );
+
+        // Index 2 should be min_slice_us << 2 << dsq_shift
+        assert_eq!(
+            dsq_slice_ns(2, min_slice_us, dsq_shift),
+            100_000 << 2 << dsq_shift
+        );
+    }
+
+    #[test]
+    fn test_sched_mode_conversion() {
+        // Also test SchedMode while we're at it
+        assert_eq!(
+            SchedMode::Default.as_i32(),
+            bpf_intf::scheduler_mode_MODE_DEFAULT as i32
+        );
+        assert_eq!(
+            SchedMode::Performance.as_i32(),
+            bpf_intf::scheduler_mode_MODE_PERF as i32
+        );
+        assert_eq!(
+            SchedMode::Efficiency.as_i32(),
+            bpf_intf::scheduler_mode_MODE_EFFICIENCY as i32
+        );
+    }
+
+    #[test]
+    fn test_lb_mode_conversion() {
+        // Test LbMode enum
+        assert_eq!(
+            LbMode::Load.as_i32(),
+            bpf_intf::p2dq_lb_mode_PICK2_LOAD as i32
+        );
+        assert_eq!(
+            LbMode::NrQueued.as_i32(),
+            bpf_intf::p2dq_lb_mode_PICK2_NR_QUEUED as i32
+        );
+    }
 }

@@ -71,12 +71,12 @@ const volatile struct {
 	u64 min_slice_us;
 	u64 max_exec_ns;
 	bool autoslice;
-	bool deadline;
+	u32 timeslice_method;
 } timeline_config = {
 	.min_slice_us = 100,
 	.max_exec_ns = 20 * NSEC_PER_MSEC,
 	.autoslice = true,
-	.deadline = true,
+	.timeslice_method = TIMESLICE_DEFAULT,
 };
 
 const volatile struct {
@@ -504,6 +504,98 @@ static bool can_migrate(task_ctx *taskc, struct llc_ctx *llcx)
 	return false;
 }
 
+/*
+ * Dispatcher function for timeslice calculation. Calls the appropriate
+ * timeslice calculation method based on the configured timeslice_method.
+ */
+static void calculate_task_slice(struct task_struct *p, task_ctx *taskc,
+				  struct llc_ctx *llcx);
+
+/*
+ * Calculate timeslice using survival analysis (simplified Kaplan-Meier).
+ * Uses running statistics to estimate P75 timeslice: approximately 75% of
+ * tasks complete within this timeslice without preemption.
+ * Also considers current system load (number of queued tasks).
+ */
+static void set_survival_slice(struct task_struct *p, task_ctx *taskc,
+				struct llc_ctx *llcx)
+{
+	u64 count = llcx->survival_stats.count;
+	u64 nr_queued = llc_nr_queued(llcx);
+	const struct cpumask *idle_cpumask;
+	u64 nr_idle;
+
+	// Bootstrap with default slice until we have enough samples
+	if (count < 10) {
+		taskc->slice_ns = task_dsq_slice_ns(p, taskc->dsq_index);
+		return;
+	}
+
+	// Calculate mean and standard deviation from running statistics
+	u64 sum = llcx->survival_stats.sum;
+	u64 sum_sq = llcx->survival_stats.sum_sq;
+	u64 mean = sum / count;
+
+	// Variance = E[X²] - E[X]²
+	// Use integer approximation: var ≈ (sum_sq / count) - mean²
+	u64 mean_sq = (sum_sq / count);
+	u64 variance = (mean_sq > mean * mean) ? (mean_sq - mean * mean) : 0;
+
+	// Standard deviation (integer sqrt approximation using binary search)
+	// Use bounded loop for BPF verifier - 64 iterations is more than enough for 64-bit sqrt
+	u64 stddev = 0;
+	if (variance > 0) {
+		u64 low = 0, high = mean, mid;
+		#pragma unroll
+		for (int i = 0; i < 64; i++) {
+			if (low > high || high == 0)
+				break;
+			mid = (low + high) / 2;
+			u64 mid_sq = mid * mid;
+			if (mid_sq < variance)
+				low = mid + 1;
+			else if (mid_sq > variance)
+				high = mid - 1;
+			else {
+				stddev = mid;
+				break;
+			}
+		}
+		if (stddev == 0)
+			stddev = high;
+	}
+
+	// P75 ≈ mean + 0.67 * stddev (normal approximation)
+	// Use integer math: P75 = mean + (2 * stddev / 3)
+	u64 base_slice_ns = mean + (2 * stddev) / 3;
+
+	// Adjust based on current system load (similar to deadline mode)
+	// Get number of idle CPUs
+	idle_cpumask = scx_bpf_get_idle_cpumask();
+	nr_idle = bpf_cpumask_weight(idle_cpumask);
+	scx_bpf_put_cpumask(idle_cpumask);
+
+	if (nr_idle == 0)
+		nr_idle = 1;
+
+	// If system is busy (more queued than idle), reduce slice proportionally
+	u64 slice_ns;
+	if (nr_queued > nr_idle) {
+		slice_ns = (base_slice_ns * nr_idle) / nr_queued;
+	} else {
+		slice_ns = base_slice_ns;
+	}
+
+	// Scale by task weight
+	slice_ns = scale_by_task_weight(p, slice_ns);
+
+	// Clamp to reasonable bounds
+	taskc->slice_ns = clamp_slice(slice_ns);
+
+	trace("SURVIVAL LLC[%u] mean=%llu stddev=%llu base=%llu queued=%llu idle=%llu final=%llu",
+	      llcx->id, mean, stddev, base_slice_ns, nr_queued, nr_idle, taskc->slice_ns);
+}
+
 static void set_deadline_slice(struct task_struct *p, task_ctx *taskc,
 			       struct llc_ctx *llcx)
 {
@@ -524,6 +616,74 @@ static void set_deadline_slice(struct task_struct *p, task_ctx *taskc,
 		taskc->slice_ns = max_ns;
 
 	taskc->slice_ns = clamp_slice(taskc->slice_ns);
+}
+
+/*
+ * Adaptive timeslice method: uses the cached method selection that was
+ * calculated in p2dq_update_idle() when CPU idle state changed.
+ * This avoids utilization calculation in the hot path.
+ *
+ * The cached method is selected based on system utilization:
+ *   < 30% util:  DEFAULT (lowest overhead)
+ *   30-75% util: DEADLINE (best for medium load)
+ *   > 75% util:  SURVIVAL (best tail latency under heavy load)
+ */
+static void set_adaptive_slice(struct task_struct *p, task_ctx *taskc,
+				struct llc_ctx *llcx)
+{
+	// Use the cached method that was set in p2dq_update_idle()
+	switch (llcx->adaptive_method) {
+	case TIMESLICE_DEFAULT:
+		taskc->slice_ns = task_dsq_slice_ns(p, taskc->dsq_index);
+		trace("ADAPTIVE LLC[%u] method=DEFAULT slice=%llu",
+		      llcx->id, taskc->slice_ns);
+		break;
+	case TIMESLICE_DEADLINE:
+		set_deadline_slice(p, taskc, llcx);
+		trace("ADAPTIVE LLC[%u] method=DEADLINE slice=%llu",
+		      llcx->id, taskc->slice_ns);
+		break;
+	case TIMESLICE_SURVIVAL:
+		set_survival_slice(p, taskc, llcx);
+		trace("ADAPTIVE LLC[%u] method=SURVIVAL slice=%llu",
+		      llcx->id, taskc->slice_ns);
+		break;
+	default:
+		// Default to DEFAULT method if not initialized
+		taskc->slice_ns = task_dsq_slice_ns(p, taskc->dsq_index);
+		break;
+	}
+}
+
+/*
+ * Dispatcher function for timeslice calculation. Calls the appropriate
+ * timeslice calculation method based on the configured timeslice_method.
+ */
+static void calculate_task_slice(struct task_struct *p, task_ctx *taskc,
+				  struct llc_ctx *llcx)
+{
+	switch (timeline_config.timeslice_method) {
+	case TIMESLICE_DEFAULT:
+		// Default: use pre-configured slice based on DSQ index
+		taskc->slice_ns = task_dsq_slice_ns(p, taskc->dsq_index);
+		break;
+
+	case TIMESLICE_DEADLINE:
+		set_deadline_slice(p, taskc, llcx);
+		break;
+
+	case TIMESLICE_SURVIVAL:
+		set_survival_slice(p, taskc, llcx);
+		break;
+
+	case TIMESLICE_ADAPTIVE:
+		set_adaptive_slice(p, taskc, llcx);
+		break;
+
+	default:
+		taskc->slice_ns = task_dsq_slice_ns(p, taskc->dsq_index);
+		break;
+	}
 }
 
 /*
@@ -1082,8 +1242,7 @@ static void async_p2dq_enqueue(struct enqueue_promise *ret,
 		// All affinitized tasks use affn_dsq
 		taskc->dsq_id = cpuc->affn_dsq;
 		update_vtime(p, cpuc, taskc, llcx);
-		if (timeline_config.deadline)
-			set_deadline_slice(p, taskc, llcx);
+		calculate_task_slice(p, taskc, llcx);
 
 		// Penalize slice for single-CPU tasks based on queue depth
 		// This prevents monopolization when many tasks are pinned to one CPU
@@ -1142,8 +1301,7 @@ static void async_p2dq_enqueue(struct enqueue_promise *ret,
 
 		ret->cpu = cpu;
 		update_vtime(p, cpuc, taskc, llcx);
-		if (timeline_config.deadline)
-			set_deadline_slice(p, taskc, llcx);
+		calculate_task_slice(p, taskc, llcx);
 
 		if (cpu_ctx_test_flag(cpuc, CPU_CTX_F_NICE_TASK))
 			enq_flags |= SCX_ENQ_PREEMPT;
@@ -1210,8 +1368,7 @@ static void async_p2dq_enqueue(struct enqueue_promise *ret,
 		enq_flags |= SCX_ENQ_PREEMPT;
 
 	update_vtime(p, cpuc, taskc, llcx);
-	if (timeline_config.deadline)
-		set_deadline_slice(p, taskc, llcx);
+	calculate_task_slice(p, taskc, llcx);
 
 	bool has_cleared_idle = scx_bpf_test_and_clear_cpu_idle(cpu);
 	if (has_cleared_idle)
@@ -1463,6 +1620,20 @@ void BPF_STRUCT_OPS(p2dq_stopping, struct task_struct *p, bool runnable)
 
 	if (!runnable) {
 		used = now - taskc->last_run_started;
+
+		// Update survival statistics for adaptive timeslice calculation
+		// Only update when using survival or adaptive methods to avoid overhead
+		if (timeline_config.timeslice_method == TIMESLICE_SURVIVAL ||
+		    timeline_config.timeslice_method == TIMESLICE_ADAPTIVE) {
+			__sync_fetch_and_add(&llcx->survival_stats.count, 1);
+			__sync_fetch_and_add(&llcx->survival_stats.sum, used);
+			__sync_fetch_and_add(&llcx->survival_stats.sum_sq, used * used);
+
+			trace("SURVIVAL LLC[%u] count=%llu mean_approx=%llu used=%llu",
+			      llcx->id, llcx->survival_stats.count,
+			      llcx->survival_stats.sum / max(llcx->survival_stats.count, 1ULL),
+			      used);
+		}
 
 		// Affinitized tasks need stricter thresholds to prevent monopolization
 		bool is_affinitized = !task_ctx_test_flag(taskc, TASK_CTX_F_ALL_CPUS);
@@ -1965,6 +2136,26 @@ void BPF_STRUCT_OPS(p2dq_update_idle, s32 cpu, bool idle)
 			llc_ctx_set_flag(llcx, LLC_CTX_F_SATURATED);
 	}
 
+	// Update adaptive method selection based on system utilization
+	// Only calculate when adaptive mode is enabled to avoid overhead
+	if (timeline_config.timeslice_method == TIMESLICE_ADAPTIVE) {
+		u64 nr_idle, nr_total, busy_cpus, utilization_pct;
+
+		nr_idle = bpf_cpumask_weight(idle_cpumask);
+		nr_total = llcx->nr_cpus;
+		busy_cpus = (nr_total > nr_idle) ? (nr_total - nr_idle) : 0;
+		utilization_pct = (busy_cpus * 100) / max(nr_total, 1ULL);
+
+		// Select method based on utilization thresholds
+		if (utilization_pct < 30) {
+			llcx->adaptive_method = TIMESLICE_DEFAULT;
+		} else if (utilization_pct < 75) {
+			llcx->adaptive_method = TIMESLICE_DEADLINE;
+		} else {
+			llcx->adaptive_method = TIMESLICE_SURVIVAL;
+		}
+	}
+
 	scx_bpf_put_cpumask(idle_cpumask);
 
 	if (!p2dq_config.cpu_priority)
@@ -2094,6 +2285,14 @@ static int init_llc(u32 llc_index)
 	llcx->index = llc_index;
 	llcx->nr_cpus = 0;
 	llcx->vtime = 0;
+
+	// Initialize survival statistics for adaptive timeslice calculation
+	llcx->survival_stats.count = 0;
+	llcx->survival_stats.sum = 0;
+	llcx->survival_stats.sum_sq = 0;
+
+	// Initialize adaptive method to DEFAULT (will be updated on first idle change)
+	llcx->adaptive_method = TIMESLICE_DEFAULT;
 
 	ret = llc_create_atqs(llcx);
 	if (ret) {

@@ -86,4 +86,11 @@ enum scheduler_mode {
 	MODE_EFFICIENCY,
 };
 
+enum timeslice_method {
+	TIMESLICE_DEFAULT,
+	TIMESLICE_DEADLINE,
+	TIMESLICE_SURVIVAL,
+	TIMESLICE_ADAPTIVE,
+};
+
 #endif /* __P2DQ_INTF_H */

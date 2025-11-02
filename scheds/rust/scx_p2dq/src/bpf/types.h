@@ -97,12 +97,23 @@ struct llc_ctx {
 	u64				affn_load;
 	u64				intr_load;
 	u32				state_flags;  /* Bitmask for saturated and other state */
+	u32				adaptive_method;  /* Cached method for adaptive mode */
+
+	/*
+	 * Survival analysis statistics (running statistics)
+	 * Used for adaptive timeslice calculation based on observed task completion
+	 */
+	struct {
+		u64 count;          /* Number of samples */
+		u64 sum;            /* Sum of timeslice usage (for mean) */
+		u64 sum_sq;         /* Sum of squares (for variance) */
+	} survival_stats;
 
 	/*
 	 * Hot atomic field #3: idle lock - frequently contended in idle CPU selection
 	 * Separate cache line from load counters above
 	 */
-	char				__pad3[CACHE_LINE_SIZE - 3*sizeof(u64) - sizeof(u32)];
+	char				__pad3[CACHE_LINE_SIZE - 3*sizeof(u64) - 2*sizeof(u32) - 3*sizeof(u64)];
 	arena_spinlock_t		idle_lock;
 
 	/*

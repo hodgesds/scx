@@ -59,6 +59,7 @@ use bpf_intf::stat_idx_P2DQ_STAT_WAKE_PREV;
 use scx_p2dq::bpf_intf;
 use scx_p2dq::bpf_skel::*;
 use scx_p2dq::SchedulerOpts;
+use scx_p2dq::TimesliceMethod;
 use scx_p2dq::TOPO;
 
 const SCHEDULER_NAME: &str = "scx_p2dq";
