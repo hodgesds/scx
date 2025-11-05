@@ -115,6 +115,86 @@ bool scx_bitmap_test_and_clear_cpu(u32 cpu, scx_bitmap_t __arg_arena mask)
 }
 
 __weak
+bool scx_bitmap_test_and_set_cpu(u32 cpu, scx_bitmap_t __arg_arena mask)
+{
+	u64 bit = 1ULL << (cpu % 64);
+	u32 idx = cpu / 64;
+	u64 actual;
+
+	do {
+		u64 old = mask->bits[idx];
+
+		if (old & bit)
+			return true;
+
+		u64 new = old | bit;
+		actual = cmpxchg(&mask->bits[idx], old, new);
+
+		if (actual == old)
+			return false;
+
+	} while (can_loop);
+
+	return true;
+}
+
+__weak
+int scx_bitmap_atomic_set_cpu(u32 cpu, scx_bitmap_t __arg_arena mask)
+{
+	u64 bit = 1ULL << (cpu % 64);
+	u32 idx = cpu / 64;
+	u64 actual;
+	bool was_set = false;
+
+	do {
+		u64 old = mask->bits[idx];
+
+		if (old & bit) {
+			was_set = true;
+			break;
+		}
+
+		u64 new = old | bit;
+		actual = cmpxchg(&mask->bits[idx], old, new);
+
+		if (actual == old)
+			break;  // Successfully set the bit
+
+	} while (can_loop);
+
+	// Return 0 if bit was already set, -1 if we set it
+	return was_set ? 0 : -1;
+}
+
+__weak
+int scx_bitmap_atomic_clear_cpu(u32 cpu, scx_bitmap_t __arg_arena mask)
+{
+	u64 bit = 1ULL << (cpu % 64);
+	u32 idx = cpu / 64;
+	u64 actual;
+	bool was_clear = false;
+
+	do {
+		u64 old = mask->bits[idx];
+
+		if (!(old & bit)) {
+			was_clear = true;
+			break;
+		}
+
+		u64 new = old & ~bit;
+		actual = cmpxchg(&mask->bits[idx], old, new);
+
+		if (actual == old)
+			break;  // Successfully cleared the bit
+
+	} while (can_loop);
+
+	// Return 0 if bit was set (and we cleared it), -1 if already clear
+	return was_clear ? -1 : 0;
+}
+
+__weak
 int scx_bitmap_clear(scx_bitmap_t __arg_arena mask)
 {
 	int i;
@@ -178,13 +258,26 @@ int scx_bitmap_copy(scx_bitmap_t __arg_arena dst, scx_bitmap_t __arg_arena src)
 __weak int
 scx_bitmap_from_bpf(scx_bitmap_t __arg_arena scx_bitmap, const cpumask_t *bpfmask __arg_trusted)
 {
-	int i;
+	/* The verifier doesn't allow variable offsets on trusted pointers like cpumask.
+	 * We need to unroll the loop with constant offsets. Since cpumask can have up to
+	 * sizeof(cpumask_t) / 8 u64 elements, and most systems have <= 8 u64s (512 CPUs),
+	 * we unroll for the common case and handle additional elements separately if needed.
+	 */
+#define COPY_WORD(idx) \
+	if (idx < mask_size && idx < sizeof(cpumask_t) / 8) \
+		scx_bitmap->bits[idx] = bpfmask->bits[idx]
 
-	for (i = 0; i < sizeof(cpumask_t) / 8 && can_loop; i++) {
-		if (i >= mask_size)
-			break;
-		scx_bitmap->bits[i] = bpfmask->bits[i];
-	}
+	/* Unroll for up to 8 u64 words (512 CPUs) which covers most systems */
+	COPY_WORD(0);
+	COPY_WORD(1);
+	COPY_WORD(2);
+	COPY_WORD(3);
+	COPY_WORD(4);
+	COPY_WORD(5);
+	COPY_WORD(6);
+	COPY_WORD(7);
+
+#undef COPY_WORD
 
 	return 0;
 }
