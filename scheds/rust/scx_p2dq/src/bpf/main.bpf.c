@@ -241,9 +241,66 @@ static __always_inline u32 wrap_index(u32 index, u32 min, u32 max)
 	return min + (index % range);
 }
 
-static __always_inline s32 __pick_idle_cpu(scx_bitmap_t mask, int flags)
+/*
+ * Native arena bitmap CPU picker - works directly on arena bitmaps.
+ * Optimized with efficient bit-scanning to minimize latency.
+ * This operates purely on the provided mask without kernel idle checks.
+ * The mask should already be filtered (e.g., LLC's idle_cpumask).
+ *
+ * Returns the first CPU found in the mask, or -1 if none found.
+ */
+__noinline static s32 __pick_idle_cpu(scx_bitmap_t mask, int flags)
 {
-	return scx_bitmap_pick_idle_cpu(mask, flags);
+	u64 word;
+	s32 cpu, bit, sibling;
+	u32 i, max_words;
+
+	if (unlikely(!mask))
+		return -1;
+
+	// Fast path for PICK_IDLE_CORE when SMT is disabled
+	if ((flags & SCX_PICK_IDLE_CORE) && !topo_config.smt_enabled)
+		flags = 0;
+
+	// Calculate max words once - this is faster than checking i*64 >= nr_cpus in the loop
+	// On large systems (316 CPUs), this avoids per-iteration overhead
+	max_words = (topo_config.nr_cpus + 63) >> 6;  // Faster than division
+	if (max_words > SCXMASK_NLONG)
+		max_words = SCXMASK_NLONG;
+
+	// Scan through bitmap words to find first idle CPU
+	bpf_for(i, 0, max_words) {
+		word = mask->bits[i];
+		if (!word)
+			continue;
+
+		bit = __builtin_ffsll(word);
+		if (unlikely(bit <= 0 || bit > 64))
+			continue;
+		bit -= 1;
+
+		cpu = i * 64 + bit;
+
+		// Bounds check: ensure CPU is valid
+		// This is critical on large systems where bitmap may have trailing bits set
+		if (unlikely(cpu < 0 || cpu >= topo_config.nr_cpus))
+			continue;  // Try next bit in next word instead of failing
+
+		// For PICK_IDLE_CORE flag, verify sibling is also idle
+		if (flags & SCX_PICK_IDLE_CORE) {
+			sibling = cpu_core_ids[cpu];
+			if (sibling == cpu || sibling < 0 || sibling >= topo_config.nr_cpus)
+				return cpu;
+			if (scx_bitmap_test_cpu(sibling, mask))
+				return cpu;
+			// Sibling not idle, continue to next word
+			continue;
+		}
+
+		return cpu;
+	}
+
+	return -1;
 }
 
 /*
@@ -261,83 +318,91 @@ static __always_inline s32 pick_and_claim_idle_cpu(scx_bitmap_t mask, int flags)
 }
 
 /*
- * Atomically test and claim a CPU from the LLC's idle mask.
- * Uses scx_bitmap_test_and_clear_cpu for lock-free atomic claiming.
- * Returns true if CPU was idle and successfully claimed, false otherwise.
+ * Helper: Clear a CPU from arena idle masks (arena tracking mode).
+ * When arena_idle_tracking is enabled, the arena masks ARE the source of truth.
+ * Keeps idle_cpumask and idle_smtmask synchronized (lock-free, slightly racy).
  */
-static __always_inline bool llc_idle_cpu_test_and_claim(struct llc_ctx __arena *llcx, s32 cpu)
+static __always_inline void llc_clear_idle_cpu(struct llc_ctx __arena *llcx, s32 cpu)
 {
-	if (!llcx || !llcx->idle_cpumask)
-		return false;
+	if (!llcx)
+		return;
 
-	return scx_bitmap_test_and_clear_cpu(cpu, llcx->idle_cpumask);
+	// Clear from idle_cpumask
+	if (llcx->idle_cpumask)
+		scx_bitmap_atomic_clear_cpu(cpu, llcx->idle_cpumask);
+
+	// Clear both CPU and sibling from smtmask (core no longer fully idle)
+	if (topo_config.smt_enabled && llcx->idle_smtmask) {
+		scx_bitmap_atomic_clear_cpu(cpu, llcx->idle_smtmask);
+
+		s32 sibling = cpu_core_ids[cpu];
+		if (sibling != cpu && sibling >= 0 && sibling < topo_config.nr_cpus) {
+			scx_bitmap_atomic_clear_cpu(sibling, llcx->idle_smtmask);
+		}
+	}
 }
 
 /*
- * Atomically test and claim a CPU from the LLC's idle SMT mask.
- * Uses scx_bitmap_test_and_clear_cpu for lock-free atomic claiming.
- * Returns true if CPU was idle and successfully claimed, false otherwise.
+ * Helper: Set a CPU in arena idle masks.
+ * Keeps idle_cpumask and idle_smtmask synchronized (lock-free, slightly racy).
+ * Used by update_idle() callback to mark CPUs as idle.
+ *
+ * idle_smtmask should only contain CPUs where BOTH the CPU and sibling are idle.
  */
-static __always_inline bool llc_idle_smt_test_and_claim(struct llc_ctx __arena *llcx, s32 cpu)
+static __always_inline void llc_set_idle_cpu(struct llc_ctx __arena *llcx, s32 cpu)
 {
-	if (!llcx || !llcx->idle_smtmask)
-		return false;
+	if (!llcx)
+		return;
 
-	return scx_bitmap_test_and_clear_cpu(cpu, llcx->idle_smtmask);
+	// Always set in idle_cpumask
+	if (llcx->idle_cpumask)
+		scx_bitmap_atomic_set_cpu(cpu, llcx->idle_cpumask);
+
+	// Only set in idle_smtmask if sibling is also idle
+	if (topo_config.smt_enabled && llcx->idle_smtmask) {
+		s32 sibling = cpu_core_ids[cpu];
+		if (sibling != cpu && sibling >= 0 && sibling < topo_config.nr_cpus) {
+			// Check if sibling is idle in the arena mask
+			if (scx_bitmap_test_cpu(sibling, llcx->idle_cpumask)) {
+				// Both CPU and sibling are idle - set both in smtmask
+				scx_bitmap_atomic_set_cpu(cpu, llcx->idle_smtmask);
+				scx_bitmap_atomic_set_cpu(sibling, llcx->idle_smtmask);
+			}
+		}
+	}
 }
 
 /*
- * Pick an idle CPU from the LLC's idle mask with lock-free atomic claiming.
- *
- * Two strategies:
- * 1. With cpu_priority: Pop from priority-ordered heap (natural distribution)
- * 2. Without: Simple pick once and claim atomically (fastest, 3% better than kernel)
- *
- * Returns the CPU number if successfully claimed, -1 if no idle CPU found.
+ * Fast path CPU picker - bypasses heap entirely for hot path optimization.
+ * Use this in the wakeup hot path when cpu_priority is not needed.
+ * Always uses simple pick strategy regardless of cpu_priority setting.
  */
-static __always_inline s32 llc_pick_idle_cpu(struct llc_ctx __arena *llcx, int flags)
+static __always_inline s32 llc_pick_idle_cpu_fast(struct llc_ctx __arena *llcx, int flags)
 {
 	s32 cpu;
 
 	if (!llcx || !llcx->idle_cpumask)
 		return -1;
 
-	/* Strategy 1: Heap-based selection for cpu_priority (if enabled by user) */
-	if (p2dq_config.cpu_priority && llcx->idle_cpu_heap) {
-		struct scx_minheap_elem helem;
-		int ret;
-
-		/* Pop from heap - O(log n) with spinlock, but gives unique CPU per caller */
-		if ((ret = arena_spin_lock((void __arena *)&llcx->idle_lock)))
-			goto fallback_pick;
-		ret = scx_minheap_pop(llcx->idle_cpu_heap, &helem);
-		arena_spin_unlock((void __arena *)&llcx->idle_lock);
-
-		if (ret == 0) {
-			cpu = (s32)helem.elem;
-			/* Verify it's still idle in arena mask and claim it */
-			if (cpu >= 0 && scx_bitmap_test_and_clear_cpu(cpu, llcx->idle_cpumask))
-				return cpu;
-		}
-		/* Heap empty or CPU already claimed - fall through to normal pick */
-	}
-
-fallback_pick:
-	/* Strategy 2: Simple pick without retry - fast failure is best (3% better than kernel) */
 	cpu = __pick_idle_cpu(llcx->idle_cpumask, flags);
 	if (cpu >= 0) {
-		// Try to atomically claim this CPU
-		if (scx_bitmap_test_and_clear_cpu(cpu, llcx->idle_cpumask))
-			return cpu;  // Successfully claimed!
+		// Arena mask is the source of truth - test and clear it
+		if (scx_bitmap_test_and_clear_cpu(cpu, llcx->idle_cpumask)) {
+			// Keep idle_smtmask in sync
+			if (topo_config.smt_enabled && llcx->idle_smtmask)
+				scx_bitmap_atomic_clear_cpu(cpu, llcx->idle_smtmask);
+			// Notify kernel
+			scx_bpf_test_and_clear_cpu_idle(cpu);
+			return cpu;
+		}
 	}
 
-	return -1;  // No idle CPUs or failed to claim
+	return -1;
 }
 
 /*
- * Pick an idle SMT CPU from the LLC's idle SMT mask with lock-free atomic claiming.
- * Uses atomic test-and-clear for lock-free claiming. Convergence is acceptable
- * because failed atomic operations return quickly.
+ * Pick an idle SMT CPU from the LLC's idle SMT mask with lock-free atomic claiming (arena tracking mode).
+ * When arena_idle_tracking is enabled, the arena mask IS the source of truth.
  * Returns the CPU number if successfully claimed, -1 if no idle CPU found or claim failed.
  */
 static __always_inline s32 llc_pick_idle_smt(struct llc_ctx __arena *llcx)
@@ -349,14 +414,18 @@ static __always_inline s32 llc_pick_idle_smt(struct llc_ctx __arena *llcx)
 
 	cpu = __pick_idle_cpu(llcx->idle_smtmask, 0);
 	if (cpu >= 0) {
-		// Atomically claim the CPU by clearing it from idle SMT mask
-		if (!scx_bitmap_test_and_clear_cpu(cpu, llcx->idle_smtmask)) {
-			// CPU was already claimed by another thread, fail fast
-			return -1;
+		// Arena SMT mask is the source of truth - test and clear it
+		if (scx_bitmap_test_and_clear_cpu(cpu, llcx->idle_smtmask)) {
+			// Keep idle_cpumask in sync
+			if (llcx->idle_cpumask)
+				scx_bitmap_atomic_clear_cpu(cpu, llcx->idle_cpumask);
+			// Notify kernel
+			scx_bpf_test_and_clear_cpu_idle(cpu);
+			return cpu;
 		}
 	}
 
-	return cpu;
+	return -1;
 }
 
 /* For arena-backed structures (LLC contexts) */
@@ -797,45 +866,45 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 	const struct cpumask *idle_smtmask = NULL, *idle_cpumask = NULL;
 	struct llc_ctx __arena *llcx;
 	s32 cpu = prev_cpu;
-	/*
-	 * Note: cpu_priority heap-based selection is handled automatically
-	 * by llc_pick_idle_cpu() when p2dq_config.cpu_priority is enabled
-	 */
 	bool migratable = false;
-	bool use_cached = false;
+	bool use_arena = false;
 
 	if (p2dq_config.interactive_sticky && task_ctx_test_flag(taskc, TASK_CTX_F_INTERACTIVE)) {
 		*is_idle = scx_bpf_test_and_clear_cpu_idle(prev_cpu);
-		goto found_cpu;
+		return cpu;
 	}
 
-	// Try to use arena idle masks from LLC context (hot path optimization)
-	// Arena masks are updated in update_idle() - no kernel helper needed
-	llcx = lookup_llc_ctx(taskc->llc_id);
+	// CRITICAL FAST PATH: Check prev_cpu BEFORE expensive LLC lookup
+	// This is the most common case - task waking on same CPU
+	if (p2dq_config.arena_idle_tracking) {
+		// Arena path: need LLC context for masks, but check kernel idle first
+		llcx = lookup_llc_ctx(taskc->llc_id);
+		if (llcx && llcx->idle_cpumask && llcx->idle_smtmask) {
+			use_arena = true;
+			scx_bitmap_t mask = (topo_config.smt_enabled &&
+					     !task_ctx_test_flag(taskc, TASK_CTX_F_INTERACTIVE)) ?
+					    llcx->idle_smtmask : llcx->idle_cpumask;
 
-	if (p2dq_config.arena_idle_tracking && llcx && llcx->idle_cpumask && llcx->idle_smtmask) {
-		use_cached = true;
+			// Fast inline check: test arena mask + claim kernel state
+			if (likely(scx_bitmap_test_cpu(prev_cpu, mask) &&
+				   scx_bpf_test_and_clear_cpu_idle(prev_cpu))) {
+				// Sync arena masks after successful claim
+				scx_bitmap_atomic_clear_cpu(prev_cpu, llcx->idle_cpumask);
+				if (topo_config.smt_enabled && llcx->idle_smtmask)
+					scx_bitmap_atomic_clear_cpu(prev_cpu, llcx->idle_smtmask);
+				*is_idle = true;
+				return cpu;
+			}
+		}
 	} else {
-		// Fallback to kernel fetch if arena tracking disabled or not available
+		// Kernel path: get idle masks first, THEN check prev_cpu
 		idle_cpumask = scx_bpf_get_idle_cpumask();
 		idle_smtmask = scx_bpf_get_idle_smtmask();
 
 		if (!idle_cpumask || !idle_smtmask)
 			goto found_cpu;
-	}
 
-	// First check if last CPU is idle (common case - CPU cache warm)
-	if (use_cached) {
-		// Use arena masks with atomic test-and-claim
-		bool claimed = (topo_config.smt_enabled && !task_ctx_test_flag(taskc, TASK_CTX_F_INTERACTIVE)) ?
-			       llc_idle_smt_test_and_claim(llcx, prev_cpu) :
-			       llc_idle_cpu_test_and_claim(llcx, prev_cpu);
-		if (likely(claimed)) {
-			*is_idle = true;
-			goto found_cpu;
-		}
-	} else {
-		// Use kernel masks - requires test_and_clear for atomicity
+		// First check if last CPU is idle (common case - CPU cache warm)
 		if (likely(bpf_cpumask_test_cpu(prev_cpu,
 					 (topo_config.smt_enabled && !task_ctx_test_flag(taskc, TASK_CTX_F_INTERACTIVE)) ?
 					 idle_smtmask : idle_cpumask) &&
@@ -843,22 +912,36 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 			*is_idle = true;
 			goto found_cpu;
 		}
+
+		llcx = lookup_llc_ctx(taskc->llc_id);
 	}
 
-	if (!llcx || !llcx->cpumask)
+	if (!use_arena && !llcx)
+		llcx = lookup_llc_ctx(taskc->llc_id);
+
+	if (!llcx || !llcx->cpumask) {
+		if (use_arena)
+			return cpu;
 		goto found_cpu;
+	}
 
 	migratable = can_migrate(taskc, llcx);
 	if (topo_config.nr_llcs > 1 &&
 	    (llc_ctx_test_flag(llcx, LLC_CTX_F_SATURATED) || saturated || overloaded) &&
 	    !migratable) {
 		cpu = prev_cpu;
+		if (use_arena)
+			return cpu;
 		goto found_cpu;
 	}
 
-	if (!valid_dsq(taskc->dsq_id))
-		if (!(llcx = rand_llc_ctx()))
+	if (!valid_dsq(taskc->dsq_id)) {
+		if (!(llcx = rand_llc_ctx())) {
+			if (use_arena)
+				return cpu;
 			goto found_cpu;
+		}
+	}
 
 	/*
 	 * If the current task is waking up another task and releasing the CPU
@@ -1013,14 +1096,14 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 	}
 
 	// Next try in the local LLC (usually succeeds)
-	if (use_cached) {
-		// Arena masks - trust them with proper locking, no kernel calls
+	if (use_arena) {
+		// ARENA PATH: Use fast picker (bypasses heap check)
 		if (likely((cpu = llc_pick_idle_smt(llcx)) >= 0)) {
 			*is_idle = true;
 			goto found_cpu;
 		}
 	} else {
-		// Kernel masks - need test_and_clear for atomicity
+		// KERNEL PATH: Use kernel masks
 		if (likely(llcx->cpumask &&
 		    (cpu = pick_and_claim_idle_cpu(llcx->cpumask, SCX_PICK_IDLE_CORE)) >= 0)) {
 			*is_idle = true;
@@ -1029,14 +1112,14 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 	}
 
 	// Try an idle CPU in the llc (also likely to succeed)
-	if (use_cached) {
-		// Arena masks - trust them with proper locking, no kernel calls
-		if (likely((cpu = llc_pick_idle_cpu(llcx, 0)) >= 0)) {
+	if (use_arena) {
+		// ARENA PATH: Use fast picker (bypasses heap check)
+		if (likely((cpu = llc_pick_idle_cpu_fast(llcx, 0)) >= 0)) {
 			*is_idle = true;
 			goto found_cpu;
 		}
 	} else {
-		// Kernel masks - need test_and_clear for atomicity
+		// KERNEL PATH: Use kernel masks
 		if (likely(llcx->cpumask &&
 		    (cpu = pick_and_claim_idle_cpu(llcx->cpumask, 0)) >= 0)) {
 			*is_idle = true;
@@ -1081,8 +1164,8 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 	cpu = prev_cpu;
 
 found_cpu:
-	// Only release kernel cpumasks if we fetched them (not using cached)
-	if (!use_cached) {
+	// Release kernel cpumasks only if we fetched them
+	if (!use_arena) {
 		if (idle_cpumask)
 			scx_bpf_put_cpumask(idle_cpumask);
 		if (idle_smtmask)
@@ -1196,6 +1279,9 @@ static void async_p2dq_enqueue(struct enqueue_promise *ret,
 				scx_bpf_error("no valid CPU contexts");
 				return;
 			}
+			// Update cpu variable to match the fallback
+			cpu = 0;
+			ret->cpu = 0;
 		}
 
 		llcx = lookup_llc_ctx(cpuc->llc_id);
@@ -1217,7 +1303,11 @@ static void async_p2dq_enqueue(struct enqueue_promise *ret,
 		if (enqueue_promise_test_flag(ret, ENQUEUE_PROMISE_F_HAS_CLEARED_IDLE) ||
 		    cpu_ctx_test_flag(cpuc, CPU_CTX_F_NICE_TASK)) {
 			ret->kind = P2DQ_ENQUEUE_PROMISE_FIFO;
-			ret->fifo.dsq_id = SCX_DSQ_LOCAL_ON|cpu;
+			// Validate CPU before using for SCX_DSQ_LOCAL_ON, fallback to SCX_DSQ_LOCAL
+			if (unlikely(cpu < 0 || cpu >= topo_config.nr_cpus))
+				ret->fifo.dsq_id = SCX_DSQ_LOCAL;
+			else
+				ret->fifo.dsq_id = SCX_DSQ_LOCAL_ON|cpu;
 			ret->fifo.slice_ns = taskc->slice_ns;
 			ret->fifo.enq_flags = enq_flags;
 			if (enqueue_promise_test_flag(ret, ENQUEUE_PROMISE_F_HAS_CLEARED_IDLE))
@@ -1278,7 +1368,11 @@ static void async_p2dq_enqueue(struct enqueue_promise *ret,
 		if (enqueue_promise_test_flag(ret, ENQUEUE_PROMISE_F_HAS_CLEARED_IDLE) ||
 		    cpu_ctx_test_flag(cpuc, CPU_CTX_F_NICE_TASK)) {
 			ret->kind = P2DQ_ENQUEUE_PROMISE_FIFO;
-			ret->fifo.dsq_id = SCX_DSQ_LOCAL_ON|cpu;
+			// Validate CPU before using for SCX_DSQ_LOCAL_ON, fallback to SCX_DSQ_LOCAL
+			if (unlikely(cpu < 0 || cpu >= topo_config.nr_cpus))
+				ret->fifo.dsq_id = SCX_DSQ_LOCAL;
+			else
+				ret->fifo.dsq_id = SCX_DSQ_LOCAL_ON|cpu;
 			ret->fifo.slice_ns = taskc->slice_ns;
 			ret->fifo.enq_flags = enq_flags;
 			if (enqueue_promise_test_flag(ret, ENQUEUE_PROMISE_F_HAS_CLEARED_IDLE))
@@ -1337,6 +1431,7 @@ static void async_p2dq_enqueue(struct enqueue_promise *ret,
 		return;
 	}
 	ret->cpu = cpuc->id;
+	cpu = cpuc->id;  // Update cpu to match cpuc after potential fallback
 
 	if (cpu_ctx_test_flag(cpuc, CPU_CTX_F_NICE_TASK))
 		enq_flags |= SCX_ENQ_PREEMPT;
@@ -1354,7 +1449,11 @@ static void async_p2dq_enqueue(struct enqueue_promise *ret,
 	if (enqueue_promise_test_flag(ret, ENQUEUE_PROMISE_F_HAS_CLEARED_IDLE) ||
 	    cpu_ctx_test_flag(cpuc, CPU_CTX_F_NICE_TASK)) {
 		ret->kind = P2DQ_ENQUEUE_PROMISE_FIFO;
-		ret->fifo.dsq_id = SCX_DSQ_LOCAL_ON|cpu;
+		// Validate CPU before using for SCX_DSQ_LOCAL_ON, fallback to SCX_DSQ_LOCAL
+		if (unlikely(cpu < 0 || cpu >= topo_config.nr_cpus))
+			ret->fifo.dsq_id = SCX_DSQ_LOCAL;
+		else
+			ret->fifo.dsq_id = SCX_DSQ_LOCAL_ON|cpu;
 		ret->fifo.slice_ns = taskc->slice_ns;
 		ret->fifo.enq_flags = enq_flags;
 		if (enqueue_promise_test_flag(ret, ENQUEUE_PROMISE_F_HAS_CLEARED_IDLE))
@@ -2049,31 +2148,15 @@ void BPF_STRUCT_OPS(p2dq_update_idle, s32 cpu, bool idle)
 	}
 
 	/*
-	 * Update LLC's arena idle masks for hot path optimization.
-	 * This eliminates kernel helper calls in pick_idle_cpu().
-	 * The masks are updated on every update_idle() call to maintain accuracy.
-	 * Using spinlock to ensure memory barriers for cross-CPU visibility.
-	 */
-	/*
-	 * Update arena idle masks atomically for this CPU only.
-	 * Hot path uses atomic test_and_clear to claim CPUs, so we must use
-	 * atomic set/clear here to avoid races. No spinlock needed - atomics provide
-	 * the necessary synchronization via __sync_fetch_and_or/__sync_fetch_and_and.
+	 * Update LLC's arena idle masks when arena tracking is enabled.
+	 * Arena masks ARE the source of truth - kernel is just notified.
+	 * Use helpers to keep idle_cpumask and idle_smtmask synchronized.
 	 */
 	if (p2dq_config.arena_idle_tracking) {
-		if (idle) {
-			// CPU going idle - atomically set bits in arena masks
-			if (llcx->idle_cpumask)
-				scx_bitmap_atomic_set_cpu(cpu, llcx->idle_cpumask);
-			if (topo_config.smt_enabled && llcx->idle_smtmask)
-				scx_bitmap_atomic_set_cpu(cpu, llcx->idle_smtmask);
-		} else {
-			// CPU going busy - atomically clear bits in arena masks
-			if (llcx->idle_cpumask)
-				scx_bitmap_atomic_clear_cpu(cpu, llcx->idle_cpumask);
-			if (topo_config.smt_enabled && llcx->idle_smtmask)
-				scx_bitmap_atomic_clear_cpu(cpu, llcx->idle_smtmask);
-		}
+		if (idle)
+			llc_set_idle_cpu(llcx, cpu);
+		else
+			llc_clear_idle_cpu(llcx, cpu);
 	}
 
 	scx_bpf_put_cpumask(idle_cpumask);

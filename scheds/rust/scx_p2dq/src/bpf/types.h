@@ -71,68 +71,63 @@ struct cpu_ctx {
 #define llc_ctx_test_flag(llcx, flag)	((llcx)->state_flags & (flag))
 
 struct llc_ctx {
-	/* Read-mostly fields - grouped together */
+	/*
+	 * CACHE LINE 0: Read-mostly metadata (accessed during initialization and lookups)
+	 * These fields are read frequently but rarely written
+	 */
 	u32				id;
 	u32				nr_cpus;
 	u32				node_id;
 	u32				lb_llc_id;
 	u32				index;
+	u32				nr_shards;
 	u64				dsq;
 	u64				mig_dsq;
 	u64				last_period_ns;
-	u64				dsq_load[MAX_DSQS_PER_LLC];
-
-	/* CPU sharding related fields */
-	u32				nr_shards;
-	u64				shard_dsqs[MAX_LLC_SHARDS];
 
 	/*
-	 * Hot atomic field #1: vtime - frequently updated in p2dq_stopping()
-	 * Padded to separate cache line from read-mostly fields above
+	 * CACHE LINE 1: Hot atomic counters (updated in p2dq_stopping - very hot!)
+	 * Keep vtime and load counters together since they're updated atomically in the same path
+	 * This minimizes cache line bouncing across CPUs
 	 */
 	char				__pad1[CACHE_LINE_SIZE];
 	u64				vtime;
-
-	/*
-	 * Hot atomic fields #2: load counters - frequently updated in p2dq_stopping()
-	 * Keep these together on same cache line since they're updated atomically together
-	 * Pad to separate from vtime above
-	 */
-	char				__pad2[CACHE_LINE_SIZE - sizeof(u64)];
 	u64				load;
 	u64				affn_load;
 	u64				intr_load;
 	u32				state_flags;  /* Bitmask for saturated and other state */
 
 	/*
-	 * Hot atomic field #3: idle lock - frequently contended in idle CPU selection
-	 * Separate cache line from load counters above
+	 * CACHE LINE 2: Hot idle tracking bitmaps (HOT PATH!)
+	 * These are the most critical fields for wakeup latency
+	 * Accessed together in pick_idle_cpu() hot path - keep on same cache line
+	 * Updated atomically (lock-free) in update_idle() callback
 	 */
-	char				__pad3[CACHE_LINE_SIZE - 3*sizeof(u64) - sizeof(u32)];
-	arena_spinlock_t		idle_lock;
+	char				__pad2[CACHE_LINE_SIZE - 4*sizeof(u64) - sizeof(u32)];
+	scx_bitmap_t			idle_cpumask;    /* Idle CPUs in this LLC */
+	scx_bitmap_t			idle_smtmask;    /* Idle SMT cores in this LLC */
 
 	/*
-	 * Read-mostly pointers - grouped together
-	 * Accessed during CPU selection but not updated frequently
+	 * CACHE LINE 3: CPU priority heap and lock (only used when cpu_priority enabled)
+	 * Separate from hot idle masks to avoid false sharing
+	 * Most deployments don't use cpu_priority, so this is cold
 	 */
-	char				__pad4[CACHE_LINE_SIZE - sizeof(arena_spinlock_t)];
+	char				__pad3[CACHE_LINE_SIZE - 2*sizeof(scx_bitmap_t)];
+	arena_spinlock_t		idle_lock;       /* Protects idle_cpu_heap operations */
+	scx_minheap_t			*idle_cpu_heap;  /* Priority-ordered idle CPUs (optional) */
+
+	/*
+	 * CACHE LINE 4+: Read-mostly pointers and masks
+	 * Accessed during CPU selection but not in the absolute hottest path
+	 */
+	char				__pad4[CACHE_LINE_SIZE - sizeof(arena_spinlock_t) - sizeof(scx_minheap_t*)];
 	scx_bitmap_t			cpumask;
 	scx_bitmap_t			big_cpumask;
 	scx_bitmap_t			little_cpumask;
 	scx_bitmap_t			node_cpumask;
-	scx_bitmap_t			tmp_cpumask;
-
-	/*
-	 * Arena idle tracking for hot path optimization
-	 * These masks are updated in update_idle() and read in pick_idle_cpu()
-	 * Protected by idle_mask_lock for memory ordering across CPUs
-	 */
-	arena_spinlock_t		idle_mask_lock;  /* Protects idle mask updates/reads */
-	scx_bitmap_t			idle_cpumask;    /* Idle CPUs in this LLC */
-	scx_bitmap_t			idle_smtmask;    /* Idle SMT cores in this LLC */
+	scx_bitmap_t			tmp_cpumask;     /* Scratch space for intersections */
 
 	scx_atq_t			*mig_atq;
-	scx_minheap_t			*idle_cpu_heap;
 	u64				dsq_load[MAX_DSQS_PER_LLC];
 	u64				shard_dsqs[MAX_LLC_SHARDS];
 };
@@ -154,20 +149,29 @@ struct node_ctx {
 #define task_ctx_clear_flag(taskc, flag)	((taskc)->flags &= ~(flag))
 #define task_ctx_test_flag(taskc, flag)		((taskc)->flags & (flag))
 
+/*
+ * Task context - optimized for cache efficiency
+ * Most-accessed fields grouped at the beginning for better cache utilization
+ */
 struct task_p2dq {
-	u64			dsq_id;
-	u64			slice_ns;
-	int			dsq_index;
-	u32			llc_id;
-	u32			node_id;
-	u64			used;
-	u64			last_dsq_id;
-	u64 			last_run_started;
-	u64 			last_run_at;
-	u64			llc_runs; /* how many runs on the current LLC */
-	u64			enq_flags;
-	int			last_dsq_index;
-	u32			flags;  /* Bitmask for interactive, was_nice, is_kworker, all_cpus */
+	/* HOT FIELDS - Accessed on every enqueue/dequeue */
+	u64			dsq_id;          /* Current DSQ assignment */
+	u64			slice_ns;        /* Current time slice */
+	u32			llc_id;          /* Current LLC affinity */
+	int			dsq_index;       /* DSQ priority index (0=interactive) */
+	u32			flags;           /* Bitmask: interactive, was_nice, is_kworker, all_cpus */
+	u32			node_id;         /* Current NUMA node */
+
+	/* MEDIUM HOT - Accessed in stopping/running callbacks */
+	u64 			last_run_at;     /* Timestamp of last execution */
+	u64 			last_run_started;/* When current run started */
+	u64			llc_runs;        /* Runs remaining on current LLC before migration eligible */
+
+	/* COOLER - Only accessed during DSQ transitions */
+	u64			last_dsq_id;     /* Previous DSQ for debugging */
+	int			last_dsq_index;  /* Previous DSQ index */
+	u64			enq_flags;       /* Enqueue flags (for ATQ path) */
+	u64			used;            /* Time used in last run (temporary) */
 };
 
 typedef struct task_p2dq __arena task_ctx;
