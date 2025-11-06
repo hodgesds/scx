@@ -1234,11 +1234,9 @@ static void async_p2dq_enqueue(struct enqueue_promise *ret,
 	    (p->flags & PF_KTHREAD) &&
 	    p->nr_cpus_allowed == 1)) {
 		stat_inc(P2DQ_STAT_DIRECT);
-		u64 slice_ns = clamp_slice(scale_by_task_weight(p,
-					   min_dsq_time_slice()));
 		scx_bpf_dsq_insert(p,
 				   SCX_DSQ_LOCAL,
-				   slice_ns,
+				   max_dsq_time_slice(),
 				   enq_flags);
 		if (scx_bpf_test_and_clear_cpu_idle(cpu))
 			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
@@ -1300,14 +1298,11 @@ static void async_p2dq_enqueue(struct enqueue_promise *ret,
 			enq_flags |= SCX_ENQ_PREEMPT;
 
 		// Idle affinitized tasks can be direct dispatched.
-		if (enqueue_promise_test_flag(ret, ENQUEUE_PROMISE_F_HAS_CLEARED_IDLE) ||
-		    cpu_ctx_test_flag(cpuc, CPU_CTX_F_NICE_TASK)) {
+		if ((enqueue_promise_test_flag(ret, ENQUEUE_PROMISE_F_HAS_CLEARED_IDLE) ||
+		    cpu_ctx_test_flag(cpuc, CPU_CTX_F_NICE_TASK)) &&
+		    bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
 			ret->kind = P2DQ_ENQUEUE_PROMISE_FIFO;
-			// Validate CPU before using for SCX_DSQ_LOCAL_ON, fallback to SCX_DSQ_LOCAL
-			if (unlikely(cpu < 0 || cpu >= topo_config.nr_cpus))
-				ret->fifo.dsq_id = SCX_DSQ_LOCAL;
-			else
-				ret->fifo.dsq_id = SCX_DSQ_LOCAL_ON|cpu;
+			ret->fifo.dsq_id = SCX_DSQ_LOCAL;
 			ret->fifo.slice_ns = taskc->slice_ns;
 			ret->fifo.enq_flags = enq_flags;
 			if (enqueue_promise_test_flag(ret, ENQUEUE_PROMISE_F_HAS_CLEARED_IDLE))
@@ -1365,14 +1360,11 @@ static void async_p2dq_enqueue(struct enqueue_promise *ret,
 		if (cpu_ctx_test_flag(cpuc, CPU_CTX_F_NICE_TASK))
 			enq_flags |= SCX_ENQ_PREEMPT;
 
-		if (enqueue_promise_test_flag(ret, ENQUEUE_PROMISE_F_HAS_CLEARED_IDLE) ||
-		    cpu_ctx_test_flag(cpuc, CPU_CTX_F_NICE_TASK)) {
+		if ((enqueue_promise_test_flag(ret, ENQUEUE_PROMISE_F_HAS_CLEARED_IDLE) ||
+		     cpu_ctx_test_flag(cpuc, CPU_CTX_F_NICE_TASK)) &&
+		    bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
 			ret->kind = P2DQ_ENQUEUE_PROMISE_FIFO;
-			// Validate CPU before using for SCX_DSQ_LOCAL_ON, fallback to SCX_DSQ_LOCAL
-			if (unlikely(cpu < 0 || cpu >= topo_config.nr_cpus))
-				ret->fifo.dsq_id = SCX_DSQ_LOCAL;
-			else
-				ret->fifo.dsq_id = SCX_DSQ_LOCAL_ON|cpu;
+			ret->fifo.dsq_id = SCX_DSQ_LOCAL_ON|cpu;
 			ret->fifo.slice_ns = taskc->slice_ns;
 			ret->fifo.enq_flags = enq_flags;
 			if (enqueue_promise_test_flag(ret, ENQUEUE_PROMISE_F_HAS_CLEARED_IDLE))
@@ -1449,8 +1441,9 @@ static void async_p2dq_enqueue(struct enqueue_promise *ret,
 	if (enqueue_promise_test_flag(ret, ENQUEUE_PROMISE_F_HAS_CLEARED_IDLE) ||
 	    cpu_ctx_test_flag(cpuc, CPU_CTX_F_NICE_TASK)) {
 		ret->kind = P2DQ_ENQUEUE_PROMISE_FIFO;
-		// Validate CPU before using for SCX_DSQ_LOCAL_ON, fallback to SCX_DSQ_LOCAL
-		if (unlikely(cpu < 0 || cpu >= topo_config.nr_cpus))
+		// Validate CPU before using for SCX_DSQ_LOCAL_ON
+		if (unlikely(cpu < 0 || cpu >= topo_config.nr_cpus ||
+		    !bpf_cpumask_test_cpu(cpu, p->cpus_ptr)))
 			ret->fifo.dsq_id = SCX_DSQ_LOCAL;
 		else
 			ret->fifo.dsq_id = SCX_DSQ_LOCAL_ON|cpu;
@@ -1923,7 +1916,6 @@ static void p2dq_dispatch_impl(s32 cpu, struct task_struct *prev)
 				dsq_id = cpuc->affn_dsq;
 			}
 		}
-
 		// LLC DSQ
 		p = __COMPAT_scx_bpf_dsq_peek(cpuc->llc_dsq);
 		if (p) {
