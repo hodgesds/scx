@@ -1896,68 +1896,79 @@ static void p2dq_dispatch_impl(s32 cpu, struct task_struct *prev)
 
 	cpuc = lookup_cpu_ctx(cpu);
 	if (unlikely(!cpuc)) {
-		// CPU doesn't have topology, use CPU 0 as fallback
-		cpuc = lookup_cpu_ctx(0);
-		if (!cpuc) {
-			// No valid CPUs - this is a critical error
-			scx_bpf_error("no valid CPU contexts in dispatch");
-			return;
-		}
+		scx_bpf_error("no valid CPU contexts in dispatch");
+		return;
 	}
 
 	u64 min_vtime = 0;
 
-	if (!saturated) {
-		// First search affinitized DSQ
-		p = __COMPAT_scx_bpf_dsq_peek(cpuc->affn_dsq);
-		if (p) {
-			if (p->scx.dsq_vtime < min_vtime || min_vtime == 0) {
-				min_vtime = p->scx.dsq_vtime;
-				dsq_id = cpuc->affn_dsq;
+	// start with affn_dsq (local cpu dsq)
+	p = __COMPAT_scx_bpf_dsq_peek(cpuc->affn_dsq);
+	if (p) {
+		// Check if affinity changed - task might not be allowed here anymore
+		if (unlikely(!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))) {
+			// Affinity changed - move misplaced tasks to correct affn_dsq
+			bpf_for_each(scx_dsq, p, cpuc->affn_dsq, 0) {
+				if (bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
+					break;
+				s32 affn_cpu = bpf_cpumask_any_distribute(p->cpus_ptr);
+				if (affn_cpu < 0 || affn_cpu >= NR_CPUS) // verifier
+					continue;
+				affn_cpu &= (NR_CPUS - 1);
+
+				struct cpu_ctx __arena *affn_cpuc = lookup_cpu_ctx(affn_cpu);
+				if (affn_cpuc) {
+					__COMPAT_scx_bpf_dsq_move_vtime(BPF_FOR_EACH_ITER,
+									p,
+									affn_cpuc->affn_dsq,
+									0);
+					trace("DISPATCH cpu[%d] moved affn task %d to cpu[%d] affn_dsq (affinity changed)",
+					      cpu, p->pid, affn_cpu);
+				}
 			}
-		}
-		// LLC DSQ
-		p = __COMPAT_scx_bpf_dsq_peek(cpuc->llc_dsq);
-		if (p) {
-			if (p->scx.dsq_vtime < min_vtime || min_vtime == 0) {
-				min_vtime = p->scx.dsq_vtime;
-				dsq_id = cpuc->llc_dsq;
-			}
+			p = __COMPAT_scx_bpf_dsq_peek(cpuc->affn_dsq);
 		}
 
-		// Migration eligible
-		if (topo_config.nr_llcs > 1) {
-			if (p2dq_config.atq_enabled) {
-				pid = scx_atq_peek(cpuc->mig_atq);
-				if ((p = bpf_task_from_pid((s32)pid))) {
-					if (p->scx.dsq_vtime < min_vtime ||
-					    min_vtime == 0) {
-						min_vtime = p->scx.dsq_vtime;
-						min_atq = cpuc->mig_atq;
-						/*
-						 * Normally doing these peeks would be
-						 * racy with scx_bpf_dsq_move_to_local.
-						 * However, with ATQs we can peek and
-						 * pop so we can check that the popped
-						 * task is the same as the peeked task.
-						 * This gives slightly better
-						 * prioritization with the potential
-						 * cost of having to reenqueue popped
-						 * tasks.
-						 */
-						peeked_pid = p->pid;
-					}
-					bpf_task_release(p);
+		if (p && likely(bpf_cpumask_test_cpu(cpu, p->cpus_ptr))) {
+			min_vtime = p->scx.dsq_vtime;
+			dsq_id = cpuc->affn_dsq;
+		}
+	}
+
+	// LLC DSQ for vtime comparison
+	p = __COMPAT_scx_bpf_dsq_peek(cpuc->llc_dsq);
+	if (p && (p->scx.dsq_vtime < min_vtime || min_vtime == 0)) {
+		min_vtime = p->scx.dsq_vtime;
+		dsq_id = cpuc->llc_dsq;
+	}
+
+	// Migration eligible vtime
+	if (topo_config.nr_llcs > 1) {
+		if (p2dq_config.atq_enabled) {
+			pid = scx_atq_peek(cpuc->mig_atq);
+			if ((p = bpf_task_from_pid((s32)pid))) {
+				if (likely(bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) &&
+				    (p->scx.dsq_vtime < min_vtime || min_vtime == 0)) {
+					min_vtime = p->scx.dsq_vtime;
+					min_atq = cpuc->mig_atq;
+					/*
+					 * With ATQs we can peek and pop to check that
+					 * the popped task is the same as the peeked task.
+					 * This gives slightly better prioritization with
+					 * the potential cost of having to reenqueue
+					 * popped tasks if they don't match.
+					 */
+					peeked_pid = p->pid;
 				}
-			} else {
-				p = __COMPAT_scx_bpf_dsq_peek(cpuc->mig_dsq);
-				if (p) {
-					if (p->scx.dsq_vtime < min_vtime ||
-					    min_vtime == 0) {
-						min_vtime = p->scx.dsq_vtime;
-						dsq_id = cpuc->mig_dsq;
-					}
-				}
+				bpf_task_release(p);
+			}
+		} else {
+			// Peek migration DSQ - only consider tasks that can run here
+			p = __COMPAT_scx_bpf_dsq_peek(cpuc->mig_dsq);
+			if (p && likely(bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) &&
+			    (p->scx.dsq_vtime < min_vtime || min_vtime == 0)) {
+				min_vtime = p->scx.dsq_vtime;
+				dsq_id = cpuc->mig_dsq;
 			}
 		}
 	}
@@ -2008,11 +2019,6 @@ static void p2dq_dispatch_impl(s32 cpu, struct task_struct *prev)
 		if (likely(valid_dsq(dsq_id) && scx_bpf_dsq_move_to_local(dsq_id)))
 			return;
 	}
-
-	// Try affinitized DSQ (less common, affinitized tasks are a minority)
-	if (unlikely(dsq_id != cpuc->affn_dsq &&
-	    scx_bpf_dsq_move_to_local(cpuc->affn_dsq)))
-		return;
 
 	// Handle sharded LLC DSQs, try to dispatch from all shards if sharding
 	// is enabled (common on large systems)
