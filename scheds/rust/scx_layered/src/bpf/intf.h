@@ -153,6 +153,7 @@ enum layer_stat_id {
 	LSTAT_LLC_DRAIN_TRY,
 	LSTAT_LLC_DRAIN,
 	LSTAT_SKIP_REMOTE_NODE,
+	LSTAT_CACHE_HOT,
 	NR_LSTATS,
 };
 
@@ -380,6 +381,7 @@ struct layer {
 	bool			periodically_refresh;
 	u8			cpuset[MAX_CPUS_U8];
 	u64			member_expire_ms;
+	u64			cache_hot_ns;
 };
 
 struct scx_cmd {

@@ -608,6 +608,7 @@ struct task_ctx {
 	bool			cpus_node_aligned;
 	u64			runnable_at;
 	u64			running_at;
+	u64			stopped_at;
 	u64			runtime_avg;
 	u64			dsq_id;
 	u32			llc_id;
@@ -1589,6 +1590,24 @@ void BPF_STRUCT_OPS(layered_enqueue, struct task_struct *p, u64 enq_flags)
 	layer_id = taskc->layer_id;
 	if (!(layer = lookup_layer(layer_id)))
 		return;
+
+	/*
+	 * Cache hotness check: If the task stopped recently and cache_hot_ns
+	 * is configured, try to run it on the same CPU to preserve cache.
+	 */
+	if (layer->cache_hot_ns && taskc->stopped_at &&
+	    taskc->last_cpu >= 0 && taskc->last_cpu < nr_possible_cpus) {
+		u64 time_since_stopped = scx_bpf_now() - taskc->stopped_at;
+
+		if (time_since_stopped < layer->cache_hot_ns &&
+		    bpf_cpumask_test_cpu(taskc->last_cpu, p->cpus_ptr)) {
+			/* Enqueue directly to the last CPU's local DSQ */
+			taskc->dsq_id = SCX_DSQ_LOCAL_ON | taskc->last_cpu;
+			scx_bpf_dsq_insert(p, taskc->dsq_id, layer->slice_ns, enq_flags);
+			lstat_inc(LSTAT_CACHE_HOT, layer, cpuc);
+			return;
+		}
+	}
 
 	if (enq_flags & SCX_ENQ_REENQ) {
 		lstat_inc(LSTAT_ENQ_REENQ, layer, cpuc);
@@ -3157,6 +3176,9 @@ void BPF_STRUCT_OPS(layered_stopping, struct task_struct *p, bool runnable)
 	taskc->runtime_avg =
 		((RUNTIME_DECAY_FACTOR - 1) * taskc->runtime_avg + runtime) /
 		RUNTIME_DECAY_FACTOR;
+
+	/* Record when the task stopped for cache hotness tracking */
+	taskc->stopped_at = now;
 
 	account_used(p, cpuc, taskc, now);
 

@@ -158,6 +158,7 @@ lazy_static! {
                         nodes: vec![],
                         llcs: vec![],
                         member_expire_ms: 0,
+                        cache_hot_us: 0,
                         placement: LayerPlacement::Standard,
                     },
                 },
@@ -194,6 +195,7 @@ lazy_static! {
                         nodes: vec![],
                         llcs: vec![],
                         member_expire_ms: 0,
+                        cache_hot_us: 0,
                         placement: LayerPlacement::Standard,
                     },
                 },
@@ -235,6 +237,7 @@ lazy_static! {
                         nodes: vec![],
                         llcs: vec![],
                         member_expire_ms: 0,
+                        cache_hot_us: 500,
                         placement: LayerPlacement::Standard,
                     },
                 },
@@ -274,6 +277,7 @@ lazy_static! {
                         nodes: vec![],
                         llcs: vec![],
                         member_expire_ms: 0,
+                        cache_hot_us: 0,
                         placement: LayerPlacement::Standard,
                     },
                 },
@@ -1910,6 +1914,7 @@ impl<'a> Scheduler<'a> {
                     xllc_mig_min_us,
                     placement,
                     member_expire_ms,
+                    cache_hot_us,
                     ..
                 } = spec.kind.common();
 
@@ -1935,6 +1940,7 @@ impl<'a> Scheduler<'a> {
                 layer.growth_algo = growth_algo.as_bpf_enum();
                 layer.weight = *weight;
                 layer.member_expire_ms = *member_expire_ms;
+                layer.cache_hot_ns = *cache_hot_us * 1000;
                 layer.disallow_open_after_ns = match disallow_open_after_us.unwrap() {
                     v if v == u64::MAX => v,
                     v => v * 1000,

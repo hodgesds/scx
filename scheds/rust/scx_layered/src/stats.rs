@@ -76,6 +76,7 @@ const LSTAT_XLAYER_REWAKE: usize = bpf_intf::layer_stat_id_LSTAT_XLAYER_REWAKE a
 const LSTAT_LLC_DRAIN_TRY: usize = bpf_intf::layer_stat_id_LSTAT_LLC_DRAIN_TRY as usize;
 const LSTAT_LLC_DRAIN: usize = bpf_intf::layer_stat_id_LSTAT_LLC_DRAIN as usize;
 const LSTAT_SKIP_REMOTE_NODE: usize = bpf_intf::layer_stat_id_LSTAT_SKIP_REMOTE_NODE as usize;
+const LSTAT_CACHE_HOT: usize = bpf_intf::layer_stat_id_LSTAT_CACHE_HOT as usize;
 
 const LLC_LSTAT_LAT: usize = bpf_intf::llc_layer_stat_id_LLC_LSTAT_LAT as usize;
 const LLC_LSTAT_CNT: usize = bpf_intf::llc_layer_stat_id_LLC_LSTAT_CNT as usize;
@@ -194,6 +195,8 @@ pub struct LayerStats {
     pub llc_drain: f64,
     #[stat(desc = "% skip LLC dispatch on remote node")]
     pub skip_remote_node: f64,
+    #[stat(desc = "% dispatched to last CPU due to cache hotness")]
+    pub cache_hot: f64,
     #[stat(desc = "mask of allocated CPUs", _om_skip)]
     pub cpus: Vec<u64>,
     #[stat(desc = "count of CPUs assigned")]
@@ -309,6 +312,7 @@ impl LayerStats {
             llc_drain_try: lstat_pct(LSTAT_LLC_DRAIN_TRY),
             llc_drain: lstat_pct(LSTAT_LLC_DRAIN),
             skip_remote_node: lstat_pct(LSTAT_SKIP_REMOTE_NODE),
+            cache_hot: lstat_pct(LSTAT_CACHE_HOT),
             cpus: layer.cpus.as_raw_slice().to_vec(),
             cur_nr_cpus: layer.cpus.weight() as u32,
             min_nr_cpus: nr_cpus_range.0 as u32,
@@ -404,13 +408,14 @@ impl LayerStats {
 
         writeln!(
             w,
-            "  {:<width$}  xlayer_wake/re={}/{} llc_drain/try={}/{} skip_rnode={}",
+            "  {:<width$}  xlayer_wake/re={}/{} llc_drain/try={}/{} skip_rnode={} cache_hot={}",
             "",
             fmt_pct(self.xlayer_wake),
             fmt_pct(self.xlayer_rewake),
             fmt_pct(self.llc_drain),
             fmt_pct(self.llc_drain_try),
             fmt_pct(self.skip_remote_node),
+            fmt_pct(self.cache_hot),
             width = header_width,
         )?;
 
