@@ -160,6 +160,8 @@ u64 cpu_llc_ids[MAX_CPUS];
 u64 cpu_node_ids[MAX_CPUS];
 u64 big_core_ids[MAX_CPUS];
 u64 dsq_time_slices[MAX_DSQS_PER_LLC];
+u32 llc_node_ids[MAX_LLCS];	/* Maps LLC index to node ID */
+u32 llc_count_per_node[MAX_NUMA_NODES];  /* Number of LLCs per node */
 
 u64 min_slice_ns = 500;
 
@@ -560,6 +562,164 @@ static void update_vtime(struct task_struct *p, struct cpu_ctx *cpuc,
 static struct llc_ctx *rand_llc_ctx(void)
 {
 	return lookup_llc_ctx(bpf_get_prandom_u32() % topo_config.nr_llcs);
+}
+
+/*
+ * Calculate the distance between two LLCs based on their NUMA nodes.
+ * Returns:
+ *   0 - Same LLC (shouldn't happen in pick2)
+ *   1 - Different LLC, same NUMA node
+ *   2 - Different NUMA nodes
+ */
+static u32 llc_distance(struct llc_ctx *llc1, struct llc_ctx *llc2)
+{
+	if (!llc1 || !llc2)
+		return 2; // Maximum distance if invalid
+
+	if (llc1->id == llc2->id)
+		return 0;
+
+	if (llc1->node_id == llc2->node_id)
+		return 1;
+
+	return 2;
+}
+
+/*
+ * Returns a random LLC from the same NUMA node as the given LLC.
+ * Returns NULL if no other LLC exists on the same node.
+ */
+static struct llc_ctx *rand_llc_ctx_same_node(struct llc_ctx *cur_llcx)
+{
+	struct llc_ctx *candidate;
+	u32 node_id, attempts = 0;
+	u32 rand_idx;
+
+	if (!cur_llcx)
+		return NULL;
+
+	node_id = cur_llcx->node_id;
+
+	// Bounds check for node_id
+	if (node_id >= MAX_NUMA_NODES)
+		return NULL;
+
+	// If there's only one LLC on this node, return NULL
+	if (llc_count_per_node[node_id] <= 1)
+		return NULL;
+
+	// Try to find an LLC on the same node (with retry limit to avoid infinite loops)
+	bpf_for(attempts, 0, 32) {
+		rand_idx = bpf_get_prandom_u32() % topo_config.nr_llcs;
+		candidate = lookup_llc_ctx(llc_ids[rand_idx]);
+		if (candidate &&
+		    candidate->node_id == node_id &&
+		    candidate->id != cur_llcx->id)
+			return candidate;
+	}
+
+	return NULL;
+}
+
+/*
+ * Returns a random LLC from a different NUMA node than the given LLC.
+ * Never returns the current LLC.
+ */
+static struct llc_ctx *rand_llc_ctx_diff_node(struct llc_ctx *cur_llcx)
+{
+	struct llc_ctx *candidate;
+	u32 node_id, attempts = 0;
+	u32 rand_idx;
+
+	if (!cur_llcx)
+		return rand_llc_ctx();
+
+	node_id = cur_llcx->node_id;
+
+	// Try to find an LLC on a different node (but not the current LLC)
+	bpf_for(attempts, 0, 32) {
+		rand_idx = bpf_get_prandom_u32() % topo_config.nr_llcs;
+		candidate = lookup_llc_ctx(llc_ids[rand_idx]);
+		if (candidate &&
+		    candidate->node_id != node_id &&
+		    candidate->id != cur_llcx->id)
+			return candidate;
+	}
+
+	// Fallback: try to get any LLC that's not the current one
+	bpf_for(attempts, 0, 16) {
+		rand_idx = bpf_get_prandom_u32() % topo_config.nr_llcs;
+		candidate = lookup_llc_ctx(llc_ids[rand_idx]);
+		if (candidate && candidate->id != cur_llcx->id)
+			return candidate;
+	}
+
+	// Last resort: return any random LLC
+	return rand_llc_ctx();
+}
+
+/*
+ * Pick two LLCs for load balancing, preferring LLCs from the same NUMA node first.
+ * This implements a hierarchical LLC selection strategy for pick2 load balancing.
+ */
+static void pick_two_llcs_numa_aware(struct llc_ctx *cur_llcx,
+				     struct llc_ctx **left_out,
+				     struct llc_ctx **right_out)
+{
+	struct llc_ctx *left = NULL, *right = NULL;
+	u32 same_node_count;
+
+	if (!cur_llcx || !left_out || !right_out)
+		return;
+
+	// Bounds check for node_id
+	if (cur_llcx->node_id >= MAX_NUMA_NODES) {
+		// Fallback to random selection if node_id is invalid
+		*left_out = rand_llc_ctx();
+		*right_out = rand_llc_ctx();
+		return;
+	}
+
+	same_node_count = llc_count_per_node[cur_llcx->node_id];
+
+	// Strategy: Try to pick both LLCs from the same NUMA node first
+	if (same_node_count >= 3) {
+		// We have at least 2 other LLCs on the same node
+		left = rand_llc_ctx_same_node(cur_llcx);
+		right = rand_llc_ctx_same_node(cur_llcx);
+
+		// Make sure left and right are different
+		if (left && right && left->id == right->id) {
+			// Try once more for a different LLC
+			right = rand_llc_ctx_same_node(cur_llcx);
+		}
+	} else if (same_node_count == 2) {
+		// We have exactly 1 other LLC on the same node
+		left = rand_llc_ctx_same_node(cur_llcx);
+		// Pick the second from a different node
+		right = rand_llc_ctx_diff_node(cur_llcx);
+	} else {
+		// Only one LLC on this node (current), pick from other nodes
+		left = rand_llc_ctx_diff_node(cur_llcx);
+		right = rand_llc_ctx_diff_node(cur_llcx);
+	}
+
+	// Fallback: if we couldn't get good picks, use random selection
+	if (!left)
+		left = rand_llc_ctx();
+	if (!right)
+		right = rand_llc_ctx();
+
+	// Final check: make sure left and right are different
+	if (left && right && left->id == right->id) {
+		u32 alt_idx = (right->index + 1) % topo_config.nr_llcs;
+		struct llc_ctx *alt = lookup_llc_ctx(llc_ids[alt_idx]);
+		if (alt)
+			right = alt;
+	}
+
+	*left_out = left;
+	*right_out = right;
 }
 
 static bool keep_running(struct cpu_ctx *cpuc, struct llc_ctx *llcx,
@@ -1597,25 +1757,43 @@ static __always_inline int dispatch_pick_two(s32 cpu, struct llc_ctx *cur_llcx, 
 	}
 
 	/*
-	 * For pick two load balancing we randomly choose two LLCs. We then
-	 * first try to consume from the LLC with the largest load. If we are
+	 * For pick two load balancing we use a NUMA-aware LLC selection strategy.
+	 * We preferentially choose LLCs from the same NUMA node first to minimize
+	 * cross-NUMA traffic, then fall back to other nodes if needed.
+	 * We then first try to consume from the LLC with the largest load. If we are
 	 * unable to consume from the first LLC then the second LLC is consumed
 	 * from. This yields better work conservation on machines with a large
-	 * number of LLCs.
+	 * number of LLCs while maintaining good NUMA locality.
 	 */
-	left = topo_config.nr_llcs == 2 ? lookup_llc_ctx(llc_ids[0]) : rand_llc_ctx();
-	right = topo_config.nr_llcs == 2 ? lookup_llc_ctx(llc_ids[1]) : rand_llc_ctx();
+	if (topo_config.nr_llcs == 2) {
+		// Special case for 2 LLCs: just pick both
+		left = lookup_llc_ctx(llc_ids[0]);
+		right = lookup_llc_ctx(llc_ids[1]);
+	} else {
+		// Use NUMA-aware selection for systems with more than 2 LLCs
+		pick_two_llcs_numa_aware(cur_llcx, &left, &right);
+	}
 
 	if (!left || !right)
 		return -EINVAL;
 
-	if (left->id == right->id) {
-		i = cur_llcx->load % topo_config.nr_llcs;
+	// Ensure left and right are different from current LLC
+	if (left->id == cur_llcx->id) {
+		i = (cur_llcx->load % topo_config.nr_llcs);
+		i &= 0x3; // verifier
+		if (i >= 0 && i < topo_config.nr_llcs)
+			left = lookup_llc_ctx(llc_ids[i]);
+		if (!left || left->id == cur_llcx->id)
+			left = rand_llc_ctx();
+	}
+
+	if (right->id == cur_llcx->id || right->id == left->id) {
+		i = ((cur_llcx->load + 1) % topo_config.nr_llcs);
 		i &= 0x3; // verifier
 		if (i >= 0 && i < topo_config.nr_llcs)
 			right = lookup_llc_ctx(llc_ids[i]);
-		if (!right)
-			return -EINVAL;
+		if (!right || right->id == cur_llcx->id || right->id == left->id)
+			right = rand_llc_ctx();
 	}
 
 
@@ -2094,6 +2272,14 @@ static int init_llc(u32 llc_index)
 	llcx->index = llc_index;
 	llcx->nr_cpus = 0;
 	llcx->vtime = 0;
+
+	// Track LLC to node mapping
+	if (llc_index < MAX_LLCS)
+		llc_node_ids[llc_index] = llcx->node_id;
+
+	// Update LLC count per node
+	if (llcx->node_id < MAX_NUMA_NODES)
+		llc_count_per_node[llcx->node_id]++;
 
 	ret = llc_create_atqs(llcx);
 	if (ret) {
