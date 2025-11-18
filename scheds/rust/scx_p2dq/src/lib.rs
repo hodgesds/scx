@@ -303,6 +303,23 @@ pub struct SchedulerOpts {
     #[clap(long, action = clap::ArgAction::SetTrue)]
     pub single_llc_fast_path: bool,
 
+    /// Enable soft affinity for tgid (process) CPU stickiness.
+    /// Tasks in the same process will try to run on a preferred set of CPUs.
+    #[clap(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub soft_affinity: bool,
+
+    /// Initial number of CPUs to allocate for soft affinity per tgid.
+    #[clap(long, default_value = "2", value_parser = clap::value_parser!(u32).range(1..64))]
+    pub soft_affinity_init_cpus: u32,
+
+    /// Maximum number of CPUs for soft affinity per tgid.
+    #[clap(long, default_value = "8", value_parser = clap::value_parser!(u32).range(1..512))]
+    pub soft_affinity_max_cpus: u32,
+
+    /// Utilization threshold (in percent) to grow soft affinity cpumask.
+    #[clap(long, default_value = "80", value_parser = clap::value_parser!(u64).range(1..100))]
+    pub soft_affinity_util_threshold: u64,
+
     #[clap(flatten, next_help_heading = "Topology Options")]
     pub topo: TopologyArgs,
 }
@@ -423,6 +440,12 @@ macro_rules! init_open_skel {
             rodata.p2dq_config.freq_control = MaybeUninit::new(opts.freq_control);
             rodata.p2dq_config.interactive_sticky = MaybeUninit::new(opts.interactive_sticky);
             rodata.p2dq_config.keep_running_enabled = MaybeUninit::new(opts.keep_running);
+
+            // soft affinity config
+            rodata.soft_affinity_config.enabled = MaybeUninit::new(opts.soft_affinity);
+            rodata.soft_affinity_config.init_cpus = opts.soft_affinity_init_cpus;
+            rodata.soft_affinity_config.max_cpus = opts.soft_affinity_max_cpus;
+            rodata.soft_affinity_config.util_threshold = opts.soft_affinity_util_threshold;
 
             rodata.debug = verbose as u32;
             rodata.nr_cpu_ids = *NR_CPU_IDS as u32;

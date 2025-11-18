@@ -51,6 +51,12 @@ pub struct Metrics {
     pub wake_llc: u64,
     #[stat(desc = "Number of times tasks have been woken and migrated llc")]
     pub wake_mig: u64,
+    #[stat(desc = "Number of times soft affinity found an idle CPU in preferred mask")]
+    pub soft_affinity_hit: u64,
+    #[stat(desc = "Number of times soft affinity missed preferred mask")]
+    pub soft_affinity_miss: u64,
+    #[stat(desc = "Number of times soft affinity grew the preferred cpumask")]
+    pub soft_affinity_grow: u64,
 }
 
 impl Metrics {
@@ -81,6 +87,15 @@ impl Metrics {
             self.llc_migrations,
             self.node_migrations,
         )?;
+        if self.soft_affinity_hit > 0 || self.soft_affinity_miss > 0 || self.soft_affinity_grow > 0 {
+            writeln!(
+                w,
+                "\tsoft affinity hit/miss/grow {}/{}/{}",
+                self.soft_affinity_hit,
+                self.soft_affinity_miss,
+                self.soft_affinity_grow,
+            )?;
+        }
         Ok(())
     }
 
@@ -104,6 +119,9 @@ impl Metrics {
             wake_prev: self.wake_prev - rhs.wake_prev,
             wake_llc: self.wake_llc - rhs.wake_llc,
             wake_mig: self.wake_mig - rhs.wake_mig,
+            soft_affinity_hit: self.soft_affinity_hit - rhs.soft_affinity_hit,
+            soft_affinity_miss: self.soft_affinity_miss - rhs.soft_affinity_miss,
+            soft_affinity_grow: self.soft_affinity_grow - rhs.soft_affinity_grow,
         }
     }
 }

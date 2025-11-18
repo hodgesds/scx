@@ -143,6 +143,18 @@ const volatile struct {
 	.kthreads_local = true,
 };
 
+const volatile struct {
+	u32 init_cpus;
+	u32 max_cpus;
+	u64 util_threshold;
+	bool enabled;
+} soft_affinity_config = {
+	.init_cpus = 2,
+	.max_cpus = 8,
+	.util_threshold = 80,
+	.enabled = false,
+};
+
 const volatile u32 debug = 2;
 const u32 zero_u32 = 0;
 extern const volatile u32 nr_cpu_ids;
@@ -436,6 +448,13 @@ struct {
 	__type(value, struct mask_wrapper);
 } task_masks SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_TGIDS);
+	__type(key, u32);
+	__type(value, struct tgid_ctx);
+} tgid_ctxs SEC(".maps");
+
 static task_ctx *lookup_task_ctx(struct task_struct *p)
 {
 	task_ctx *taskc = scx_task_data(p);
@@ -444,6 +463,216 @@ static task_ctx *lookup_task_ctx(struct task_struct *p)
 		scx_bpf_error("task_ctx lookup failed");
 
 	return taskc;
+}
+
+static struct tgid_ctx *lookup_tgid_ctx(u32 tgid)
+{
+	return bpf_map_lookup_elem(&tgid_ctxs, &tgid);
+}
+
+/* Forward declaration for stat_inc */
+static inline void stat_inc(enum stat_idx idx);
+
+/*
+ * Find idle CPUs for initial soft affinity allocation.
+ * Tries to find idle cores in the task's LLC first.
+ */
+static s32 find_idle_cpu_for_tgid(struct llc_ctx *llcx, struct bpf_cpumask *pref_mask)
+{
+	const struct cpumask *idle_cpumask;
+	s32 cpu = -1;
+
+	idle_cpumask = scx_bpf_get_idle_cpumask();
+	if (!idle_cpumask)
+		return -1;
+
+	/* Try to find an idle core in the LLC */
+	if (llcx && llcx->cpumask) {
+		if (topo_config.smt_enabled) {
+			cpu = scx_bpf_pick_idle_cpu(cast_mask(llcx->cpumask),
+						    SCX_PICK_IDLE_CORE);
+		}
+		if (cpu < 0) {
+			cpu = scx_bpf_pick_idle_cpu(cast_mask(llcx->cpumask), 0);
+		}
+	}
+
+	/* If no idle CPU in LLC, try anywhere */
+	if (cpu < 0 && all_cpumask) {
+		cpu = scx_bpf_pick_idle_cpu(cast_mask(all_cpumask), 0);
+	}
+
+	scx_bpf_put_cpumask(idle_cpumask);
+	return cpu;
+}
+
+/*
+ * Initialize preferred cpumask for a tgid with initial idle CPUs.
+ */
+static int init_tgid_preferred_mask(struct tgid_ctx *tgidc, struct llc_ctx *llcx)
+{
+	struct bpf_cpumask *pref_mask;
+	s32 cpu;
+	u32 i;
+
+	if (!tgidc || !soft_affinity_config.enabled)
+		return -EINVAL;
+
+	pref_mask = bpf_cpumask_create();
+	if (!pref_mask)
+		return -ENOMEM;
+
+	/* Allocate initial CPUs for this tgid */
+	for (i = 0; i < soft_affinity_config.init_cpus && i < 64; i++) {
+		cpu = find_idle_cpu_for_tgid(llcx, pref_mask);
+		if (cpu >= 0) {
+			bpf_cpumask_set_cpu(cpu, pref_mask);
+			tgidc->nr_cpus_wanted++;
+		}
+	}
+
+	/* Ensure we have at least one CPU */
+	if (bpf_cpumask_empty(cast_mask(pref_mask)) && llcx && llcx->cpumask) {
+		cpu = bpf_cpumask_any_distribute(cast_mask(llcx->cpumask));
+		if (cpu < topo_config.nr_cpus) {
+			bpf_cpumask_set_cpu(cpu, pref_mask);
+			tgidc->nr_cpus_wanted = 1;
+		}
+	}
+
+	pref_mask = bpf_kptr_xchg(&tgidc->preferred_cpumask, pref_mask);
+	if (pref_mask)
+		bpf_cpumask_release(pref_mask);
+
+	return 0;
+}
+
+/*
+ * Grow the tgid's preferred cpumask when utilization is high.
+ * Returns true if the mask was grown.
+ */
+static bool grow_tgid_cpumask(struct tgid_ctx *tgidc, struct llc_ctx *llcx)
+{
+	struct bpf_cpumask *pref_mask;
+	s32 cpu;
+
+	if (!tgidc || !soft_affinity_config.enabled)
+		return false;
+
+	/* Check if we've hit the max CPU limit */
+	if (tgidc->nr_cpus_wanted >= soft_affinity_config.max_cpus)
+		return false;
+
+	pref_mask = tgidc->preferred_cpumask;
+	if (!pref_mask)
+		return false;
+
+	/* Find an idle CPU to add to the preferred mask */
+	cpu = find_idle_cpu_for_tgid(llcx, pref_mask);
+	if (cpu < 0)
+		return false;
+
+	/* Don't add if already in the mask */
+	if (bpf_cpumask_test_cpu(cpu, cast_mask(pref_mask)))
+		return false;
+
+	bpf_cpumask_set_cpu(cpu, pref_mask);
+	tgidc->nr_cpus_wanted++;
+	stat_inc(P2DQ_STAT_SOFT_AFFINITY_GROW);
+
+	return true;
+}
+
+/*
+ * Update tgid utilization tracking.
+ */
+static void update_tgid_util(struct tgid_ctx *tgidc, u64 runtime_ns)
+{
+	u64 now, elapsed;
+
+	if (!tgidc)
+		return;
+
+	now = bpf_ktime_get_ns();
+	elapsed = now - tgidc->last_util_update;
+
+	/* Decay old utilization and add new */
+	if (elapsed > NSEC_PER_SEC) {
+		tgidc->util = runtime_ns;
+	} else {
+		/* Simple exponential decay */
+		tgidc->util = (tgidc->util * 7 / 8) + runtime_ns;
+	}
+	tgidc->last_util_update = now;
+}
+
+/*
+ * Get or create tgid context for soft affinity.
+ */
+static struct tgid_ctx *get_or_create_tgid_ctx(struct task_struct *p, struct llc_ctx *llcx)
+{
+	struct tgid_ctx *tgidc;
+	struct tgid_ctx new_tgidc = {};
+	u32 tgid = p->tgid;
+	int ret;
+
+	if (!soft_affinity_config.enabled)
+		return NULL;
+
+	tgidc = lookup_tgid_ctx(tgid);
+	if (tgidc) {
+		__sync_fetch_and_add(&tgidc->nr_tasks, 1);
+		return tgidc;
+	}
+
+	/* Create new tgid context */
+	new_tgidc.tgid = tgid;
+	new_tgidc.nr_tasks = 1;
+	new_tgidc.nr_cpus_wanted = 0;
+	new_tgidc.llc_id = llcx ? llcx->id : 0;
+	new_tgidc.util = 0;
+	new_tgidc.last_util_update = bpf_ktime_get_ns();
+
+	ret = bpf_map_update_elem(&tgid_ctxs, &tgid, &new_tgidc, BPF_NOEXIST);
+	if (ret && ret != -EEXIST)
+		return NULL;
+
+	tgidc = lookup_tgid_ctx(tgid);
+	if (!tgidc)
+		return NULL;
+
+	/* Initialize preferred cpumask if we created it */
+	if (ret == 0)
+		init_tgid_preferred_mask(tgidc, llcx);
+
+	return tgidc;
+}
+
+/*
+ * Remove task from tgid tracking.
+ */
+static void put_tgid_ctx(struct task_struct *p)
+{
+	struct tgid_ctx *tgidc;
+	struct bpf_cpumask *pref_mask;
+	u32 tgid = p->tgid;
+	u32 nr_tasks;
+
+	if (!soft_affinity_config.enabled)
+		return;
+
+	tgidc = lookup_tgid_ctx(tgid);
+	if (!tgidc)
+		return;
+
+	nr_tasks = __sync_fetch_and_sub(&tgidc->nr_tasks, 1);
+	if (nr_tasks <= 1) {
+		/* Last task in tgid, release cpumask and clean up */
+		pref_mask = bpf_kptr_xchg(&tgidc->preferred_cpumask, NULL);
+		if (pref_mask)
+			bpf_cpumask_release(pref_mask);
+		bpf_map_delete_elem(&tgid_ctxs, &tgid);
+	}
 }
 
 struct {
@@ -677,6 +906,49 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 	    scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
 		*is_idle = true;
 		goto found_cpu;
+	}
+
+	/*
+	 * Soft affinity: try to find an idle CPU in the tgid's preferred mask.
+	 * This is a hint, not an enforcement, so we fall back to normal
+	 * selection if no idle CPU is found in the preferred mask.
+	 */
+	if (soft_affinity_config.enabled &&
+	    task_ctx_test_flag(taskc, TASK_CTX_F_SOFT_AFFINITY)) {
+		struct tgid_ctx *tgidc = lookup_tgid_ctx(p->tgid);
+		if (tgidc && tgidc->preferred_cpumask) {
+			struct bpf_cpumask *pref_mask = tgidc->preferred_cpumask;
+
+			/* First try prev_cpu if it's in preferred mask */
+			if (bpf_cpumask_test_cpu(prev_cpu, cast_mask(pref_mask)) &&
+			    scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+				stat_inc(P2DQ_STAT_SOFT_AFFINITY_HIT);
+				*is_idle = true;
+				goto found_cpu;
+			}
+
+			/* Try to find an idle core in preferred mask */
+			if (topo_config.smt_enabled) {
+				cpu = scx_bpf_pick_idle_cpu(cast_mask(pref_mask),
+							    SCX_PICK_IDLE_CORE);
+				if (cpu >= 0) {
+					stat_inc(P2DQ_STAT_SOFT_AFFINITY_HIT);
+					*is_idle = true;
+					goto found_cpu;
+				}
+			}
+
+			/* Try any idle CPU in preferred mask */
+			cpu = scx_bpf_pick_idle_cpu(cast_mask(pref_mask), 0);
+			if (cpu >= 0) {
+				stat_inc(P2DQ_STAT_SOFT_AFFINITY_HIT);
+				*is_idle = true;
+				goto found_cpu;
+			}
+
+			/* Soft affinity miss - fall through to normal selection */
+			stat_inc(P2DQ_STAT_SOFT_AFFINITY_MISS);
+		}
 	}
 
 	if (p2dq_config.interactive_sticky && task_ctx_test_flag(taskc, TASK_CTX_F_INTERACTIVE)) {
@@ -1453,6 +1725,24 @@ void BPF_STRUCT_OPS(p2dq_stopping, struct task_struct *p, bool runnable)
 		// Note that affinitized load is absolute load, not scaled.
 		__sync_fetch_and_add(&llcx->affn_load, used);
 
+	/* Update soft affinity tgid utilization */
+	if (soft_affinity_config.enabled &&
+	    task_ctx_test_flag(taskc, TASK_CTX_F_SOFT_AFFINITY)) {
+		struct tgid_ctx *tgidc = lookup_tgid_ctx(p->tgid);
+		if (tgidc) {
+			update_tgid_util(tgidc, used);
+
+			/* Check if we need to grow the cpumask based on utilization */
+			u64 util_per_cpu = tgidc->util / (tgidc->nr_cpus_wanted ?: 1);
+			u64 threshold = soft_affinity_config.util_threshold *
+					NSEC_PER_MSEC;
+			if (util_per_cpu > threshold &&
+			    tgidc->nr_cpus_wanted < soft_affinity_config.max_cpus) {
+				grow_tgid_cpumask(tgidc, llcx);
+			}
+		}
+	}
+
 	trace("STOPPING %s weight %d slice %llu used %llu scaled %llu",
 	      p->comm, p->scx.weight, last_dsq_slice_ns, used, scaled_used);
 
@@ -2044,12 +2334,23 @@ static s32 p2dq_init_task_impl(struct task_struct *p, struct scx_init_task_args 
 
 	taskc->pid = p->pid;
 
+	/* Setup soft affinity tracking if enabled */
+	if (soft_affinity_config.enabled &&
+	    task_ctx_test_flag(taskc, TASK_CTX_F_ALL_CPUS)) {
+		struct tgid_ctx *tgidc = get_or_create_tgid_ctx(p, llcx);
+		if (tgidc) {
+			task_ctx_set_flag(taskc, TASK_CTX_F_SOFT_AFFINITY);
+		}
+	}
+
 	return 0;
 }
 
 void BPF_STRUCT_OPS(p2dq_exit_task, struct task_struct *p,
 		    struct scx_exit_task_args *args)
 {
+	/* Clean up soft affinity tracking */
+	put_tgid_ctx(p);
 	scx_task_free(p);
 }
 

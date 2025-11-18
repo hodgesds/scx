@@ -131,6 +131,18 @@ struct node_ctx {
 #define TASK_CTX_F_WAS_NICE	(1 << 1)
 #define TASK_CTX_F_IS_KWORKER	(1 << 2)
 #define TASK_CTX_F_ALL_CPUS	(1 << 3)
+#define TASK_CTX_F_SOFT_AFFINITY	(1 << 4)
+
+/* tgid_ctx for soft affinity tracking */
+struct tgid_ctx {
+	u32				tgid;
+	u32				nr_tasks;
+	u32				nr_cpus_wanted;
+	u32				llc_id;
+	u64				util;
+	u64				last_util_update;
+	struct bpf_cpumask __kptr	*preferred_cpumask;
+};
 
 /* Helper macros for task_ctx flags */
 #define task_ctx_set_flag(taskc, flag)		((taskc)->flags |= (flag))

@@ -57,6 +57,9 @@ use bpf_intf::stat_idx_P2DQ_STAT_SELECT_PICK2;
 use bpf_intf::stat_idx_P2DQ_STAT_WAKE_LLC;
 use bpf_intf::stat_idx_P2DQ_STAT_WAKE_MIG;
 use bpf_intf::stat_idx_P2DQ_STAT_WAKE_PREV;
+use bpf_intf::stat_idx_P2DQ_STAT_SOFT_AFFINITY_HIT;
+use bpf_intf::stat_idx_P2DQ_STAT_SOFT_AFFINITY_MISS;
+use bpf_intf::stat_idx_P2DQ_STAT_SOFT_AFFINITY_GROW;
 use scx_p2dq::bpf_intf;
 use scx_p2dq::bpf_skel::*;
 use scx_p2dq::SchedulerOpts;
@@ -163,6 +166,15 @@ impl<'a> Scheduler<'a> {
             &hw_profile
         )?;
 
+        if opts.soft_affinity {
+            info!(
+                "Soft affinity enabled: init_cpus={}, max_cpus={}, util_threshold={}%",
+                opts.soft_affinity_init_cpus,
+                opts.soft_affinity_max_cpus,
+                opts.soft_affinity_util_threshold
+            );
+        }
+
         if opts.queued_wakeup {
             open_skel.struct_ops.p2dq_mut().flags |= *compat::SCX_OPS_ALLOW_QUEUED_WAKEUP;
         }
@@ -214,6 +226,9 @@ impl<'a> Scheduler<'a> {
             wake_prev: stats[stat_idx_P2DQ_STAT_WAKE_PREV as usize],
             wake_llc: stats[stat_idx_P2DQ_STAT_WAKE_LLC as usize],
             wake_mig: stats[stat_idx_P2DQ_STAT_WAKE_MIG as usize],
+            soft_affinity_hit: stats[stat_idx_P2DQ_STAT_SOFT_AFFINITY_HIT as usize],
+            soft_affinity_miss: stats[stat_idx_P2DQ_STAT_SOFT_AFFINITY_MISS as usize],
+            soft_affinity_grow: stats[stat_idx_P2DQ_STAT_SOFT_AFFINITY_GROW as usize],
         }
     }
 
