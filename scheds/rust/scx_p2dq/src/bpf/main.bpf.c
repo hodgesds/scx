@@ -160,8 +160,6 @@ u64 cpu_llc_ids[MAX_CPUS];
 u64 cpu_node_ids[MAX_CPUS];
 u64 big_core_ids[MAX_CPUS];
 u64 dsq_time_slices[MAX_DSQS_PER_LLC];
-u32 llc_node_ids[MAX_LLCS];	/* Maps LLC index to node ID */
-u32 llc_count_per_node[MAX_NUMA_NODES];  /* Number of LLCs per node */
 
 u64 min_slice_ns = 500;
 
@@ -565,60 +563,40 @@ static struct llc_ctx *rand_llc_ctx(void)
 }
 
 /*
- * Calculate the distance between two LLCs based on their NUMA nodes.
- * Returns:
- *   0 - Same LLC (shouldn't happen in pick2)
- *   1 - Different LLC, same NUMA node
- *   2 - Different NUMA nodes
- */
-static u32 llc_distance(struct llc_ctx *llc1, struct llc_ctx *llc2)
-{
-	if (!llc1 || !llc2)
-		return 2; // Maximum distance if invalid
-
-	if (llc1->id == llc2->id)
-		return 0;
-
-	if (llc1->node_id == llc2->node_id)
-		return 1;
-
-	return 2;
-}
-
-/*
  * Returns a random LLC from the same NUMA node as the given LLC.
+ * Uses direct indexing into node_ctx->llc_ids for efficiency.
  * Returns NULL if no other LLC exists on the same node.
  */
 static struct llc_ctx *rand_llc_ctx_same_node(struct llc_ctx *cur_llcx)
 {
-	struct llc_ctx *candidate;
-	u32 node_id, attempts = 0;
-	u32 rand_idx;
+	struct node_ctx *nodec;
+	u32 rand_idx, llc_id;
 
 	if (!cur_llcx)
 		return NULL;
 
-	node_id = cur_llcx->node_id;
-
-	// Bounds check for node_id
-	if (node_id >= MAX_NUMA_NODES)
+	nodec = lookup_node_ctx(cur_llcx->node_id);
+	if (!nodec || nodec->nr_llcs <= 1)
 		return NULL;
 
-	// If there's only one LLC on this node, return NULL
-	if (llc_count_per_node[node_id] <= 1)
+	// Pick a random LLC from this node's LLC list
+	rand_idx = bpf_get_prandom_u32() % nodec->nr_llcs;
+
+	// Bounds check for verifier
+	if (rand_idx >= MAX_LLCS)
 		return NULL;
 
-	// Try to find an LLC on the same node (with retry limit to avoid infinite loops)
-	bpf_for(attempts, 0, 32) {
-		rand_idx = bpf_get_prandom_u32() % topo_config.nr_llcs;
-		candidate = lookup_llc_ctx(llc_ids[rand_idx]);
-		if (candidate &&
-		    candidate->node_id == node_id &&
-		    candidate->id != cur_llcx->id)
-			return candidate;
+	llc_id = nodec->llc_ids[rand_idx];
+
+	// If we picked the current LLC, try the next one
+	if (llc_id == cur_llcx->id) {
+		rand_idx = (rand_idx + 1) % nodec->nr_llcs;
+		if (rand_idx >= MAX_LLCS)
+			return NULL;
+		llc_id = nodec->llc_ids[rand_idx];
 	}
 
-	return NULL;
+	return lookup_llc_ctx(llc_id);
 }
 
 /*
@@ -628,33 +606,41 @@ static struct llc_ctx *rand_llc_ctx_same_node(struct llc_ctx *cur_llcx)
 static struct llc_ctx *rand_llc_ctx_diff_node(struct llc_ctx *cur_llcx)
 {
 	struct llc_ctx *candidate;
-	u32 node_id, attempts = 0;
-	u32 rand_idx;
+	struct node_ctx *nodec;
+	u32 rand_node, rand_idx, llc_id;
+	int attempts;
 
 	if (!cur_llcx)
 		return rand_llc_ctx();
 
-	node_id = cur_llcx->node_id;
+	// Try to find an LLC on a different node
+	bpf_for(attempts, 0, 8) {
+		rand_node = bpf_get_prandom_u32() % topo_config.nr_nodes;
+		if (rand_node == cur_llcx->node_id)
+			continue;
 
-	// Try to find an LLC on a different node (but not the current LLC)
-	bpf_for(attempts, 0, 32) {
-		rand_idx = bpf_get_prandom_u32() % topo_config.nr_llcs;
-		candidate = lookup_llc_ctx(llc_ids[rand_idx]);
-		if (candidate &&
-		    candidate->node_id != node_id &&
-		    candidate->id != cur_llcx->id)
+		nodec = lookup_node_ctx(rand_node);
+		if (!nodec || nodec->nr_llcs == 0)
+			continue;
+
+		rand_idx = bpf_get_prandom_u32() % nodec->nr_llcs;
+		if (rand_idx >= MAX_LLCS)
+			continue;
+
+		llc_id = nodec->llc_ids[rand_idx];
+		candidate = lookup_llc_ctx(llc_id);
+		if (candidate && candidate->id != cur_llcx->id)
 			return candidate;
 	}
 
-	// Fallback: try to get any LLC that's not the current one
-	bpf_for(attempts, 0, 16) {
+	// Fallback: try any random LLC that's not the current one
+	bpf_for(attempts, 0, 8) {
 		rand_idx = bpf_get_prandom_u32() % topo_config.nr_llcs;
 		candidate = lookup_llc_ctx(llc_ids[rand_idx]);
 		if (candidate && candidate->id != cur_llcx->id)
 			return candidate;
 	}
 
-	// Last resort: return any random LLC
 	return rand_llc_ctx();
 }
 
@@ -667,20 +653,21 @@ static void pick_two_llcs_numa_aware(struct llc_ctx *cur_llcx,
 				     struct llc_ctx **right_out)
 {
 	struct llc_ctx *left = NULL, *right = NULL;
+	struct node_ctx *nodec;
 	u32 same_node_count;
 
 	if (!cur_llcx || !left_out || !right_out)
 		return;
 
-	// Bounds check for node_id
-	if (cur_llcx->node_id >= MAX_NUMA_NODES) {
-		// Fallback to random selection if node_id is invalid
+	nodec = lookup_node_ctx(cur_llcx->node_id);
+	if (!nodec) {
+		// Fallback to random selection if node lookup fails
 		*left_out = rand_llc_ctx();
 		*right_out = rand_llc_ctx();
 		return;
 	}
 
-	same_node_count = llc_count_per_node[cur_llcx->node_id];
+	same_node_count = nodec->nr_llcs;
 
 	// Strategy: Try to pick both LLCs from the same NUMA node first
 	if (same_node_count >= 3) {
@@ -2273,13 +2260,14 @@ static int init_llc(u32 llc_index)
 	llcx->nr_cpus = 0;
 	llcx->vtime = 0;
 
-	// Track LLC to node mapping
-	if (llc_index < MAX_LLCS)
-		llc_node_ids[llc_index] = llcx->node_id;
-
-	// Update LLC count per node
-	if (llcx->node_id < MAX_NUMA_NODES)
-		llc_count_per_node[llcx->node_id]++;
+	// Register this LLC with its node_ctx
+	struct node_ctx *nodec = lookup_node_ctx(llcx->node_id);
+	if (nodec && nodec->nr_llcs < MAX_LLCS) {
+		u32 idx = nodec->nr_llcs;
+		if (idx < MAX_LLCS) // verifier
+			nodec->llc_ids[idx] = llcx->id;
+		nodec->nr_llcs++;
+	}
 
 	ret = llc_create_atqs(llcx);
 	if (ret) {
@@ -2366,6 +2354,7 @@ static int init_node(u32 node_id)
 	}
 
 	nodec->id = node_id;
+	nodec->nr_llcs = 0;  // Will be populated by init_llc
 
 	ret = init_cpumask(&nodec->cpumask);
 	if (ret) {
@@ -2653,15 +2642,16 @@ static s32 p2dq_init_impl()
 		return -EINVAL;
 	}
 
-	// First we initialize LLCs because DSQs are created at the LLC level.
-	bpf_for(i, 0, topo_config.nr_llcs) {
-		ret = init_llc(i);
+	// First initialize nodes so that init_llc can register LLCs with their nodes
+	bpf_for(i, 0, topo_config.nr_nodes) {
+		ret = init_node(i);
 		if (ret)
 			return ret;
 	}
 
-	bpf_for(i, 0, topo_config.nr_nodes) {
-		ret = init_node(i);
+	// Then initialize LLCs (DSQs are created at the LLC level)
+	bpf_for(i, 0, topo_config.nr_llcs) {
+		ret = init_llc(i);
 		if (ret)
 			return ret;
 	}

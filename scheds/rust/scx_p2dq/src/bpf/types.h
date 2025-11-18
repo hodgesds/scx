@@ -122,6 +122,8 @@ struct llc_ctx {
 
 struct node_ctx {
 	u32				id;
+	u32				nr_llcs;		/* Number of LLCs on this node */
+	u32				llc_ids[MAX_LLCS];	/* IDs of LLCs on this node */
 	struct bpf_cpumask __kptr	*cpumask;
 	struct bpf_cpumask __kptr	*big_cpumask;
 };
