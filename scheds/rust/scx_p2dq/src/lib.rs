@@ -272,6 +272,12 @@ pub struct SchedulerOpts {
     #[arg(value_enum, long, default_value_t = SchedMode::Default)]
     pub sched_mode: SchedMode,
 
+    /// Cache-hot threshold in microseconds. Tasks that stopped running less than this time ago
+    /// will not be migrated to preserve cache locality. Set to 0 to disable cache-hot detection.
+    /// Default is 500μs (CFS default). Increase if your workload has higher BPF/scheduling overhead.
+    #[clap(long, default_value = "500", value_parser = clap::value_parser!(u64))]
+    pub cache_hot_threshold_us: u64,
+
     /// Slack factor for load balancing, load balancing is not performed if load is within slack
     /// factor percent.
     #[clap(long, default_value = "5", value_parser = clap::value_parser!(u64).range(0..99))]
@@ -453,6 +459,7 @@ macro_rules! init_open_skel {
             );
 
             rodata.p2dq_config.dhq_max_imbalance = opts.dhq_max_imbalance;
+            rodata.p2dq_config.cache_hot_threshold_ns = opts.cache_hot_threshold_us * 1000;
 
             // Check if cpu_priority is supported by the kernel
             let cpu_priority_supported = compat::ksym_exists("sched_core_priority").unwrap_or(false);

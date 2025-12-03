@@ -48,6 +48,7 @@ use bpf_intf::stat_idx_P2DQ_STAT_DSQ_CHANGE;
 use bpf_intf::stat_idx_P2DQ_STAT_DSQ_SAME;
 use bpf_intf::stat_idx_P2DQ_STAT_ENQ_CPU;
 use bpf_intf::stat_idx_P2DQ_STAT_ENQ_INTR;
+use bpf_intf::stat_idx_P2DQ_STAT_CACHE_HOT;
 use bpf_intf::stat_idx_P2DQ_STAT_ENQ_LLC;
 use bpf_intf::stat_idx_P2DQ_STAT_ENQ_MIG;
 use bpf_intf::stat_idx_P2DQ_STAT_EXEC_BALANCE;
@@ -220,6 +221,7 @@ impl<'a> Scheduler<'a> {
             keep: stats[stat_idx_P2DQ_STAT_KEEP as usize],
             enq_cpu: stats[stat_idx_P2DQ_STAT_ENQ_CPU as usize],
             enq_intr: stats[stat_idx_P2DQ_STAT_ENQ_INTR as usize],
+            cache_hot: stats[stat_idx_P2DQ_STAT_CACHE_HOT as usize],
             enq_llc: stats[stat_idx_P2DQ_STAT_ENQ_LLC as usize],
             enq_mig: stats[stat_idx_P2DQ_STAT_ENQ_MIG as usize],
             select_pick2: stats[stat_idx_P2DQ_STAT_SELECT_PICK2 as usize],

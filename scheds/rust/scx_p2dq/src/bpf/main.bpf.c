@@ -125,6 +125,7 @@ const volatile struct {
 	u32 sched_mode;
 	u32 llc_shards;
 	u64 dhq_max_imbalance;
+	u64 cache_hot_threshold_ns;
 
 	bool atq_enabled;
 	bool dhq_enabled;
@@ -146,6 +147,7 @@ const volatile struct {
 	.saturated_percent = 5,
 	.llc_shards = 0,
 	.dhq_max_imbalance = 3,
+	.cache_hot_threshold_ns = 500000, // 500μs default (CFS default)
 
 	.atq_enabled = false,
 	.dhq_enabled = false,
@@ -729,6 +731,16 @@ static bool can_migrate(task_ctx *taskc, struct llc_ctx *llcx)
 	if (unlikely(lb_config.single_llc_mode))
 		return false;
 
+	// Cache-hot detection: prevent migration of recently-run tasks
+	// Using configurable threshold (default 500μs, CFS default) to account for BPF/scheduling overhead
+	// This reduces cache thrashing by keeping recently-active tasks local
+	if (taskc->last_stopped_ns > 0) {
+		u64 now = scx_bpf_now();
+		u64 delta = now - taskc->last_stopped_ns;
+		if (delta < p2dq_config.cache_hot_threshold_ns)
+			return false;
+	}
+
 	if (topo_config.nr_llcs < 2 ||
 	    !task_ctx_test_flag(taskc, TASK_CTX_F_ALL_CPUS) ||
 	    (!lb_config.dispatch_lb_interactive && task_ctx_test_flag(taskc, TASK_CTX_F_INTERACTIVE)))
@@ -1033,6 +1045,21 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 
 	if (idle_cpumask && bpf_cpumask_empty(idle_cpumask))
 		goto found_cpu;
+
+	// Cache-hot detection: keep task on prev_cpu if it recently stopped running
+	// This preserves cache locality and avoids unnecessary migration
+	if (p2dq_config.cache_hot_threshold_ns > 0 && taskc->last_stopped_ns > 0) {
+		u64 now = scx_bpf_now();
+		u64 delta = now - taskc->last_stopped_ns;
+		if (delta < p2dq_config.cache_hot_threshold_ns) {
+			// Task is cache-hot, keep it on prev_cpu regardless of idle state
+			*is_idle = scx_bpf_test_and_clear_cpu_idle(prev_cpu);
+			stat_inc(P2DQ_STAT_CACHE_HOT);
+			trace("CACHE_HOT SELECT pid=%d comm=%s delta=%llu us, staying on cpu=%d",
+			      p->pid, p->comm, delta / 1000, prev_cpu);
+			goto found_cpu;
+		}
+	}
 
 	if (!(llcx = lookup_llc_ctx(taskc->llc_id)) ||
 	    !llcx->cpumask)
@@ -1453,14 +1480,34 @@ static void async_p2dq_enqueue(struct enqueue_promise *ret,
 				    p->pid, target_cpu, target_llc_id);
 				return;
 			}
+	// Check if task is cache-hot (stopped running recently)
+	// Cache-hot tasks should stick to prev_cpu to preserve cache warmth
+	// Threshold is configurable (default 500μs, CFS default)
+	bool is_cache_hot = false;
+	if (taskc->last_stopped_ns > 0) {
+		u64 now = scx_bpf_now();
+		u64 delta = now - taskc->last_stopped_ns;
+
+		// Trace delta for analysis (< 10ms)
+		if (delta < 10000000) {
+			trace("CACHE_CHECK pid=%d delta=%llu us", p->pid, delta / 1000);
+		}
+
+		if (delta < p2dq_config.cache_hot_threshold_ns) {
+			is_cache_hot = true;
+			trace("CACHE_HOT pid=%d comm=%s delta=%llu us", p->pid, p->comm, delta / 1000);
 		}
 	}
 
 	// Handle affinitized tasks: always use per-CPU affn_dsq
 	// All affinitized tasks queued to affn_dsq regardless of affinity breadth
+	// Also handle interactive tasks when interactive_sticky is enabled
+	// Also handle cache-hot tasks to preserve cache locality
 	if (!task_ctx_test_flag(taskc, TASK_CTX_F_ALL_CPUS) ||
 	    (p->cpus_ptr == &p->cpus_mask &&
-	     p->nr_cpus_allowed != topo_config.nr_cpus)) {
+	     p->nr_cpus_allowed != topo_config.nr_cpus) ||
+	    (p2dq_config.interactive_sticky && task_ctx_test_flag(taskc, TASK_CTX_F_INTERACTIVE)) ||
+	    is_cache_hot) {
 		bool has_cleared_idle = false;
 		if (!__COMPAT_is_enq_cpu_selected(enq_flags) ||
 		    !bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
@@ -1483,16 +1530,31 @@ static void async_p2dq_enqueue(struct enqueue_promise *ret,
 			return;
 		}
 
-		stat_inc(P2DQ_STAT_ENQ_CPU);
+		// Track whether this is an interactive sticky enqueue or regular affinity enqueue
+		if (p2dq_config.interactive_sticky && task_ctx_test_flag(taskc, TASK_CTX_F_INTERACTIVE))
+			stat_inc(P2DQ_STAT_ENQ_INTR);
+		else if (is_cache_hot)
+			stat_inc(P2DQ_STAT_CACHE_HOT);
+		else
+			stat_inc(P2DQ_STAT_ENQ_CPU);
 
 		// Select target CPU for affn_dsq with priority:
-		// 1. prev_cpu if in affinity
-		// 2. CPU in last LLC if any match affinity
-		// 3. Random CPU from affinity mask
+		// For cache-hot tasks: always use prev_cpu to preserve cache
+		// For affinitized tasks:
+		//   1. prev_cpu if in affinity
+		//   2. CPU in last LLC if any match affinity
+		//   3. Random CPU from affinity mask
 		s32 target_cpu = cpu;
 
+		// Cache-hot tasks: force prev_cpu for cache locality
+		if (is_cache_hot) {
+			s32 prev_cpu = scx_bpf_task_cpu(p);
+			if (prev_cpu >= 0 && prev_cpu < NR_CPUS) {
+				target_cpu = prev_cpu;
+			}
+		}
 		// If selected CPU not in affinity, find a better one
-		if (!bpf_cpumask_test_cpu(target_cpu, p->cpus_ptr)) {
+		else if (!bpf_cpumask_test_cpu(target_cpu, p->cpus_ptr)) {
 			// Try prev_cpu first
 			s32 prev_cpu = scx_bpf_task_cpu(p);
 			if (prev_cpu >= 0 && prev_cpu < NR_CPUS &&
@@ -1948,6 +2010,7 @@ void BPF_STRUCT_OPS(p2dq_stopping, struct task_struct *p, bool runnable)
 	taskc->last_dsq_id = taskc->dsq_id;
 	taskc->last_dsq_index = taskc->dsq_index;
 	taskc->used = 0;
+	taskc->last_stopped_ns = now; /* track when task stopped for cache-hot detection */
 
 	last_dsq_slice_ns = taskc->slice_ns;
 	used = now - taskc->last_run_at;

@@ -31,6 +31,8 @@ pub struct Metrics {
     pub enq_llc: u64,
     #[stat(desc = "Number of times a task was enqueued to interactive DSQ")]
     pub enq_intr: u64,
+    #[stat(desc = "Number of times a cache-hot task was kept on prev_cpu")]
+    pub cache_hot: u64,
     #[stat(desc = "Number of times a task was enqueued to migration DSQ")]
     pub enq_mig: u64,
     #[stat(desc = "Number of times a select_cpu pick 2 load balancing occured")]
@@ -65,7 +67,7 @@ impl Metrics {
     fn format<W: Write>(&self, w: &mut W) -> Result<()> {
         writeln!(
             w,
-            "direct/idle/keep {}/{}/{}\n\tdsq same/migrate {}/{}\n\tatq enq/reenq {}/{}\n\tenq cpu/llc/intr/mig {}/{}/{}/{}",
+            "direct/idle/keep {}/{}/{}\n\tdsq same/migrate {}/{}\n\tatq enq/reenq {}/{}\n\tenq cpu/llc/intr/cache_hot/mig {}/{}/{}/{}/{}",
             self.direct,
             self.idle,
             self.keep,
@@ -76,6 +78,7 @@ impl Metrics {
             self.enq_cpu,
             self.enq_llc,
             self.enq_intr,
+            self.cache_hot,
             self.enq_mig,
         )?;
         writeln!(
@@ -108,6 +111,7 @@ impl Metrics {
             enq_cpu: self.enq_cpu - rhs.enq_cpu,
             enq_llc: self.enq_llc - rhs.enq_llc,
             enq_intr: self.enq_intr - rhs.enq_intr,
+            cache_hot: self.cache_hot - rhs.cache_hot,
             enq_mig: self.enq_mig - rhs.enq_mig,
             select_pick2: self.select_pick2 - rhs.select_pick2,
             dispatch_pick2: self.dispatch_pick2 - rhs.dispatch_pick2,
