@@ -2881,6 +2881,7 @@ dependencies = [
  "libc",
  "log",
  "nix 0.30.1",
+ "regex",
  "scx_arena",
  "scx_cargo",
  "scx_p2dq",
@@ -2889,6 +2890,7 @@ dependencies = [
  "scx_userspace_arena",
  "scx_utils",
  "serde",
+ "serde_json",
  "simplelog",
 ]
 

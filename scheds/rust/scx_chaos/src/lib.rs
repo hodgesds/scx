@@ -4,6 +4,7 @@
 // GNU General Public License version 2.
 mod bpf_intf;
 mod bpf_skel;
+pub mod mcp;
 pub mod stats;
 
 use bpf_skel::BpfSkel;
@@ -572,6 +573,11 @@ pub struct Args {
     /// is not launched.
     #[clap(long)]
     pub monitor: Option<f64>,
+
+    /// Run MCP server for AI/tool integration (Model Context Protocol).
+    /// The server communicates via JSON-RPC over stdin/stdout.
+    #[clap(long)]
+    pub mcp: bool,
 
     #[command(flatten, next_help_heading = "Random Delays")]
     pub random_delay: RandomDelayArgs,
