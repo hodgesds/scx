@@ -738,7 +738,7 @@ static bool can_migrate(task_ctx *taskc, struct llc_ctx *llcx)
 	    taskc->dsq_index != p2dq_config.nr_dsqs_per_llc - 1)
 		return false;
 
-	if (taskc->llc_runs > 0)
+	if (taskc->llc_runs <= lb_config.min_llc_runs_pick2)
 		return false;
 
 	if (unlikely(saturated || overloaded))
@@ -747,7 +747,7 @@ static bool can_migrate(task_ctx *taskc, struct llc_ctx *llcx)
 	if (unlikely(llc_ctx_test_flag(llcx, LLC_CTX_F_SATURATED)))
 		return true;
 
-	return false;
+	return true;
 }
 
 static void set_deadline_slice(struct task_struct *p, task_ctx *taskc,
@@ -834,7 +834,7 @@ static bool keep_running(struct cpu_ctx *cpuc, struct llc_ctx *llcx,
 static s32 pick_idle_affinitized_cpu(struct task_struct *p, task_ctx *taskc,
 				     s32 prev_cpu, bool *is_idle)
 {
-	const struct cpumask *idle_smtmask, *idle_cpumask;
+	const struct cpumask *idle_cpumask;
 	struct mask_wrapper *wrapper;
 	struct bpf_cpumask *mask;
 	struct llc_ctx *llcx;
@@ -847,7 +847,6 @@ static s32 pick_idle_affinitized_cpu(struct task_struct *p, task_ctx *taskc,
 	}
 
 	idle_cpumask = scx_bpf_get_idle_cpumask();
-	idle_smtmask = scx_bpf_get_idle_smtmask();
 
 	if (!(llcx = lookup_llc_ctx(taskc->llc_id)) ||
 	    !llcx->cpumask)
@@ -906,7 +905,6 @@ static s32 pick_idle_affinitized_cpu(struct task_struct *p, task_ctx *taskc,
 
 found_cpu:
 	scx_bpf_put_cpumask(idle_cpumask);
-	scx_bpf_put_cpumask(idle_smtmask);
 
 	return cpu;
 }
@@ -1009,15 +1007,14 @@ u32 __attribute__((noinline)) find_least_loaded_llc_for_fork(u32 parent_llc_id)
 static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 			 s32 prev_cpu, u64 wake_flags, bool *is_idle)
 {
-	const struct cpumask *idle_smtmask, *idle_cpumask;
+	const struct cpumask *idle_cpumask;
 	struct llc_ctx *llcx;
 	s32 pref_cpu, cpu = prev_cpu;
 	bool migratable = false;
 
 	idle_cpumask = scx_bpf_get_idle_cpumask();
-	idle_smtmask = scx_bpf_get_idle_smtmask();
 
-	if (!idle_cpumask || !idle_smtmask)
+	if (!idle_cpumask)
 		goto found_cpu;
 
 	if (bpf_cpumask_test_cpu(prev_cpu, idle_cpumask) &&
@@ -1270,7 +1267,6 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 
 found_cpu:
 	scx_bpf_put_cpumask(idle_cpumask);
-	scx_bpf_put_cpumask(idle_smtmask);
 
 	return cpu;
 }
