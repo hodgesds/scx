@@ -989,7 +989,7 @@ static bool keep_running(struct cpu_ctx *cpuc, struct llc_ctx *llcx,
 static s32 pick_idle_affinitized_cpu(struct task_struct *p, task_ctx *taskc,
 				     s32 prev_cpu, bool *is_idle)
 {
-	const struct cpumask *idle_smtmask, *idle_cpumask;
+	const struct cpumask *idle_cpumask;
 	struct mask_wrapper *wrapper;
 	struct bpf_cpumask *mask;
 	struct llc_ctx *llcx;
@@ -1002,7 +1002,6 @@ static s32 pick_idle_affinitized_cpu(struct task_struct *p, task_ctx *taskc,
 	}
 
 	idle_cpumask = scx_bpf_get_idle_cpumask();
-	idle_smtmask = scx_bpf_get_idle_smtmask();
 
 	if (!(llcx = lookup_llc_ctx(taskc->llc_id)) ||
 	    !llcx->cpumask)
@@ -1060,7 +1059,6 @@ static s32 pick_idle_affinitized_cpu(struct task_struct *p, task_ctx *taskc,
 
 found_cpu:
 	scx_bpf_put_cpumask(idle_cpumask);
-	scx_bpf_put_cpumask(idle_smtmask);
 
 	return cpu;
 }
@@ -1364,30 +1362,49 @@ static __always_inline s32 pick_idle_energy_aware(struct task_struct *p,
 static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 			 s32 prev_cpu, u64 wake_flags, bool *is_idle)
 {
-	const struct cpumask *idle_smtmask, *idle_cpumask;
+	const struct cpumask *idle_cpumask;
 	struct llc_ctx *llcx;
 	s32 pref_cpu, cpu = prev_cpu;
 	bool migratable = false;
 
 	idle_cpumask = scx_bpf_get_idle_cpumask();
-	idle_smtmask = scx_bpf_get_idle_smtmask();
 
-	if (!idle_cpumask || !idle_smtmask)
+	if (!idle_cpumask)
 		goto found_cpu;
 
 	if (bpf_cpumask_test_cpu(prev_cpu, idle_cpumask) &&
 	    scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+		stat_inc(P2DQ_STAT_WAKE_PREV);
 		*is_idle = true;
 		goto found_cpu;
 	}
 
-	if (p2dq_config.interactive_sticky && task_ctx_test_flag(taskc, TASK_CTX_F_INTERACTIVE)) {
+	if (idle_cpumask &&
+	    (bpf_cpumask_empty(idle_cpumask) || saturated || overloaded))
+		goto found_cpu;
+
+	if (p2dq_config.interactive_sticky &&
+	    task_ctx_test_flag(taskc, TASK_CTX_F_INTERACTIVE)) {
 		*is_idle = scx_bpf_test_and_clear_cpu_idle(prev_cpu);
 		goto found_cpu;
 	}
 
-	if (idle_cpumask && bpf_cpumask_empty(idle_cpumask))
-		goto found_cpu;
+	// For interactive tasks, prioritize cache locality
+	if (topo_config.smt_enabled &&
+	    task_ctx_test_flag(taskc, TASK_CTX_F_INTERACTIVE)) {
+		struct cpu_ctx *prev_cpuc = lookup_cpu_ctx(prev_cpu);
+		if (prev_cpuc && prev_cpuc->sibling_cpu >= 0) {
+			s32 sibling = prev_cpuc->sibling_cpu;
+			if (bpf_cpumask_test_cpu(sibling, p->cpus_ptr) &&
+			    bpf_cpumask_test_cpu(sibling, idle_cpumask) &&
+			    scx_bpf_test_and_clear_cpu_idle(sibling)) {
+				cpu = sibling;
+				*is_idle = true;
+				stat_inc(P2DQ_STAT_WAKE_SIB);
+				goto found_cpu;
+			}
+		}
+	}
 
 	if (!(llcx = lookup_llc_ctx(taskc->llc_id)) ||
 	    !llcx->cpumask)
@@ -1395,13 +1412,14 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 
 	migratable = can_migrate(taskc, llcx);
 	if (topo_config.nr_llcs > 1 &&
-	    (llc_ctx_test_flag(llcx, LLC_CTX_F_SATURATED) || saturated || overloaded) &&
+	    (llc_ctx_test_flag(llcx, LLC_CTX_F_SATURATED)) &&
 	    !migratable) {
 		cpu = prev_cpu;
 		goto found_cpu;
 	}
 
-	if (!valid_dsq(taskc->dsq_id))
+
+	if (unlikely(!valid_dsq(taskc->dsq_id)))
 		if (!(llcx = rand_llc_ctx()))
 			goto found_cpu;
 
@@ -1414,6 +1432,13 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 		// Interactive tasks aren't worth migrating across LLCs.
 		if (task_ctx_test_flag(taskc, TASK_CTX_F_INTERACTIVE) ||
 		    (topo_config.nr_llcs == 2 && topo_config.nr_nodes == 2)) {
+			if (bpf_cpumask_test_cpu(prev_cpu, idle_cpumask) &&
+			    scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+				cpu = prev_cpu;
+				*is_idle = true;
+				stat_inc(P2DQ_STAT_WAKE_PREV);
+				goto found_cpu;
+			}
 			// Try an idle CPU in the LLC.
 			if (llcx->cpumask &&
 			    (cpu = __pick_idle_cpu(llcx->cpumask, 0)
@@ -1438,7 +1463,13 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 
 		if (waker_taskc->llc_id == llcx->id ||
 		    !lb_config.wakeup_llc_migrations) {
-			// Try an idle smt core in the LLC.
+			if (bpf_cpumask_test_cpu(prev_cpu, idle_cpumask) &&
+			    scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+				cpu = prev_cpu;
+				*is_idle = true;
+				stat_inc(P2DQ_STAT_WAKE_PREV);
+				goto found_cpu;
+			}
 			if (topo_config.smt_enabled &&
 			    llcx->cpumask &&
 			    (cpu = __pick_idle_cpu(llcx->cpumask,
@@ -1598,19 +1629,43 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 		}
 	}
 
-	// Next try in the local LLC (usually succeeds)
+	if (bpf_cpumask_test_cpu(prev_cpu, idle_cpumask) &&
+	    scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+		cpu = prev_cpu;
+		*is_idle = true;
+		stat_inc(P2DQ_STAT_WAKE_PREV);
+		goto found_cpu;
+	}
+
+	if (topo_config.smt_enabled) {
+		struct cpu_ctx *prev_cpuc = lookup_cpu_ctx(prev_cpu);
+		if (prev_cpuc && prev_cpuc->sibling_cpu >= 0) {
+			s32 sibling = prev_cpuc->sibling_cpu;
+			if (bpf_cpumask_test_cpu(sibling, p->cpus_ptr) &&
+			    bpf_cpumask_test_cpu(sibling, idle_cpumask) &&
+			    scx_bpf_test_and_clear_cpu_idle(sibling)) {
+				cpu = sibling;
+				*is_idle = true;
+				stat_inc(P2DQ_STAT_WAKE_SIB);
+				goto found_cpu;
+			}
+		}
+	}
+
 	if (likely(llcx->cpumask &&
 	    (cpu = __pick_idle_cpu(llcx->cpumask,
 				   SCX_PICK_IDLE_CORE)
 	     ) >= 0)) {
 		*is_idle = true;
+		stat_inc(P2DQ_STAT_WAKE_LLC);
 		goto found_cpu;
 	}
 
-	// Try a idle CPU in the llc (also likely to succeed)
+	// Finally try any idle CPU in the llc
 	if (likely(llcx->cpumask &&
 	    (cpu = __pick_idle_cpu(llcx->cpumask, 0)) >= 0)) {
 		*is_idle = true;
+		stat_inc(P2DQ_STAT_WAKE_LLC);
 		goto found_cpu;
 	}
 
@@ -1652,7 +1707,6 @@ static s32 pick_idle_cpu(struct task_struct *p, task_ctx *taskc,
 
 found_cpu:
 	scx_bpf_put_cpumask(idle_cpumask);
-	scx_bpf_put_cpumask(idle_smtmask);
 
 	return cpu;
 }
@@ -2367,40 +2421,43 @@ void BPF_STRUCT_OPS(p2dq_stopping, struct task_struct *p, bool runnable)
 	if (!runnable) {
 		used = now - taskc->last_run_started;
 
-		// Affinitized tasks need stricter thresholds to prevent monopolization
-		bool is_affinitized = !task_ctx_test_flag(taskc, TASK_CTX_F_ALL_CPUS);
-		u64 inc_threshold = is_affinitized ?
-			((19 * last_dsq_slice_ns) / 20) :  // 95% for affinitized
-			((9 * last_dsq_slice_ns) / 10);     // 90% for normal
-		u64 dec_threshold = is_affinitized ?
-			(last_dsq_slice_ns / 4) :           // 25% for affinitized
-			(last_dsq_slice_ns / 2);            // 50% for normal
+		// Skip DSQ index adjustment entirely in single-DSQ mode (optimization)
+		if (p2dq_config.nr_dsqs_per_llc > 1) {
+			// Affinitized tasks need stricter thresholds to prevent monopolization
+			bool is_affinitized = !task_ctx_test_flag(taskc, TASK_CTX_F_ALL_CPUS);
+			u64 inc_threshold = is_affinitized ?
+				((19 * last_dsq_slice_ns) / 20) :  // 95% for affinitized
+				((9 * last_dsq_slice_ns) / 10);     // 90% for normal
+			u64 dec_threshold = is_affinitized ?
+				(last_dsq_slice_ns / 4) :           // 25% for affinitized
+				(last_dsq_slice_ns / 2);            // 50% for normal
 
-		// On stopping determine if the task can move to a longer DSQ by
-		// comparing the used time to the scaled DSQ slice.
-		if (used >= inc_threshold) {
-			if (taskc->dsq_index < p2dq_config.nr_dsqs_per_llc - 1 &&
-			    p->scx.weight >= 100) {
-				taskc->dsq_index += 1;
-				stat_inc(P2DQ_STAT_DSQ_CHANGE);
-				trace("%s[%p]: DSQ inc %llu -> %u", p->comm, p,
-				      taskc->last_dsq_index, taskc->dsq_index);
+			// On stopping determine if the task can move to a longer DSQ by
+			// comparing the used time to the scaled DSQ slice.
+			if (used >= inc_threshold) {
+				if (taskc->dsq_index < p2dq_config.nr_dsqs_per_llc - 1 &&
+				    p->scx.weight >= 100) {
+					taskc->dsq_index += 1;
+					stat_inc(P2DQ_STAT_DSQ_CHANGE);
+					trace("%s[%p]: DSQ inc %llu -> %u", p->comm, p,
+					      taskc->last_dsq_index, taskc->dsq_index);
+				} else {
+					stat_inc(P2DQ_STAT_DSQ_SAME);
+				}
+			// If under threshold, move the task back down.
+			} else if (used < dec_threshold) {
+				if (taskc->dsq_index > 0) {
+					taskc->dsq_index -= 1;
+					stat_inc(P2DQ_STAT_DSQ_CHANGE);
+					trace("%s[%p]: DSQ dec %llu -> %u",
+					      p->comm, p,
+					      taskc->last_dsq_index, taskc->dsq_index);
+				} else {
+					stat_inc(P2DQ_STAT_DSQ_SAME);
+				}
 			} else {
 				stat_inc(P2DQ_STAT_DSQ_SAME);
 			}
-		// If under threshold, move the task back down.
-		} else if (used < dec_threshold) {
-			if (taskc->dsq_index > 0) {
-				taskc->dsq_index -= 1;
-				stat_inc(P2DQ_STAT_DSQ_CHANGE);
-				trace("%s[%p]: DSQ dec %llu -> %u",
-				      p->comm, p,
-				      taskc->last_dsq_index, taskc->dsq_index);
-			} else {
-				stat_inc(P2DQ_STAT_DSQ_SAME);
-			}
-		} else {
-			stat_inc(P2DQ_STAT_DSQ_SAME);
 		}
 
 		// nice tasks can only get the minimal amount of non
@@ -3305,8 +3362,21 @@ static s32 init_cpu(int cpu)
 		bpf_cpumask_set_cpu(cpu, llcx->cpumask);
 	bpf_rcu_read_unlock();
 
-	trace("CFG CPU[%d]NODE[%d]LLC[%d] initialized",
-	    cpu, cpuc->node_id, cpuc->llc_id);
+	// Find SMT sibling (CPU on same core)
+	cpuc->sibling_cpu = -1;
+	if (topo_config.smt_enabled) {
+		u32 my_core_id = cpu_core_ids[cpu];
+		int sibling;
+		bpf_for(sibling, 0, topo_config.nr_cpus) {
+			if (sibling != cpu && cpu_core_ids[sibling] == my_core_id) {
+				cpuc->sibling_cpu = sibling;
+				break;
+			}
+		}
+	}
+
+	trace("CFG CPU[%d]NODE[%d]LLC[%d] sibling=%d initialized",
+	    cpu, cpuc->node_id, cpuc->llc_id, cpuc->sibling_cpu);
 
 	return 0;
 }

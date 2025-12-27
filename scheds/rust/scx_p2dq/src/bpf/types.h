@@ -42,23 +42,27 @@ struct p2dq_timer {
 struct cpu_ctx {
 	int				id;
 	u32				llc_id;
-	u64				affn_dsq;
-	u64				slice_ns;
 	u32				core_id;
-	u32				dsq_index;
-	u32				perf;  /* Thermal pressure (0-1024, 0=no throttling, 1024=max capacity lost) */
-	u32				flags;  /* Bitmask for interactive, is_big, nice_task */
-	u64				ran_for;
 	u32				node_id;
-	u64				mig_dsq;
-	u64				llc_dsq;
-	u64				max_load_dsq;
+	s32				sibling_cpu;  /* SMT sibling CPU ID, -1 if none */
+	u32				flags;  /* Bitmask for interactive, is_big, nice_task */
+	u32				perf;  /* Thermal pressure (0-1024, 0=no throttling, 1024=max capacity lost) */
 	u32				running_weight;  /* Weight of currently running task */
+	u32				dsq_index;
+	u32				__pad1[7];
+
+	u64				slice_ns;
+	u64				ran_for;
+
+	u64				affn_dsq;
+	u64				llc_dsq;
+	u64				mig_dsq;
+	u64				max_load_dsq;
 
 	scx_atq_t			*mig_atq;
 	scx_dhq_t			*mig_dhq;
 	u64				dhq_strand;  /* Which DHQ strand (A or B) for this CPU's LLC */
-};
+} __attribute__((aligned(CACHE_LINE_SIZE)));
 
 /* llc_ctx state flag bits */
 #define LLC_CTX_F_SATURATED	(1 << 0)

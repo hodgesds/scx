@@ -73,6 +73,8 @@ pub struct Metrics {
     pub wake_llc: u64,
     #[stat(desc = "Number of times tasks have been woken and migrated llc")]
     pub wake_mig: u64,
+    #[stat(desc = "Number of times tasks have been woken and migrated to sibling CPU")]
+    pub wake_sib: u64,
     #[stat(desc = "Number of times fork balancing migrated to different LLC")]
     pub fork_balance: u64,
     #[stat(desc = "Number of times exec balancing migrated to different LLC")]
@@ -113,8 +115,9 @@ impl Metrics {
 
         // Build the stats line conditionally based on thermal tracking availability
         let mut stats_line = format!(
-            "\twake prev/llc/mig {}/{}/{}\n\tpick2 select/dispatch {}/{}\n\tmigrations llc/node: {}/{}\n\tfork balance/same {}/{}\n\texec balance/same {}/{}",
+            "\twake prev/sib/llc/mig {}/{}/{}/{}\n\tpick2 select/dispatch {}/{}\n\tmigrations llc/node: {}/{}\n\tfork balance/same {}/{}\n\texec balance/same {}/{}",
             self.wake_prev,
+            self.wake_sib,
             self.wake_llc,
             self.wake_mig,
             self.select_pick2,
@@ -167,6 +170,7 @@ impl Metrics {
             wake_prev: self.wake_prev - rhs.wake_prev,
             wake_llc: self.wake_llc - rhs.wake_llc,
             wake_mig: self.wake_mig - rhs.wake_mig,
+            wake_sib: self.wake_sib - rhs.wake_sib,
             fork_balance: self.fork_balance - rhs.fork_balance,
             exec_balance: self.exec_balance - rhs.exec_balance,
             fork_same_llc: self.fork_same_llc - rhs.fork_same_llc,
