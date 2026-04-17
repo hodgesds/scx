@@ -785,6 +785,16 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		reset_task_flag(taskc, LAVD_FLAG_IDLE_CPU_PICKED);
 	}
 
+	/*
+	 * If the task has migration disabled, it must stay on its current
+	 * CPU. The CPU selected by ops.select_cpu() may be stale if
+	 * migration was disabled between select_cpu and enqueue.
+	 */
+	if (is_migration_disabled(p) && cpu != task_cpu) {
+		cpu = task_cpu;
+		is_idle = scx_bpf_test_and_clear_cpu_idle(cpu);
+	}
+
 	cpuc = get_cpu_ctx_id(cpu);
 	if (!cpuc) {
 		scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
