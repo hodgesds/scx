@@ -602,6 +602,24 @@ s32 migrate_to_neighbor(struct pick_ctx *ctx, struct cpdom_ctx *cpdc,
 			if (!mig_cpdc || !READ_ONCE(mig_cpdc->is_stealer))
 				continue;
 
+			/*
+			 * Gate cross-NUMA migration:
+			 * 1) Only allow if NUMA load EMA shows significant
+			 *    imbalance justifying the cross-NUMA cost.
+			 * 2) Further gate by NUMA distance so closer NUMA
+			 *    nodes are preferred over farther ones.
+			 */
+			if (nr_numa_nodes > 1 &&
+			    cpdc->numa_id != mig_cpdc->numa_id) {
+				if (!is_cross_numa_justified(cpdc->numa_id,
+							    mig_cpdc->numa_id))
+					continue;
+				u32 dist = get_numa_dist(cpdc->numa_id,
+							 mig_cpdc->numa_id);
+				if (!prob_x_out_of_y(LAVD_NUMA_LOCAL_DIST, dist))
+					continue;
+			}
+
 			cpu = pick_idle_cpu_at_cpdom(ctx, mig_cpdom, scope, is_idle);
 			if (cpu >= 0) {
 				/*
@@ -619,6 +637,14 @@ s32 migrate_to_neighbor(struct pick_ctx *ctx, struct cpdom_ctx *cpdc,
 				break;
 			}
 		}
+
+		/*
+		 * Gate further distance traversal. Migration to a farther
+		 * neighbor is more expensive (e.g., crossing a NUMA boundary),
+		 * so decrease the chance exponentially as distance increases.
+		 */
+		if (!prob_x_out_of_y(1, LAVD_CPDOM_MIG_PROB_FT))
+			break;
 	}
 
 	return cpu;

@@ -479,6 +479,7 @@ impl<'a> Scheduler<'a> {
         let order = CpuOrder::new(opts.topology.as_ref()).unwrap();
         Self::init_cpus(&mut skel, &order);
         Self::init_cpdoms(&mut skel, &order);
+        Self::init_numa_dist(&mut skel, &order);
 
         // When there are multiple domains, hook the execve() syscall family
         // to enable aggressive cross-domain migration when execve() is called.
@@ -661,6 +662,22 @@ impl<'a> Scheduler<'a> {
                     skel.maps.bss_data.as_mut().unwrap().cpdom_ctxs[v.cpdom_id].neighbor_ids[idx] =
                         id as u8;
                 }
+            }
+        }
+    }
+
+    fn init_numa_dist(skel: &mut OpenBpfSkel, order: &CpuOrder) {
+        let bss_data = skel.maps.bss_data.as_mut().unwrap();
+        bss_data.nr_numa_nodes = order.nr_numa as i32;
+        for (i, row) in order.numa_distances.iter().enumerate() {
+            if i >= LAVD_NUMA_MAX_NR as usize {
+                break;
+            }
+            for (j, &dist) in row.iter().enumerate() {
+                if j >= LAVD_NUMA_MAX_NR as usize {
+                    break;
+                }
+                bss_data.numa_dist_table[i * LAVD_NUMA_MAX_NR as usize + j] = dist as u32;
             }
         }
     }

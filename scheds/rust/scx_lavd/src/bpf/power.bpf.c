@@ -43,6 +43,11 @@ int			nr_cpdoms;
 /* contexts for compute domains */
 struct cpdom_ctx	cpdom_ctxs[LAVD_CPDOM_MAX_NR];
 
+/* NUMA distance table, node count, and per-NUMA load EMA */
+u32			numa_dist_table[LAVD_NUMA_MAX_NR * LAVD_NUMA_MAX_NR];
+int			nr_numa_nodes;
+u32			numa_load_avg[LAVD_NUMA_MAX_NR];
+
 /* online CPU mask for each compute domain */
 private(LAVD) struct bpf_cpumask cpdom_cpumask[LAVD_CPDOM_MAX_NR];
 

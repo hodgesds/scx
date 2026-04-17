@@ -90,6 +90,7 @@ pub struct CpuOrder {
     pub nr_cpdoms: usize,
     pub nr_llcs: usize,
     pub nr_numa: usize,
+    pub numa_distances: Vec<Vec<usize>>,
     pub smt_enabled: bool,
     pub has_biglittle: bool,
     pub has_energy_model: bool,
@@ -110,6 +111,12 @@ impl CpuOrder {
         };
 
         let nr_cpdoms = cpdom_map.len();
+        let numa_distances: Vec<Vec<usize>> = ctx
+            .topo
+            .nodes
+            .values()
+            .map(|n| n.distance.clone())
+            .collect();
         Ok(CpuOrder {
             all_cpus_mask: ctx.topo.span,
             cpuids: cpus_pf,
@@ -120,6 +127,7 @@ impl CpuOrder {
             nr_cpdoms,
             nr_llcs: ctx.topo.all_llcs.len(),
             nr_numa: ctx.topo.nodes.len(),
+            numa_distances,
             smt_enabled: ctx.smt_enabled,
             has_biglittle: ctx.has_biglittle,
             has_energy_model: ctx.has_energy_model,

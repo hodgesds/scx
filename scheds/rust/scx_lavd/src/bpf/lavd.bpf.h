@@ -290,6 +290,39 @@ struct cpdom_ctx {
 extern struct cpdom_ctx		cpdom_ctxs[LAVD_CPDOM_MAX_NR];
 extern struct bpf_cpumask	cpdom_cpumask[LAVD_CPDOM_MAX_NR];
 extern int			nr_cpdoms;
+extern u32			numa_dist_table[LAVD_NUMA_MAX_NR * LAVD_NUMA_MAX_NR];
+extern int			nr_numa_nodes;
+extern u32			numa_load_avg[LAVD_NUMA_MAX_NR];
+
+static inline u32 get_numa_dist(u8 src, u8 dst)
+{
+	u32 s = src & (LAVD_NUMA_MAX_NR - 1);
+	u32 d = dst & (LAVD_NUMA_MAX_NR - 1);
+	u32 dist = numa_dist_table[s * LAVD_NUMA_MAX_NR + d];
+	return dist > 0 ? dist : LAVD_NUMA_LOCAL_DIST;
+}
+
+/*
+ * Check if cross-NUMA migration is justified by load imbalance.
+ * @heavy_numa: the overloaded NUMA node (source of migration)
+ * @light_numa: the underloaded NUMA node (destination of migration)
+ *
+ * Returns true only when the heavy NUMA's EMA load is significantly
+ * higher than the light NUMA's, justifying the cross-NUMA cost.
+ */
+static inline bool is_cross_numa_justified(u8 heavy_numa, u8 light_numa)
+{
+	if (nr_numa_nodes <= 1 || heavy_numa == light_numa)
+		return true;
+
+	u32 h = heavy_numa & (LAVD_NUMA_MAX_NR - 1);
+	u32 l = light_numa & (LAVD_NUMA_MAX_NR - 1);
+	u32 heavy_load = READ_ONCE(numa_load_avg[h]);
+	u32 light_load = READ_ONCE(numa_load_avg[l]);
+
+	/* Allow if heavy NUMA load exceeds light by >25% */
+	return heavy_load > light_load + (light_load >> 2);
+}
 
 typedef struct task_ctx __arena task_ctx;
 

@@ -59,8 +59,11 @@ int plan_x_cpdom_migration(void)
 
 
 	/*
-	 * Calculate scaled load for each active compute domain.
+	 * Calculate scaled load for each active compute domain and
+	 * aggregate per-NUMA load.
 	 */
+	u32 numa_load_cur[LAVD_NUMA_MAX_NR] = {};
+
 	bpf_for(cpdom_id, 0, nr_cpdoms) {
 		if (cpdom_id >= LAVD_CPDOM_MAX_NR)
 			break;
@@ -91,6 +94,9 @@ int plan_x_cpdom_migration(void)
 		cpdomc->load_invr = util + qlen_invr;
 		avg_load_invr += cpdomc->load_invr;
 
+		if (cpdomc->numa_id < LAVD_NUMA_MAX_NR)
+			numa_load_cur[cpdomc->numa_id] += cpdomc->load_invr;
+
 		if (min_load_invr > cpdomc->load_invr)
 			min_load_invr = cpdomc->load_invr;
 		if (max_load_invr < cpdomc->load_invr)
@@ -100,6 +106,16 @@ int plan_x_cpdom_migration(void)
 	}
 	if (sys_stat.nr_active_cpdoms)
 		avg_load_invr /= sys_stat.nr_active_cpdoms;
+
+	/*
+	 * Update per-NUMA load EMA.
+	 */
+	for (int i = 0; i < LAVD_NUMA_MAX_NR; i++) {
+		if (i >= nr_numa_nodes)
+			break;
+		numa_load_avg[i] = calc_avg32(numa_load_avg[i],
+					      numa_load_cur[i]);
+	}
 
 	/*
 	 * When the highest per-CPU utilization among all compute
@@ -408,11 +424,35 @@ static bool force_to_steal_task(struct cpdom_ctx *cpdomc)
 			if (!cpdomc_pick->is_valid)
 				continue;
 
+			/*
+			 * Gate cross-NUMA stealing:
+			 * 1) Check NUMA load imbalance justifies it.
+			 * 2) Further gate by NUMA distance.
+			 */
+			if (nr_numa_nodes > 1 &&
+			    cpdomc->numa_id != cpdomc_pick->numa_id) {
+				if (!is_cross_numa_justified(
+					    cpdomc_pick->numa_id,
+					    cpdomc->numa_id))
+					continue;
+				u32 dist = get_numa_dist(cpdomc->numa_id,
+							 cpdomc_pick->numa_id);
+				if (!prob_x_out_of_y(LAVD_NUMA_LOCAL_DIST, dist))
+					continue;
+			}
+
 			dsq_id = pick_most_loaded_dsq(cpdomc_pick);
 
 			if (consume_dsq(cpdomc_pick, dsq_id))
 				return true;
 		}
+
+		/*
+		 * Gate further distance traversal to reduce cross-NUMA
+		 * stealing.
+		 */
+		if (!prob_x_out_of_y(1, LAVD_CPDOM_MIG_PROB_FT))
+			break;
 	}
 
 	return false;
