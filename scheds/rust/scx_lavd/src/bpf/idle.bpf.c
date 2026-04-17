@@ -451,20 +451,39 @@ s32 find_sticky_cpu_and_cpdom(struct pick_ctx *ctx, s64 *sticky_cpdom)
 		d0 = MEMBER_VPTR(cpdom_ctxs, [p0->cpdom_id]);
 		d1 = MEMBER_VPTR(cpdom_ctxs, [p1->cpdom_id]);
 
-		if ((p0 != p1) && (d0 && d1) && (d0->load_invr > d1->load_invr)) {
-			/*
-			 * When a waker's compute domain is chosen, let's just
-			 * stick to the waker's domain. Let's not decide to
-			 * stick to the waker's CPU at this point. Since a
-			 * single waker can trigger waking up many other tasks,
-			 * always moving to the waker's CPU could introduce a
-			 * thundering herd problem. So return -ENOENT.
-			 */
-			*sticky_cpdom = p1->cpdom_id;
-			return -ENOENT;
-		} else {
-			*sticky_cpdom = p0->cpdom_id;
-			return p0->cpu_id; /* prev_cpu */
+		if ((p0 != p1) && (d0 && d1)) {
+			bool prefer_waker;
+
+			if (nr_numa_nodes > 1 &&
+			    d0->numa_id != d1->numa_id) {
+				/*
+				 * Cross-NUMA: require a significant load
+				 * advantage (>25%) to follow the waker.
+				 * Avoids bouncing latency-critical tasks
+				 * across NUMA on every wakeup.
+				 */
+				prefer_waker = d0->load_invr >
+					d1->load_invr + (d1->load_invr >> 2);
+			} else {
+				prefer_waker = d0->load_invr > d1->load_invr;
+			}
+
+			if (prefer_waker) {
+				/*
+				 * When a waker's compute domain is chosen,
+				 * let's just stick to the waker's domain.
+				 * Let's not decide to stick to the waker's
+				 * CPU at this point. Since a single waker can
+				 * trigger waking up many other tasks, always
+				 * moving to the waker's CPU could introduce a
+				 * thundering herd problem. So return -ENOENT.
+				 */
+				*sticky_cpdom = p1->cpdom_id;
+				return -ENOENT;
+			} else {
+				*sticky_cpdom = p0->cpdom_id;
+				return p0->cpu_id; /* prev_cpu */
+			}
 		}
 	}
 

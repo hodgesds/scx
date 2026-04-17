@@ -94,8 +94,16 @@ int plan_x_cpdom_migration(void)
 		cpdomc->load_invr = util + qlen_invr;
 		avg_load_invr += cpdomc->load_invr;
 
-		if (cpdomc->numa_id < LAVD_NUMA_MAX_NR)
-			numa_load_cur[cpdomc->numa_id] += cpdomc->load_invr;
+		if (cpdomc->numa_id < LAVD_NUMA_MAX_NR) {
+			/*
+			 * For NUMA load, weight steal/softirq utilization
+			 * at 50%. This load is real (reduces available
+			 * capacity) but not migratable.
+			 */
+			u32 steal = cpdomc->avg_steal_util_wall_sum;
+			numa_load_cur[cpdomc->numa_id] +=
+				cpdomc->load_invr - (steal >> 1);
+		}
 
 		if (min_load_invr > cpdomc->load_invr)
 			min_load_invr = cpdomc->load_invr;
