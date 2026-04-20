@@ -247,6 +247,28 @@ static bool consume_dsq(struct cpdom_ctx *cpdomc, u64 dsq_id)
 	bool ret;
 	u64 before = 0;
 
+	/*
+	 * In per-CPU DSQ mode, gate cross-NUMA consumption.
+	 * This provides defense-in-depth beyond the domain-level
+	 * steal gates, since per-CPU DSQs create more granular
+	 * steal opportunities that pass the probabilistic checks
+	 * more often.
+	 */
+	if (use_per_cpu_dsq() && nr_numa_nodes > 1) {
+		struct cpu_ctx *cpuc = get_cpu_ctx();
+		if (cpuc) {
+			struct cpdom_ctx *local_cpdc =
+				MEMBER_VPTR(cpdom_ctxs, [cpuc->cpdom_id]);
+			if (local_cpdc &&
+			    cpdomc->numa_id != local_cpdc->numa_id) {
+				if (!is_cross_numa_justified(
+					    cpdomc->numa_id,
+					    local_cpdc->numa_id))
+					return false;
+			}
+		}
+	}
+
 	if (is_monitored)
 		before = bpf_ktime_get_ns();
 	/*
