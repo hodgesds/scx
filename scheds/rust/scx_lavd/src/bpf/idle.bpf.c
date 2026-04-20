@@ -273,6 +273,18 @@ s32 cpumask_any_distribute(struct pick_ctx *ctx)
 	return -ENOENT;
 }
 
+static inline
+u8 get_cpu_numa_id(s32 cpu)
+{
+	struct cpu_ctx *cpuc = get_cpu_ctx_id(cpu);
+	if (!cpuc)
+		return 0;
+	struct cpdom_ctx *cpdc = MEMBER_VPTR(cpdom_ctxs, [cpuc->cpdom_id]);
+	if (!cpdc)
+		return 0;
+	return cpdc->numa_id;
+}
+
 static
 s32 pick_random_cpu(struct pick_ctx *ctx)
 {
@@ -290,6 +302,40 @@ s32 pick_random_cpu(struct pick_ctx *ctx)
 	cpuc1 = get_cpu_ctx_id(cpu1);
 	if (!cpuc0 || !cpuc1)
 		return ctx->prev_cpu;
+
+	return (cpuc0->cur_util_invr < cpuc1->cur_util_invr) ? cpu0 : cpu1;
+}
+
+/*
+ * NUMA-aware variant of pick_random_cpu. Picks two random candidates
+ * and prefers the one on the same NUMA node as prev_cpu. Falls back
+ * to load comparison when both are same-NUMA or both are remote.
+ */
+static
+s32 pick_random_cpu_numa(struct pick_ctx *ctx)
+{
+	s32 cpu0 = cpumask_any_distribute(ctx);
+	s32 cpu1 = cpumask_any_distribute(ctx);
+	struct cpu_ctx *cpuc0, *cpuc1;
+
+	if (cpu0 == cpu1 && cpu0 != -ENOENT)
+		return cpu0;
+
+	cpuc0 = get_cpu_ctx_id(cpu0);
+	cpuc1 = get_cpu_ctx_id(cpu1);
+	if (!cpuc0 || !cpuc1)
+		return ctx->prev_cpu;
+
+	if (nr_numa_nodes > 1) {
+		u8 prev_numa = get_cpu_numa_id(ctx->prev_cpu);
+		u8 numa0 = get_cpu_numa_id(cpu0);
+		u8 numa1 = get_cpu_numa_id(cpu1);
+
+		if (numa0 == prev_numa && numa1 != prev_numa)
+			return cpu0;
+		if (numa1 == prev_numa && numa0 != prev_numa)
+			return cpu1;
+	}
 
 	return (cpuc0->cur_util_invr < cpuc1->cur_util_invr) ? cpu0 : cpu1;
 }
@@ -773,7 +819,8 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool *is_idle)
 	 * overflow set.
 	 */
 	if (sticky_cpdom < 0) {
-		cpu = pick_random_cpu(ctx);
+		cpu = nr_numa_nodes > 1 ? pick_random_cpu_numa(ctx)
+					: pick_random_cpu(ctx);
 		goto unlock_out;
 	}
 	/* NOTE: There is a sticky domain. */
@@ -934,7 +981,8 @@ unlock_out:
 	 * For non-error cases, cpu should be chosen, so it cannot be negative.
 	 */
 	if (cpu < 0)
-		cpu = pick_random_cpu(ctx);
+		cpu = nr_numa_nodes > 1 ? pick_random_cpu_numa(ctx)
+					: pick_random_cpu(ctx);
 
 	/*
 	 * Clean up.

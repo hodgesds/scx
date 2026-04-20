@@ -362,6 +362,23 @@ static bool try_to_steal_task(struct cpdom_ctx *cpdomc)
 			if (!READ_ONCE(cpdomc_pick->is_stealee) || !cpdomc_pick->is_valid)
 				continue;
 
+			/*
+			 * Gate cross-NUMA stealing:
+			 * 1) Check NUMA load imbalance justifies it.
+			 * 2) Further gate by NUMA distance.
+			 */
+			if (nr_numa_nodes > 1 &&
+			    cpdomc->numa_id != cpdomc_pick->numa_id) {
+				if (!is_cross_numa_justified(
+					    cpdomc_pick->numa_id,
+					    cpdomc->numa_id))
+					continue;
+				u32 dist = get_numa_dist(cpdomc->numa_id,
+							 cpdomc_pick->numa_id);
+				if (!prob_x_out_of_y(LAVD_NUMA_LOCAL_DIST, dist))
+					continue;
+			}
+
 			dsq_id = pick_most_loaded_dsq(cpdomc_pick);
 
 			/*
