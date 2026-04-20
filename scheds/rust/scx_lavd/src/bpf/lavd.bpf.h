@@ -302,6 +302,9 @@ static inline u32 get_numa_dist(u8 src, u8 dst)
 	return dist > 0 ? dist : LAVD_NUMA_LOCAL_DIST;
 }
 
+extern volatile u64		nr_cpus_onln;
+extern struct sys_stat		sys_stat;
+
 /*
  * Check if cross-NUMA migration is justified by load imbalance.
  * @heavy_numa: the overloaded NUMA node (source of migration)
@@ -313,6 +316,11 @@ static inline u32 get_numa_dist(u8 src, u8 dst)
 static inline bool is_cross_numa_justified(u8 heavy_numa, u8 light_numa)
 {
 	if (nr_numa_nodes <= 1 || heavy_numa == light_numa)
+		return true;
+
+	/* When the system is saturated, allow cross-NUMA migration
+	 * unconditionally — running somewhere beats waiting. */
+	if (sys_stat.nr_active >= nr_cpus_onln)
 		return true;
 
 	u32 h = heavy_numa & (LAVD_NUMA_MAX_NR - 1);
