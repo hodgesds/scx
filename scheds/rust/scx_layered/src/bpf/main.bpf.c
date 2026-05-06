@@ -4367,15 +4367,8 @@ static s32 init_layer(int layer_id)
 			return -EINVAL;
 		}
 
-		dbg("CFG   OR[%02d]", i);
-
 		bpf_for(j, 0, ands->nr_match_ands) {
-			char header[32];
-			u64 header_data[1] = { j };
 			struct layer_match *match;
-
-			bpf_snprintf(header, sizeof(header), "CFG     AND[%02d]:",
-				     header_data, sizeof(header_data));
 
 			match = MEMBER_VPTR(layers, [layer_id].matches[i].matches[j]);
 			if (!match) {
@@ -4383,95 +4376,13 @@ static s32 init_layer(int layer_id)
 				return -EINVAL;
 			}
 
-			switch (match->kind) {
-			case MATCH_CGROUP_PREFIX:
-				dbg("%s CGROUP_PREFIX \"%s\"", header, match->cgroup_prefix);
-				break;
-			case MATCH_COMM_PREFIX:
-				dbg("%s COMM_PREFIX \"%s\"", header, match->comm_prefix);
-				break;
-			case MATCH_PCOMM_PREFIX:
-				dbg("%s PCOMM_PREFIX \"%s\"", header, match->pcomm_prefix);
-				break;
-			case MATCH_NICE_ABOVE:
-				dbg("%s NICE_ABOVE %d", header, match->nice);
-				break;
-			case MATCH_NICE_BELOW:
-				dbg("%s NICE_BELOW %d", header, match->nice);
-				break;
-			case MATCH_NICE_EQUALS:
-				dbg("%s NICE_EQUALS %d", header, match->nice);
-				break;
-			case MATCH_USER_ID_EQUALS:
-				dbg("%s USER_ID %u", header, match->user_id);
-				break;
-			case MATCH_GROUP_ID_EQUALS:
-				dbg("%s GROUP_ID %u", header, match->group_id);
-				break;
-			case MATCH_PID_EQUALS:
-				dbg("%s PID %u", header, match->pid);
-				break;
-			case MATCH_PPID_EQUALS:
-				dbg("%s PPID %u", header, match->ppid);
-				break;
-			case MATCH_TGID_EQUALS:
-				dbg("%s TGID %u", header, match->tgid);
-				break;
-			case MATCH_NSPID_EQUALS:
-				dbg("%s NSID %lld PID %d",
-				    header, match->nsid, match->pid);
-				break;
-			case MATCH_NS_EQUALS:
-				dbg("%s NSID %lld", header, match->nsid);
-				break;
-			case MATCH_SCXCMD_JOIN:
-				dbg("%s SCXCMD_JOIN \"%s\"", header, match->comm_prefix);
-				break;
-			case MATCH_IS_GROUP_LEADER:
-				dbg("%s IS_GROUP_LEADER %d", header, match->is_group_leader);
-				break;
-			case MATCH_IS_KTHREAD:
-				dbg("%s IS_KTHREAD %d", header, match->is_kthread);
-				break;
-			case MATCH_USED_GPU_TID:
-				dbg("%s GPU_TID %d", header, match->used_gpu_tid);
-				break;
-			case MATCH_USED_GPU_PID:
-				dbg("%s GPU_PID %d", header, match->used_gpu_pid);
-				break;
-			case MATCH_AVG_RUNTIME:
+			if (match->kind == MATCH_AVG_RUNTIME)
 				layer->periodically_refresh = true;
-				dbg("%s AVG_RUNTIME [%lluus, %lluus)", header,
-					match->min_avg_runtime_us,
-					match->max_avg_runtime_us);
-			case MATCH_CGROUP_SUFFIX:
-				dbg("%s CGROUP_SUFFIX \"%s\"", header, match->cgroup_suffix);
-				break;
-			case MATCH_CGROUP_CONTAINS:
-				dbg("%s CGROUP_CONTAINS \"%s\"", header, match->cgroup_substr);
-				break;
-			case MATCH_CGROUP_REGEX:
-				dbg("%s CGROUP_REGEX %d", header, match->cgroup_regex_id);
-				break;
-			case MATCH_HINT_EQUALS:
-				dbg("%s HINT_EQUALS %d", header, match->hint);
-				break;
-			case MATCH_SYSTEM_CPU_UTIL_BELOW:
-				dbg("%s SYSTEM_CPU_UTIL_BELOW %llu", header, match->system_cpu_util_below);
-				break;
-			case MATCH_DSQ_INSERT_BELOW:
-				dbg("%s DSQ_INSERT_BELOW %llu", header, match->dsq_insert_below);
-				break;
-			case MATCH_NUMA_NODE:
-				dbg("%s MATCH_NUMA_NODE %llu", header, match->numa_node_id);
-				break;
-			default:
-				scx_bpf_error("%s Invalid kind", header);
+			else if (match->kind >= NR_LAYER_MATCH_KINDS) {
+				scx_bpf_error("Invalid kind");
 				return -EINVAL;
 			}
 		}
-		if (ands->nr_match_ands == 0)
-			dbg("CFG     DEFAULT");
 	}
 
 	if ((ret = init_layer_cpumasks(layer_id))) {
