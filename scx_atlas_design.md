@@ -250,14 +250,31 @@ the hot path defaults it to a single LLC `1 << (tgid % nr_llcs)` — computed in
 BPF, zero userspace cost, and tgid-keyed so all of a process's threads share one
 LLC (a *random* pick would scatter siblings and defeat cache locality).
 
-*Hot path.* `tgid_pick_idle_cpu()` (called first in `select_cpu`, before the
-class domain) ORs the home's LLC masks into the task's `eff` scratch mask,
-intersects with `p->cpus_ptr`, and `scx_bpf_pick_idle_cpu`s within it; hits are
-the `home` stat. If the bitmask OR loop ever profiles hot, the planned
-optimization is to cache the resolved cpumask per-task (kptr + a generation
-counter bumped when the allocator changes the mask). The runtime field is
-BPF-owned (atomic add); userspace preserves it on write-back (tiny lost-update
+*Hot path.* `tgid_pick_idle_cpu()` ORs the home's LLC masks into the task's `eff`
+scratch mask, intersects with `p->cpus_ptr`, and `scx_bpf_pick_idle_cpu`s within
+it; hits are the `home` stat. If the bitmask OR loop ever profiles hot, the
+planned optimization is to cache the resolved cpumask per-task (kptr + a
+generation counter bumped when the allocator changes the mask). The runtime field
+is BPF-owned (atomic add); userspace preserves it on write-back (tiny lost-update
 window accepted for the prototype).
+
+*`select_cpu` idle-CPU ladder (locality- and NUMA-sticky).* The order is tuned to
+minimize CPU migrations (an early version that picked an arbitrary idle CPU in the
+home LLC drove ~7.5× more migrations than a comparable layered config):
+1. **prev_cpu** — if still idle and allowed, keep it (warmest cache, zero
+   migration). `scx_bpf_test_and_clear_cpu_idle(prev_cpu)`.
+2. **preferred / home** — the per-tgid home LLC set (`tgid_pick_idle_cpu`), with a
+   mempolicy-node bias first for tasks that have one.
+3. **NUMA-local fallback** — `scx_bpf_select_cpu_and(..., SCX_PICK_IDLE_IN_NODE)`
+   constrains the idle search to prev_cpu's node (effectively prev_llc → prev_node),
+   so `select_cpu` **never gratuitously crosses NUMA**. If no in-node idle CPU is
+   free, return `prev_cpu` without direct dispatch — the task enqueues on a
+   node-local LLC DSQ, and any cross-node movement is left to the conservative,
+   idle-gated xnuma steal in `dispatch`. (Older kernels without
+   `scx_bpf_select_cpu_and` fall back to `scx_bpf_select_cpu_dfl`.)
+
+Measured (10 s schbench, 88-core AMD): migrations EEVDF 133k vs atlas 995k without
+stickiness → **194k with prev_cpu stickiness** (~5× fewer).
 
 ## 3. Reusable module: `lib/soft_affinity` (principle #9) — IMPLEMENTED
 

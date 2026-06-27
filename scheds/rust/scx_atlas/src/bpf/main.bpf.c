@@ -755,6 +755,22 @@ s32 BPF_STRUCT_OPS(atlas_select_cpu, struct task_struct *p, s32 prev_cpu,
 	refresh_pref_node(p, tctx);
 
 	/*
+	 * Stickiness first: if the task's previous CPU is still idle and allowed,
+	 * keep it there. prev_cpu has the warmest cache and reusing it avoids a
+	 * migration. Picking an arbitrary idle CPU from the home set below would
+	 * bounce the task across its whole LLC every wakeup — the dominant source
+	 * of excess CPU migrations. (scx_bpf_test_and_clear_cpu_idle claims the CPU
+	 * atomically.)
+	 */
+	if (prev_cpu >= 0 && bpf_cpumask_test_cpu(prev_cpu, p->cpus_ptr) &&
+	    scx_bpf_test_and_clear_cpu_idle(prev_cpu)) {
+		stat_inc(ATLAS_STAT_LOCAL);
+		stat_inc(ATLAS_STAT_CLS_LATENCY + class);
+		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, task_slice_ns(tctx), 0);
+		return prev_cpu;
+	}
+
+	/*
 	 * Try the task's soft-affinity domain first: an idle CPU from
 	 * proximal -> preferred -> spill, intersected with the task's affinity.
 	 * A direct dispatch here skips enqueue(), so count the class on this path.
@@ -819,6 +835,29 @@ s32 BPF_STRUCT_OPS(atlas_select_cpu, struct task_struct *p, s32 prev_cpu,
 				}
 			}
 		}
+	}
+
+	/*
+	 * NUMA-sticky idle fallback: constrain the idle search to prev_cpu's NUMA
+	 * node (SCX_PICK_IDLE_IN_NODE) so select_cpu never gratuitously crosses
+	 * NUMA — keeping compute near its memory. If no idle CPU is free on the
+	 * node, return prev_cpu (no direct dispatch): the task is enqueued on a
+	 * node-local LLC DSQ and any cross-node movement is left to the
+	 * (idle-gated, conservative) xnuma steal in dispatch. Older kernels without
+	 * scx_bpf_select_cpu_and fall back to the default LLC/node-aware picker.
+	 */
+	if (__COMPAT_HAS_scx_bpf_select_cpu_and) {
+		cpu = scx_bpf_select_cpu_and(p, prev_cpu,
+					     wake_flags & ~SCX_WAKE_SYNC,
+					     p->cpus_ptr, SCX_PICK_IDLE_IN_NODE);
+		if (cpu >= 0) {
+			stat_inc(ATLAS_STAT_LOCAL);
+			stat_inc(ATLAS_STAT_CLS_LATENCY + class);
+			scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL,
+					   task_slice_ns(tctx), 0);
+			return cpu;
+		}
+		return prev_cpu;
 	}
 
 	cpu = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &is_idle);
