@@ -637,11 +637,22 @@ priority-DSQ idea — fewer queues, no starvation.)
 **Phase 3 — load balancing.** *(DONE: tiered pick-2 in dispatch — local LLC
 first, then Tier 1 pick-2 among LLCs in the local NUMA node (steal from the
 busier of two random LLCs), then Tier 2 cross-NUMA steal from the **tail**
-(`SCX_DSQ_ITER_REV`, least-urgent) of a remote LLC, skipping tasks that migrated
-NUMA within `--xnuma-mig-min-us` (default 1ms) and CPU-less CXL nodes. NUMA
-migrations tracked in `running`; `steal`/`xnuma_steal` stats. Verified: Tier-1
-steals fire; Tier-2 loads (single-node box → 0, as expected).)* Remaining:
-periodic userspace `saf_resize` from utilization; optional infeasible weights.
+(`SCX_DSQ_ITER_REV`, least-urgent) of a remote LLC. Cross-NUMA stealing is
+deliberately conservative — it's the most expensive migration (compute leaves its
+memory node):
+- **Skipped entirely on single-NUMA systems** (`nr_nodes <= 1`) — no remote node
+  exists, so dispatch avoids the idle-mask get/put and node walk on every idle.
+- **Idle-CPU gate:** a remote LLC is stolen from only if it has a backlog **and no
+  idle CPU of its own** (`bpf_cpumask_intersects(llc_mask, idle) == false`). If it
+  has an idle CPU it will self-serve, so the work stays put for locality.
+- **Affinity-safe:** since `SCX_DSQ_LOCAL_ON` forces the task onto the stealing
+  CPU, we skip any task not allowed there (`bpf_cpumask_test_cpu(cpu,
+  p->cpus_ptr)`) — without this, a per-node kthread like `kcompactd` trips a
+  runtime error.
+- Per-task gate: skip tasks that migrated NUMA within `--xnuma-mig-min-us`
+  (default 1ms); CPU-less CXL nodes are skipped.
+NUMA migrations tracked in `running`; `steal`/`xnuma_steal` stats.)* Remaining:
+optional infeasible-weight load balancing.
 
 *Exit:* imbalance metric converges under skewed load.
 

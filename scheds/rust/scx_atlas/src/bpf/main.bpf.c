@@ -988,8 +988,17 @@ static __always_inline bool steal_xnuma(s32 cpu, u32 home_node)
 {
 	u64 now = scx_bpf_now();
 	u64 min_ns = atlas_config.xnuma_mig_min_us * NSEC_PER_USEC;
+	const struct cpumask *idle;
 	struct task_struct *p;
 	u32 ni, li, cnt, dsq;
+	bool stole = false;
+
+	/*
+	 * System idle mask: a remote LLC with any idle CPU will run its own
+	 * queued tasks, so there's no reason to pull them across NUMA. We only
+	 * steal from a remote LLC that has a backlog AND no idle CPU to drain it.
+	 */
+	idle = scx_bpf_get_idle_cpumask();
 
 	bpf_for(ni, 0, topo_config.nr_nodes) {
 		if (ni >= MAX_NUMA_NODES)
@@ -999,10 +1008,24 @@ static __always_inline bool steal_xnuma(s32 cpu, u32 home_node)
 
 		cnt = node_nr_llcs[ni & (MAX_NUMA_NODES - 1)];
 		bpf_for(li, 0, cnt) {
+			struct bpf_cpumask *lmask;
+
 			if (li >= MAX_LLCS)
 				break;
 			dsq = node_llcs[ni & (MAX_NUMA_NODES - 1)][li & (MAX_LLCS - 1)];
+
+			/* Nothing queued -> nothing to relieve. */
 			if (!scx_bpf_dsq_nr_queued(dsq))
+				continue;
+
+			/*
+			 * Cross-NUMA steals are expensive (compute moves away from
+			 * its memory). Only steal when this remote LLC is fully busy
+			 * — no idle CPU of its own to run the backlog. If it has an
+			 * idle CPU, leave the work there for locality.
+			 */
+			lmask = lookup_llc_mask(dsq & (MAX_LLCS - 1));
+			if (lmask && bpf_cpumask_intersects(cast_mask(lmask), idle))
 				continue;
 
 			bpf_for_each(scx_dsq, p, dsq, SCX_DSQ_ITER_REV) {
@@ -1010,15 +1033,30 @@ static __always_inline bool steal_xnuma(s32 cpu, u32 home_node)
 
 				if (tc && now - tc->last_mig_ns < min_ns)
 					continue;
+				/*
+				 * Only steal a task this CPU is allowed to run:
+				 * SCX_DSQ_LOCAL_ON forces the task onto @cpu, so a
+				 * task affinitized off @cpu (e.g. a per-node kthread
+				 * like kcompactd) would trip a runtime error. Skip it.
+				 */
+				if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
+					continue;
 				if (scx_bpf_dsq_move(BPF_FOR_EACH_ITER, p,
 						     SCX_DSQ_LOCAL_ON | cpu, 0)) {
 					stat_inc(ATLAS_STAT_XNUMA_STEAL);
-					return true;
+					stole = true;
+					break;
 				}
 			}
+			if (stole)
+				break;
 		}
+		if (stole)
+			break;
 	}
-	return false;
+
+	scx_bpf_put_idle_cpumask(idle);
+	return stole;
 }
 
 void BPF_STRUCT_OPS(atlas_dispatch, s32 cpu, struct task_struct *prev)
@@ -1042,8 +1080,14 @@ void BPF_STRUCT_OPS(atlas_dispatch, s32 cpu, struct task_struct *prev)
 	if (pick2_node((u32)home_node))
 		return;
 
-	/* Tier 2: cross-NUMA steal of a non-recently-migrated tail task. */
-	steal_xnuma(cpu, (u32)home_node);
+	/*
+	 * Tier 2: cross-NUMA steal of a non-recently-migrated tail task. Skipped
+	 * entirely on single-NUMA systems (the common single-socket case), where
+	 * there is no remote node to steal from — avoids the idle-mask get/put and
+	 * node walk on every idle dispatch.
+	 */
+	if (topo_config.nr_nodes > 1)
+		steal_xnuma(cpu, (u32)home_node);
 }
 
 void BPF_STRUCT_OPS(atlas_running, struct task_struct *p)
