@@ -26,6 +26,7 @@ use log::info;
 use log::warn;
 use scx_stats::prelude::*;
 use scx_utils::build_id;
+use scx_utils::cli::TopologyArgs;
 use scx_utils::compat;
 use scx_utils::init_libbpf_logging;
 use scx_utils::libbpf_clap_opts::LibbpfOpts;
@@ -122,6 +123,9 @@ struct CliOpts {
 
     #[clap(flatten)]
     pub sched: SchedulerOpts,
+
+    #[clap(flatten, next_help_heading = "Topology Options")]
+    pub topology: TopologyArgs,
 
     #[clap(flatten, next_help_heading = "Libbpf Options")]
     pub libbpf: LibbpfOpts,
@@ -324,7 +328,23 @@ impl<'a> Scheduler<'a> {
             build_id::full_version(env!("CARGO_PKG_VERSION"))
         );
 
-        let topo = Topology::new()?;
+        // Build host topology, optionally splitting large LLCs into smaller
+        // virtual LLCs (--virt-llc) to reduce per-LLC DSQ lock contention and
+        // tighten scheduling/cache-affinity domains. The rest of the scheduler
+        // (per-LLC DSQs, masks, the saf allocator) keys on the resulting LLC
+        // ids, so virtual LLCs flow through transparently.
+        opts.topology.validate()?;
+        let topo = Topology::with_args(&opts.topology)?;
+        let nr_llcs = topo.all_llcs.len();
+        let max_llcs = scx_atlas::bpf_intf::atlas_consts_MAX_LLCS as usize;
+        if nr_llcs > max_llcs {
+            anyhow::bail!(
+                "{} LLCs (after --virt-llc) exceeds MAX_LLCS ({}); widen the \
+                 partition range or bump MAX_LLCS in intf.h",
+                nr_llcs,
+                max_llcs
+            );
+        }
 
         let open_opts = opts.libbpf.clone().into_bpf_open_opts();
         let mut open_skel = scx_ops_open!(skel_builder, open_object, atlas_ops, open_opts)
