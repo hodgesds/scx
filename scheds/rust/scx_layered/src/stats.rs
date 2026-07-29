@@ -254,6 +254,10 @@ pub struct LayerStats {
     pub node_loads: Vec<f64>,
     #[stat(desc = "Whether xnuma gating is active for this layer (0/1)")]
     pub xnuma_active: u32,
+    #[stat(desc = "Per-node memory bandwidth utilization for this layer (fraction of node capacity, 0.0 if disabled)")]
+    pub node_membw_util: Vec<f64>,
+    #[stat(desc = "Per-node MBW pressure flag for this layer (0/1)")]
+    pub node_membw_pressured: Vec<u32>,
     #[stat(desc = "runqueue latency histogram, log2 us buckets 1us..32s, per stats interval")]
     pub l_runq_lat_hist: Vec<u64>,
 }
@@ -266,6 +270,8 @@ impl LayerStats {
         bstats: &BpfStats,
         nr_cpus_range: (usize, usize),
         xnuma_active: bool,
+        node_membw_capacity: &[f64],
+        node_membw_pressured: &[bool],
     ) -> Self {
         let lstat = |sidx| bstats.lstats[lidx][sidx];
         let ltotal = lstat(LSTAT_SEL_LOCAL)
@@ -395,6 +401,21 @@ impl LayerStats {
                 .map(|l| l * 100.0)
                 .collect(),
             xnuma_active: if xnuma_active { 1 } else { 0 },
+            node_membw_util: {
+                let per_node = &stats.layer_node_membws[lidx];
+                per_node
+                    .iter()
+                    .enumerate()
+                    .map(|(nid, bw)| {
+                        let cap = node_membw_capacity.get(nid).copied().unwrap_or(0.0);
+                        if cap > 0.0 { bw / cap } else { 0.0 }
+                    })
+                    .collect()
+            },
+            node_membw_pressured: node_membw_pressured
+                .iter()
+                .map(|&b| if b { 1 } else { 0 })
+                .collect(),
             l_runq_lat_hist: (0..NR_RUNQ_LAT_BUCKETS)
                 .map(|b| lstat(LSTAT_RUNQ_LAT_BASE + b))
                 .collect(),

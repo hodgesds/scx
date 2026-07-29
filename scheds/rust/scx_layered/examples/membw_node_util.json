@@ -1,0 +1,29 @@
+[
+	{
+		"name": "ai-inference",
+		"matches": [
+			[{ "PcommPrefix": "vllm" }],
+			[{ "PcommPrefix": "trtllm" }]
+		],
+		"kind": {
+			"Grouped": {
+				"cpus_range": [8, 64],
+				"util_range": [0.4, 0.85],
+				"growth_algo": "Topo",
+				"node_membw_util_range": [0.30, 0.40],
+				"protected": true
+			}
+		}
+	},
+	{
+		"name": "everything-else",
+		"matches": [
+			[]
+		],
+		"kind": {
+			"Open": {
+				"growth_algo": "RandomTopo"
+			}
+		}
+	}
+]

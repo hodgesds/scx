@@ -100,3 +100,52 @@ run on clean CPUs.
 
 `scx_layered` can provide performance wins, for certain workloads when
 sufficient tuning on the layer config.
+
+### Memory-Bandwidth-Aware Layer Sizing
+
+`scx_layered` can factor memory bandwidth into per-layer CPU allocation.
+Two independent knobs control this, and they compose:
+
+1. **`membw_gb` (per-layer, absolute cap).** When set on a Confined or
+   Grouped layer, the target CPU count is clamped by dividing the
+   configured bandwidth budget by the observed per-CPU bandwidth. This
+   is a coarse layer-global cap that has been available for some time
+   (see `examples/membw.json`).
+
+2. **`node_membw_util_range: [low, high]` (per-layer, per-node
+   fraction).** New: expresses "for this layer, shrink on any NUMA node
+   where the layer's observed share of node memory bandwidth exceeds
+   `high`, and refuse to grow onto that node until it falls back below
+   `low`". Values are fractions of that node's peak bandwidth, mirroring
+   the semantics of `util_range` (which is per-layer CPU utilization).
+   On the shrink pass the scheduler computes how many CPUs to shed on
+   the pressured node proportionally, floored by the layer's global
+   `cpus_range.0`. See `examples/membw_node_util.json`.
+
+Each node gets exactly one denominator, chosen at scheduler init from
+the first source below that produces a value:
+
+1. **`--node-membw-capacity-gb <N>`** — CLI override in GiB/s, uniform
+   across all nodes. If > 0, this wins; the value is frozen for the
+   run.
+2. **HMAT sysfs** — `/sys/devices/system/node/nodeN/access0/initiators/
+   {read,write}_bandwidth`, populated by ACPI from firmware/SPD.
+   Available on essentially all Intel server BIOSes 2020+ and modern
+   AMD Genoa/Bergamo/Turin OEM BIOSes. Older AMD (Rome/Milan) BIOSes
+   often lack HMAT — check with `cat /sys/devices/system/node/node0/
+   access0/initiators/read_bandwidth`. If present, this wins; frozen
+   for the run.
+3. **Codename-seed + adaptive peak-hold** — a small `codename →
+   default GiB/s` table keyed via `scx_raw_pmu` seeds a non-zero
+   starting value so the denominator is never zero at cold start.
+   This value is then updated every tick by an adaptive peak-hold
+   (`peak = max(observed, prev × decay^elapsed_s)`, half-life ≈ 2.3
+   min), so nodes running under this source converge to their real
+   sustained peak once traffic ramps up.
+
+The source used per node is logged at scheduler init.
+
+Both knobs require memory bandwidth tracking to be active, which is
+turned on automatically whenever any layer configures `membw_gb` or
+`node_membw_util_range`. That in turn requires a supported PMU (Intel
+Haswell+ or AMD Zen 1+) and resctrl mounted at `/sys/fs/resctrl`.

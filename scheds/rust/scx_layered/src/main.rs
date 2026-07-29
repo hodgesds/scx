@@ -664,6 +664,17 @@ struct Opts {
     #[clap(long, default_value = "")]
     hi_fb_thread_name: String,
 
+    /// Per-node peak memory bandwidth in GiB/s (uniform across nodes).
+    /// If > 0, overrides HMAT and adaptive detection as the denominator
+    /// used for per-layer `node_membw_util_range` thresholds. 0.0 = auto:
+    /// prefer HMAT (`/sys/devices/system/node/nodeN/access0/initiators/
+    /// {read,write}_bandwidth`), fall back to adaptive peak-hold, seeded
+    /// from a small codename → default table so the denominator is never
+    /// zero. Only meaningful when memory-bandwidth tracking is active
+    /// (any layer configured with `membw_gb` or `node_membw_util_range`).
+    #[clap(long, default_value = "0.0")]
+    node_membw_capacity_gb: f64,
+
     #[clap(flatten, next_help_heading = "Topology Options")]
     topology: TopologyArgs,
 
@@ -683,6 +694,51 @@ enum CgroupEvent {
         path: String,
         cgroup_id: u64, // inode number
     },
+}
+
+/// Read HMAT-declared per-node peak memory bandwidth in GiB/s.
+///
+/// Returns None if the HMAT sysfs files are not present, which happens on
+/// older BIOSes (common on pre-2020 hardware and some AMD Rome/Milan
+/// boards), inside VMs without HMAT passthrough, and on kernels older than
+/// 5.5. Sysfs reports MiB/s; we sum read and write and convert to GiB/s.
+///
+/// See Documentation/admin-guide/mm/numaperf.rst.
+fn hmat_read_node_bandwidth(nid: usize) -> Option<f64> {
+    let read_mib = fs::read_to_string(format!(
+        "/sys/devices/system/node/node{}/access0/initiators/read_bandwidth",
+        nid
+    ))
+    .ok()?
+    .trim()
+    .parse::<f64>()
+    .ok()?;
+    let write_mib = fs::read_to_string(format!(
+        "/sys/devices/system/node/node{}/access0/initiators/write_bandwidth",
+        nid
+    ))
+    .ok()?
+    .trim()
+    .parse::<f64>()
+    .ok()?;
+    Some((read_mib + write_mib) / 1024.0)
+}
+
+/// Rough per-socket sustained memory bandwidth in GiB/s keyed by
+/// scx_raw_pmu codename. Only used as a cold-start floor for the
+/// adaptive path when HMAT is absent and no CLI override is set. The
+/// values are conservative; the adaptive path replaces them with the
+/// observed peak as soon as real traffic ramps up.
+fn codename_default_membw_gb(codename: &str) -> f64 {
+    match codename {
+        "SapphireRapids" | "EmeraldRapids" => 200.0,
+        "GraniteRapids" => 380.0,
+        "IceLake" | "IceLakeX" => 200.0,
+        "Genoa" | "Bergamo" => 460.0,
+        "Milan" | "MilanX" => 200.0,
+        "Turin" => 500.0,
+        _ => 100.0,
+    }
 }
 
 fn read_total_cpu(reader: &fb_procfs::ProcReader) -> Result<fb_procfs::CpuStat> {
@@ -886,6 +942,8 @@ struct Stats {
 
     layer_membws: Vec<Vec<f64>>, // Estimated memory bandsidth consumption
     prev_layer_membw_agg: Vec<Vec<u64>>, // Estimated aggregate membw consumption
+    layer_node_membws: Vec<Vec<f64>>, // Per-layer per-node membw in GiB/s (EWMA)
+    prev_layer_node_membw_agg: Vec<Vec<u64>>, // Per-layer per-node raw PMU counters
 
     cpu_busy: f64, // Read from /proc, maybe higher than total_util
     prev_total_cpu: fb_procfs::CpuStat,
@@ -925,6 +983,27 @@ impl Stats {
         }
 
         layer_membw_agg
+    }
+
+    #[allow(clippy::needless_range_loop)]
+    fn read_layer_node_membw_agg(
+        cpu_ctxs: &[bpf_intf::cpu_ctx],
+        topo: &Topology,
+        nr_layers: usize,
+        nr_nodes: usize,
+    ) -> Vec<Vec<u64>> {
+        let mut agg = vec![vec![0u64; nr_nodes]; nr_layers];
+
+        for cpu in 0..*NR_CPUS_POSSIBLE {
+            let node = topo.all_cpus.get(&cpu).map_or(0, |c| c.node_id);
+            for layer in 0..nr_layers {
+                for usage in 0..NR_LAYER_USAGES {
+                    agg[layer][node] += cpu_ctxs[cpu].layer_membw_agg[layer][usage];
+                }
+            }
+        }
+
+        agg
     }
 
     #[allow(clippy::needless_range_loop)]
@@ -1043,6 +1122,8 @@ impl Stats {
         let cpu_ctxs = read_cpu_ctxs(skel)?;
         let bpf_stats = BpfStats::read(skel, &cpu_ctxs);
         let pmu_membw = Self::read_layer_membw_agg(&cpu_ctxs, nr_layers);
+        let pmu_node_membw =
+            Self::read_layer_node_membw_agg(&cpu_ctxs, &topo, nr_layers, nr_nodes);
 
         Ok(Self {
             at: Instant::now(),
@@ -1072,6 +1153,8 @@ impl Stats {
             // It should not matter too much, since the value is dropped on the first
             // iteration.
             prev_layer_membw_agg: pmu_membw,
+            layer_node_membws: vec![vec![0.0; nr_nodes]; nr_layers],
+            prev_layer_node_membw_agg: pmu_node_membw,
             prev_pmu_resctrl_membw: (0, 0),
 
             cpu_busy: 0.0,
@@ -1148,6 +1231,12 @@ impl Stats {
             self.topo.nodes.len(),
         );
         let cur_layer_membw_agg = Self::read_layer_membw_agg(&cpu_ctxs, self.nr_layers);
+        let cur_layer_node_membw_agg = Self::read_layer_node_membw_agg(
+            &cpu_ctxs,
+            &self.topo,
+            self.nr_layers,
+            self.topo.nodes.len(),
+        );
 
         // Memory BW normalization. It requires finding the delta according to perf, the delta
         // according to resctl, and finding the factor between them. This also helps in
@@ -1202,6 +1291,16 @@ impl Stats {
             .map(|x| x.iter().map(|x| *x * factor).collect())
             .collect();
 
+        // Same normalization as cur_layer_membw but per-node, then divided
+        // by elapsed to yield GiB/s (a rate — differs from layer_membws
+        // which stores per-tick GiB delta).
+        let per_sec = if elapsed_f64 > 0.0 { 1.0 / elapsed_f64 } else { 0.0 };
+        let cur_layer_node_membw: Vec<Vec<f64>> =
+            compute_mem_diff(&cur_layer_node_membw_agg, &self.prev_layer_node_membw_agg)
+                .iter()
+                .map(|x| x.iter().map(|x| *x * factor * per_sec).collect())
+                .collect();
+
         let metric_decay =
             |cur_metric: Vec<Vec<f64>>, prev_metric: &Vec<Vec<f64>>, decay_rate: f64| {
                 cur_metric
@@ -1238,6 +1337,8 @@ impl Stats {
             metric_decay(cur_node_duty, &self.layer_node_duty_sums, *USAGE_DECAY);
 
         let layer_membws: Vec<Vec<f64>> = metric_decay(cur_layer_membw, &self.layer_membws, 0.0);
+        let layer_node_membws: Vec<Vec<f64>> =
+            metric_decay(cur_layer_node_membw, &self.layer_node_membws, *USAGE_DECAY);
 
         let proc_stat = proc_reader
             .read_stat()
@@ -1405,6 +1506,8 @@ impl Stats {
 
             layer_membws,
             prev_layer_membw_agg: cur_layer_membw_agg,
+            layer_node_membws,
+            prev_layer_node_membw_agg: cur_layer_node_membw_agg,
             // Was updated during normalization.
             prev_pmu_resctrl_membw: (pmu_cur, resctrl_cur),
 
@@ -1819,6 +1922,35 @@ impl GpuTaskAffinitizer {
     }
 }
 
+/// Source of each entry in `Scheduler::node_membw_capacity`. Determines
+/// whether the adaptive peak-hold updater is allowed to touch that
+/// node's capacity value on each tick.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum MembwCapacitySrc {
+    /// Value came from `--node-membw-capacity-gb`. Frozen.
+    CliFlag,
+    /// Value came from HMAT sysfs. Frozen.
+    Hmat,
+    /// Value was seeded from the codename → default table. Adaptive
+    /// peak-hold is allowed to raise it based on observed traffic.
+    CodenameSeed,
+}
+
+impl MembwCapacitySrc {
+    fn as_str(&self) -> &'static str {
+        match self {
+            MembwCapacitySrc::CliFlag => "cli-flag",
+            MembwCapacitySrc::Hmat => "hmat",
+            MembwCapacitySrc::CodenameSeed => "codename-seed",
+        }
+    }
+}
+
+/// Exponential decay factor per second for the adaptive per-node
+/// membw-capacity peak-hold. Applied only to nodes whose source is
+/// `CodenameSeed`. Half-life ≈ ln(0.5)/ln(0.995) s ≈ 138 s ≈ 2.3 min.
+const MEMBW_CAPACITY_DECAY: f64 = 0.995;
+
 struct Scheduler<'a> {
     skel: BpfSkel<'a>,
     struct_ops: Option<libbpf_rs::Link>,
@@ -1841,6 +1973,19 @@ struct Scheduler<'a> {
     xnuma_mig_src: Vec<Vec<bool>>,
     growth_denied: Vec<Vec<bool>>,
     processing_dur: Duration,
+
+    /// Per-node peak memory bandwidth in GiB/s. Used as the denominator
+    /// for `LayerCommon::node_membw_util_range`. Populated via
+    /// CLI > HMAT > codename-seed. See `MembwCapacitySrc`.
+    node_membw_capacity: Vec<f64>,
+    node_membw_capacity_src: Vec<MembwCapacitySrc>,
+
+    /// Per-(layer, node) MBW pressure flag with hysteresis. True means
+    /// the layer's observed share of the node's memory bandwidth crossed
+    /// `node_membw_util_range.1` and has not yet fallen below `.0`.
+    /// Consumed by `refresh_cpumasks` to force shrinks and refuse grows
+    /// on pressured nodes.
+    layer_node_membw_pressured: Vec<Vec<bool>>,
 
     topo: Arc<Topology>,
     netdevs: BTreeMap<String, NetDev>,
@@ -1914,6 +2059,39 @@ fn xnuma_check_active(
             result[nid] = false;
         } else {
             result[nid] = currently_active[nid];
+        }
+    }
+    result
+}
+
+/// Determine per-node MBW-pressure state with two-threshold hysteresis.
+///
+/// Activates when the layer's share of node bandwidth exceeds
+/// `threshold.1`, deactivates when it falls below `threshold.0`,
+/// otherwise holds the prior state. A node whose capacity is `<= 0`
+/// (i.e. the feature isn't enabled for that node) is always inactive.
+fn membw_pressure_check_active(
+    layer_node_membws: &[f64],
+    node_capacity: &[f64],
+    threshold: (f64, f64),
+    currently_active: &[bool],
+) -> Vec<bool> {
+    let (lo, hi) = threshold;
+    let nr_nodes = layer_node_membws.len();
+    let mut result = vec![false; nr_nodes];
+    for nid in 0..nr_nodes {
+        let cap = node_capacity.get(nid).copied().unwrap_or(0.0);
+        if cap <= 0.0 {
+            result[nid] = false;
+            continue;
+        }
+        let ratio = layer_node_membws[nid] / cap;
+        if ratio > hi {
+            result[nid] = true;
+        } else if ratio < lo {
+            result[nid] = false;
+        } else {
+            result[nid] = currently_active.get(nid).copied().unwrap_or(false);
         }
     }
     result
@@ -3069,6 +3247,45 @@ impl<'a> Scheduler<'a> {
             GpuTaskAffinitizer::new(opts.gpu_affinitize_secs, opts.enable_gpu_affinitize);
         gpu_task_handler.init(topo.clone());
 
+        // Resolve per-node MBW capacity in GiB/s and record its source.
+        // Precedence: --node-membw-capacity-gb > HMAT > codename-seed.
+        // Only computed when membw tracking is enabled; otherwise the
+        // vectors stay zero-length and the feature is a no-op.
+        let nr_nodes = topo.nodes.len();
+        let (node_membw_capacity, node_membw_capacity_src) = if membw_tracking {
+            let mut cap = vec![0.0f64; nr_nodes];
+            let mut src = vec![MembwCapacitySrc::CodenameSeed; nr_nodes];
+            let codename_default = {
+                match PMUManager::new() {
+                    Ok(m) => codename_default_membw_gb(&m.codename),
+                    Err(e) => {
+                        warn!("PMUManager unavailable for codename seed: {e}");
+                        codename_default_membw_gb("")
+                    }
+                }
+            };
+            for nid in 0..nr_nodes {
+                let (val, s) = if opts.node_membw_capacity_gb > 0.0 {
+                    (opts.node_membw_capacity_gb, MembwCapacitySrc::CliFlag)
+                } else if let Some(hmat) = hmat_read_node_bandwidth(nid) {
+                    (hmat, MembwCapacitySrc::Hmat)
+                } else {
+                    (codename_default, MembwCapacitySrc::CodenameSeed)
+                };
+                info!(
+                    "node {} membw capacity: {:.1} GiB/s (source: {})",
+                    nid,
+                    val,
+                    s.as_str()
+                );
+                cap[nid] = val;
+                src[nid] = s;
+            }
+            (cap, src)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
         let sched = Self {
             struct_ops: Some(struct_ops),
             layer_specs,
@@ -3094,6 +3311,10 @@ impl<'a> Scheduler<'a> {
             xnuma_mig_src: vec![vec![false; topo.nodes.len()]; nr_layers],
             growth_denied: vec![vec![false; topo.nodes.len()]; nr_layers],
             processing_dur: Default::default(),
+
+            node_membw_capacity,
+            node_membw_capacity_src,
+            layer_node_membw_pressured: vec![vec![false; topo.nodes.len()]; nr_layers],
 
             proc_reader,
             skel,
@@ -3806,6 +4027,10 @@ impl<'a> Scheduler<'a> {
         // Snapshot per-layer CPU counts for ALLOC debug logging.
         let prev_nr_cpus: Vec<usize> = self.layers.iter().map(|l| l.nr_cpus).collect();
 
+        // Per-layer minimum CPU floors, used as a global slack ceiling
+        // when MBW pressure demands extra shrinking on a specific node.
+        let layer_mins: Vec<usize> = targets.iter().map(|(_, min)| *min).collect();
+
         let mut ascending: Vec<(usize, usize)> = cpu_targets.iter().copied().enumerate().collect();
         ascending.sort_by_key(|a| a.1);
 
@@ -3855,6 +4080,39 @@ impl<'a> Scheduler<'a> {
                 let desired = alloc.node_target(n) * au;
                 let mut to_free = layer.nr_node_cpus[n].saturating_sub(desired);
                 let node_span = &self.topo.nodes[&n].span;
+
+                // MBW-pressure override: on a pressured node, force shed
+                // proportionally down to the CPU count that would put us at
+                // the high-watermark, floored by the layer's global cpus min.
+                if self
+                    .layer_node_membw_pressured
+                    .get(idx)
+                    .and_then(|v| v.get(n))
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    let cap = self.node_membw_capacity.get(n).copied().unwrap_or(0.0);
+                    let cur_bw = self.sched_stats.layer_node_membws[idx][n];
+                    let cur_cpus = layer.nr_node_cpus[n];
+                    let hi = layer
+                        .kind
+                        .common()
+                        .node_membw_util_range
+                        .map(|(_, h)| h)
+                        .unwrap_or(1.0);
+                    if cap > 0.0 && cur_bw > hi * cap && cur_cpus > 0 {
+                        // Assume BW scales roughly linearly with cpu count on
+                        // this node: solve cur_cpus * (hi * cap / cur_bw) for
+                        // the count that lands at the high-watermark.
+                        let target_cpus =
+                            ((cur_cpus as f64) * hi * cap / cur_bw).floor() as usize;
+                        let want_free = cur_cpus.saturating_sub(target_cpus);
+                        // Don't push the layer below its global cpus min.
+                        let slack = layer.nr_cpus.saturating_sub(layer_mins[idx]);
+                        let extra = want_free.min(slack);
+                        to_free = to_free.max(extra);
+                    }
+                }
 
                 while to_free > 0 {
                     let node_cands = layer.cpus.and(node_span);
@@ -3914,6 +4172,18 @@ impl<'a> Scheduler<'a> {
             let mut alloced = false;
 
             for &node_id in norder.iter() {
+                // MBW-pressure guard: refuse to grow onto a node whose
+                // membw utilization for this layer is above the high
+                // threshold.
+                if self
+                    .layer_node_membw_pressured
+                    .get(idx)
+                    .and_then(|v| v.get(node_id))
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
                 let node_target = alloc.node_target(node_id) * au;
                 let cur_node = layer.nr_node_cpus[node_id];
                 if node_target <= cur_node {
@@ -4228,12 +4498,84 @@ impl<'a> Scheduler<'a> {
                 (self.sched_stats.layer_dsq_insert_ewma[layer_id] * 10000.0) as u64;
         }
 
+        self.refresh_membw_capacity();
+        self.refresh_membw_pressure();
         self.refresh_cpumasks()?;
         self.refresh_xnuma();
         self.refresh_idle_qos()?;
         self.gpu_task_handler.maybe_affinitize();
         self.processing_dur += Instant::now().duration_since(started_at);
         Ok(())
+    }
+
+    /// Recompute per-(layer, node) MBW pressure with two-threshold
+    /// hysteresis. Called from `step()` after `refresh_membw_capacity`
+    /// so the denominator is fresh, and before `refresh_cpumasks` so
+    /// the allocator sees the current state.
+    fn refresh_membw_pressure(&mut self) {
+        if self.node_membw_capacity.is_empty() {
+            return;
+        }
+        let nr_nodes = self.topo.nodes.len();
+        for (idx, spec) in self.layer_specs.iter().enumerate() {
+            let Some(range) = spec.kind.common().node_membw_util_range else {
+                for n in 0..nr_nodes {
+                    self.layer_node_membw_pressured[idx][n] = false;
+                }
+                continue;
+            };
+            let per_node = &self.sched_stats.layer_node_membws[idx];
+            let prev = self.layer_node_membw_pressured[idx].clone();
+            let next =
+                membw_pressure_check_active(per_node, &self.node_membw_capacity, range, &prev);
+            for n in 0..nr_nodes {
+                if next[n] != prev[n] {
+                    let cap = self.node_membw_capacity[n].max(f64::EPSILON);
+                    info!(
+                        "[{}] node {} membw pressure -> {} (util={:.2}, thr=[{:.2}, {:.2}])",
+                        spec.name,
+                        n,
+                        if next[n] { "ON" } else { "OFF" },
+                        per_node[n] / cap,
+                        range.0,
+                        range.1,
+                    );
+                }
+            }
+            self.layer_node_membw_pressured[idx] = next;
+        }
+    }
+
+    /// Adaptive peak-hold update for per-node membw capacity.
+    ///
+    /// Only touches nodes whose source is `CodenameSeed` — CLI-flag and
+    /// HMAT values are authoritative and never adjusted. Runs on the
+    /// existing per-tick refresh cadence; the decay uses the stats
+    /// refresh elapsed time so the effective half-life is independent
+    /// of `--interval`.
+    fn refresh_membw_capacity(&mut self) {
+        if self.node_membw_capacity.is_empty() {
+            return;
+        }
+        let elapsed_s = self.sched_stats.elapsed.as_secs_f64();
+        if elapsed_s <= 0.0 {
+            return;
+        }
+        let decay = MEMBW_CAPACITY_DECAY.powf(elapsed_s);
+        let nr_nodes = self.topo.nodes.len();
+        for nid in 0..nr_nodes {
+            if self.node_membw_capacity_src[nid] != MembwCapacitySrc::CodenameSeed {
+                continue;
+            }
+            let observed: f64 = self
+                .sched_stats
+                .layer_node_membws
+                .iter()
+                .map(|l| l[nid])
+                .sum();
+            let decayed = self.node_membw_capacity[nid] * decay;
+            self.node_membw_capacity[nid] = observed.max(decayed);
+        }
     }
 
     fn generate_sys_stats(
@@ -4252,6 +4594,11 @@ impl<'a> Scheduler<'a> {
                 bstats,
                 cpus_ranges[lidx],
                 self.xnuma_mig_src[lidx].iter().any(|&a| a),
+                &self.node_membw_capacity,
+                self.layer_node_membw_pressured
+                    .get(lidx)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]),
             );
             sys_stats.layers.insert(spec.name.to_string(), layer_stats);
             cpus_ranges[lidx] = (layer.nr_cpus, layer.nr_cpus);
@@ -5204,13 +5551,34 @@ fn main(opts: Opts) -> Result<()> {
         if common.allow_node_aligned.is_some() {
             warn!("Layer {} has deprecated flag \"allow_node_aligned\", node-aligned tasks are now always dispatched on layer DSQs", &spec.name);
         }
+
+        if let Some((lo, hi)) = common.node_membw_util_range {
+            if !(0.0 < lo && lo < hi && hi <= 1.0) {
+                bail!(
+                    "Layer {} has invalid node_membw_util_range [{}, {}]: require 0 < low < high <= 1",
+                    &spec.name,
+                    lo,
+                    hi
+                );
+            }
+            if matches!(spec.kind, LayerKind::Open { .. }) {
+                bail!(
+                    "Layer {} is Open; node_membw_util_range is only valid on Confined/Grouped",
+                    &spec.name
+                );
+            }
+        }
     }
 
-    let membw_required = layer_config.specs.iter().any(|spec| match spec.kind {
-        LayerKind::Confined { membw_gb, .. } | LayerKind::Grouped { membw_gb, .. } => {
-            membw_gb.is_some()
-        }
-        LayerKind::Open { .. } => false,
+    let membw_required = layer_config.specs.iter().any(|spec| {
+        let common_hit = spec.kind.common().node_membw_util_range.is_some();
+        let gb_hit = match spec.kind {
+            LayerKind::Confined { membw_gb, .. } | LayerKind::Grouped { membw_gb, .. } => {
+                membw_gb.is_some()
+            }
+            LayerKind::Open { .. } => false,
+        };
+        common_hit || gb_hit
     });
 
     if opts.print_and_exit {
@@ -5312,6 +5680,69 @@ mod peak_util_tests {
             high_with_peak, 4,
             "peak should only widen the shrink boundary"
         );
+    }
+}
+
+#[cfg(test)]
+mod membw_pressure_tests {
+    use super::*;
+
+    const THR: (f64, f64) = (0.30, 0.40);
+
+    #[test]
+    fn above_high_activates() {
+        let out = membw_pressure_check_active(&[45.0], &[100.0], THR, &[false]);
+        assert_eq!(out, vec![true]);
+    }
+
+    #[test]
+    fn below_low_deactivates() {
+        let out = membw_pressure_check_active(&[20.0], &[100.0], THR, &[true]);
+        assert_eq!(out, vec![false]);
+    }
+
+    #[test]
+    fn in_band_holds() {
+        // 35% is between 30% and 40% -> keep prior state.
+        assert_eq!(
+            membw_pressure_check_active(&[35.0], &[100.0], THR, &[true]),
+            vec![true]
+        );
+        assert_eq!(
+            membw_pressure_check_active(&[35.0], &[100.0], THR, &[false]),
+            vec![false]
+        );
+    }
+
+    #[test]
+    fn zero_capacity_forces_inactive() {
+        let out = membw_pressure_check_active(&[99.0], &[0.0], THR, &[true]);
+        assert_eq!(out, vec![false]);
+    }
+
+    #[test]
+    fn per_node_independence() {
+        // Node 0 pressured, node 1 idle.
+        let out = membw_pressure_check_active(
+            &[50.0, 5.0],
+            &[100.0, 100.0],
+            THR,
+            &[false, false],
+        );
+        assert_eq!(out, vec![true, false]);
+    }
+
+    #[test]
+    fn hysteresis_two_tick_sequence() {
+        // First tick crosses high -> active.
+        let after_hi = membw_pressure_check_active(&[45.0], &[100.0], THR, &[false]);
+        assert_eq!(after_hi, vec![true]);
+        // Second tick drops into the band -> still active (hold).
+        let after_band = membw_pressure_check_active(&[35.0], &[100.0], THR, &after_hi);
+        assert_eq!(after_band, vec![true]);
+        // Third tick drops below low -> deactivates.
+        let after_lo = membw_pressure_check_active(&[10.0], &[100.0], THR, &after_band);
+        assert_eq!(after_lo, vec![false]);
     }
 }
 

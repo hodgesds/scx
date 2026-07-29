@@ -157,6 +157,18 @@ pub struct LayerCommon {
     pub xnuma_threshold: (f64, f64),
     #[serde(default = "default_xnuma_threshold_delta")]
     pub xnuma_threshold_delta: (f64, f64),
+
+    /// Per-node memory bandwidth utilization range for this layer,
+    /// expressed as a fraction of node capacity (see
+    /// `--node-membw-capacity-gb` / HMAT / codename-seed auto-detection).
+    /// When the layer's observed share of a node's memory bandwidth
+    /// crosses `.1`, the scheduler shrinks the layer on that node
+    /// proportionally and refuses to grow onto it until the share falls
+    /// back below `.0`. If `None`, no memory-bandwidth-driven per-node
+    /// grow/shrink is applied for this layer; the existing `membw_gb`
+    /// absolute cap (if set) continues to apply.
+    #[serde(default)]
+    pub node_membw_util_range: Option<(f64, f64)>,
 }
 
 fn default_xnuma_threshold() -> (f64, f64) {
