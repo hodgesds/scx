@@ -177,7 +177,8 @@ s32 any_idle_cpu_in(const struct cpumask *idle, const struct cpumask *tier)
  * Without SMT every idle CPU is a fully idle core. A lost claim is retried
  * and clears the stale hint that caused it.
  */
-static s32 pick_idle_cpu_in(s64 cpdom, const struct cpumask *tier_mask, u64 scope)
+__hidden
+s32 pick_idle_cpu_in(s64 cpdom, const struct cpumask *tier_mask, u64 scope)
 {
 	struct bpf_cpumask *i_mask, *is_mask;
 	s32 cpu;
@@ -1060,7 +1061,8 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 	if (warm_cpu_ns && ctx->prev_cpu >= 0 &&
 	    bpf_cpumask_test_cpu(ctx->prev_cpu, cast_mask(ctx->active)) &&
 	    bpf_cpumask_test_cpu(ctx->prev_cpu, ctx->p->cpus_ptr) &&
-	    !warm_cpu_turbulent_for(ctx)) {
+	    !warm_cpu_turbulent_for(ctx) &&
+	    (!enable_soft_partitioning || soft_affinity_cpu_home(ctx->taskc, ctx->prev_cpu))) {
 		if (claim_idle_cpu(ctx->prev_cpu)) {
 			cpu = ctx->prev_cpu;
 			goto idle_out;
@@ -1074,6 +1076,15 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 			 * Per-core DSQ.
 			 */
 			set_task_flag(ctx->taskc, LAVD_FLAG_WARM_CPU);
+			goto unlock_out;
+		}
+	}
+
+	/* Return from spill CPUs to the origin node when a home CPU is idle. */
+	if (enable_soft_partitioning) {
+		cpu = soft_affinity_pick(ctx);
+		if (cpu >= 0) {
+			*is_idle = true;
 			goto unlock_out;
 		}
 	}
