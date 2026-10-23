@@ -35,6 +35,8 @@ enum {
 
 	LAVD_CPDOM_MAX_NR		= 128, /* maximum number of compute domain */
 	LAVD_CPDOM_MAX_DIST		= 3,  /* maximum distance from one compute domain to another */
+	LAVD_SOFT_GROUP_MAX_NR		= 16384,
+	LAVD_SOFT_LLC_WORDS		= (LAVD_CPDOM_MAX_NR + 63) / 64,
 
 	LAVD_PCO_STATE_MAX		= 11, /* maximum number of performance vs. CPU order states */
 
@@ -42,6 +44,26 @@ enum {
 						 {HI: performance-Hungry, performance-Insensitive}
 						 {BT: Big, liTtle}
 						 {EG: Eligible, Greedy} */
+};
+
+/* Userspace never dereferences group pointers. These commands run in BPF. */
+enum {
+	LAVD_SOFT_SAMPLE,
+	LAVD_SOFT_APPLY,
+};
+
+struct soft_affinity_key {
+	u32 tgid;
+	u32 numa_id;
+};
+
+struct soft_affinity_cmd {
+	struct soft_affinity_key key;
+	u32 op;
+	u32 __pad;
+	u64 id;
+	u64 runtime;
+	u64 llcs[LAVD_SOFT_LLC_WORDS];
 };
 
 /*

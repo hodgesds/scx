@@ -13,6 +13,7 @@ mod bpf_streams;
 pub use bpf_intf::*;
 
 mod cpu_order;
+mod soft_affinity;
 use scx_utils::Topology;
 use scx_utils::init_libbpf_logging;
 mod stats;
@@ -255,6 +256,12 @@ struct Opts {
     /// highly experimental feature.
     #[clap(long = "per-cpu-dsq", action = clap::ArgAction::SetTrue)]
     per_cpu_dsq: bool,
+
+    /// Prefer a process's utilization-sized LLC home on each task's first
+    /// observed execution node. Spill through normal LAVD placement when no
+    /// eligible home CPU is idle. This is an experimental feature.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    soft_partitioning: bool,
 
     /// Enable CPU bandwidth control using cpu.max in cgroup v2.
     /// This is a highly experimental feature.
@@ -531,10 +538,17 @@ struct Scheduler<'a> {
     monitor_tid: Option<ThreadId>,
     stats_server: StatsServer<StatsReq, StatsRes>,
     mseq_id: u64,
+    soft_affinity: Option<soft_affinity::SoftAffinity>,
 }
 
 impl<'a> Scheduler<'a> {
     fn init(opts: &'a Opts, open_object: &'a mut MaybeUninit<OpenObject>) -> Result<Self> {
+        if opts.soft_partitioning {
+            anyhow::ensure!(
+                ksym_exists("bpf_local_irq_save")? && ksym_exists("bpf_local_irq_restore")?,
+                "--soft-partitioning requires kernel BPF local IRQ save/restore support"
+            );
+        }
         if *NR_CPU_IDS > LAVD_CPU_ID_MAX as usize {
             panic!(
                 "Num possible CPU IDs ({}) exceeds maximum of ({})",
@@ -572,6 +586,10 @@ impl<'a> Scheduler<'a> {
         let order = CpuOrder::new(opts.topology.as_ref(), opts.no_use_em).unwrap();
         Self::init_cpus(&mut skel, &order);
         Self::init_cpdoms(&mut skel, &order);
+        let soft_affinity = opts
+            .soft_partitioning
+            .then(|| soft_affinity::SoftAffinity::new(&order))
+            .transpose()?;
 
         // When there are multiple domains, hook the execve() syscall family
         // to enable aggressive cross-domain migration when execve() is called.
@@ -615,6 +633,7 @@ impl<'a> Scheduler<'a> {
             monitor_tid: None,
             stats_server,
             mseq_id: 0,
+            soft_affinity,
         })
     }
 
@@ -797,6 +816,7 @@ impl<'a> Scheduler<'a> {
         rodata.no_wake_sync = opts.no_wake_sync;
         rodata.no_slice_boost = opts.no_slice_boost;
         rodata.per_cpu_dsq = opts.per_cpu_dsq;
+        rodata.enable_soft_partitioning = opts.soft_partitioning;
         rodata.enable_cpu_bw = opts.enable_cpu_bw;
         // Replenishment wakes dispatch through the built-in idle tracking.
         rodata.bw_kick_builtin_idle = true;
@@ -1121,6 +1141,9 @@ impl<'a> Scheduler<'a> {
         }
 
         while !shutdown.load(Ordering::Relaxed) && !self.exited() {
+            if let Some(soft_affinity) = &mut self.soft_affinity {
+                soft_affinity.resize(&mut self.skel)?;
+            }
             if autopower {
                 (autopower, profile) = self.update_power_profile(profile);
             }

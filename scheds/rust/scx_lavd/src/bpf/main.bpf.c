@@ -602,6 +602,8 @@ static void account_task_runtime(struct task_struct *p,
 	}
 
 	taskc->acc_runtime_wall += task_time_wall;
+	if (enable_soft_partitioning)
+		soft_affinity_account(taskc, task_time_wall);
 	taskc->acc_runtime_invr += task_time_invr;
 	taskc->svc_time_iwgt += task_time_iwgt;
 	taskc->last_measured_wall_clk = now;
@@ -1738,6 +1740,9 @@ void BPF_STRUCT_OPS(lavd_running, struct task_struct *p)
 		return;
 	}
 
+	if (enable_soft_partitioning)
+		soft_affinity_running(p, taskc, cpuc);
+
 	unaccount_queued_load(taskc);
 	unaccount_queued_load_pcpu(taskc);
 
@@ -2239,6 +2244,9 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 	/* Per-CPU warmth is task+CPU private -- never inherit it. */
 	taskc->cpu_heat = 0;
 	taskc->last_stopping_clk = scx_bpf_now();
+	taskc->home_numa_id = -1;
+	taskc->home_llc_id = 0;
+	taskc->soft_group = NULL;
 
 	bpf_rcu_read_lock();
 	set_affinity_flags(taskc, p->cpus_ptr);
@@ -2284,6 +2292,9 @@ s32 BPF_STRUCT_OPS(lavd_exit_task, struct task_struct *p,
 	 */
 	if (enable_cpu_bw && taskc)
 		scx_cgroup_bw_cancel((u64)taskc, SCX_CGROUP_BW_CANCEL_DROP);
+
+	if (enable_soft_partitioning && taskc)
+		soft_affinity_exit(taskc);
 
 	scx_task_free_rcu(p);
 	return 0;
@@ -2343,6 +2354,8 @@ void BPF_STRUCT_OPS(lavd_dump_task, struct scx_dump_ctx *dctx,
 	 */
 	scx_bpf_dump("  \\_ ddsp_dsq_id: 0x%llx   ddsp_enq_flags: 0x%llx\n",
 		     p->scx.ddsp_dsq_id, p->scx.ddsp_enq_flags);
+	if (enable_soft_partitioning)
+		soft_affinity_dump(taskc);
 }
 
 static s32 init_cpdoms(u64 now)
@@ -2761,6 +2774,12 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init)
 {
 	u64 now = scx_bpf_now();
 	int err;
+
+	if (enable_soft_partitioning) {
+		err = soft_affinity_init();
+		if (err)
+			return err;
+	}
 
 	/*
 	 * Create compute domains.

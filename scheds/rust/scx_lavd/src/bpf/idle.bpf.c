@@ -847,7 +847,8 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 	 */
 	if (warm_cpu_ns && ctx->prev_cpu >= 0 &&
 	    bpf_cpumask_test_cpu(ctx->prev_cpu, cast_mask(ctx->active)) &&
-	    bpf_cpumask_test_cpu(ctx->prev_cpu, ctx->p->cpus_ptr)) {
+	    bpf_cpumask_test_cpu(ctx->prev_cpu, ctx->p->cpus_ptr) &&
+	    (!enable_soft_partitioning || soft_affinity_cpu_home(ctx->taskc, ctx->prev_cpu))) {
 		if (scx_bpf_test_and_clear_cpu_idle(ctx->prev_cpu)) {
 			cpu = ctx->prev_cpu;
 			*is_idle = true;
@@ -862,6 +863,15 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 			 * Per-core DSQ.
 			 */
 			set_task_flag(ctx->taskc, LAVD_FLAG_WARM_CPU);
+			goto unlock_out;
+		}
+	}
+
+	/* Return from spill CPUs to the origin node when a home CPU is idle. */
+	if (enable_soft_partitioning) {
+		cpu = soft_affinity_pick(ctx);
+		if (cpu >= 0) {
+			*is_idle = true;
 			goto unlock_out;
 		}
 	}

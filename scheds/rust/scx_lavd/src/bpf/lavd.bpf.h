@@ -181,6 +181,8 @@ enum consts_flags {
 /*
  * Task context
  */
+struct soft_affinity_group;
+
 struct task_ctx {
 	/* --- cacheline 0 boundary (0 bytes) --- */
 	/*
@@ -268,6 +270,11 @@ struct task_ctx {
 	/* --- per-CPU warmth (cache/TLB state) --- */
 	u64	last_stopping_clk;	/* when cpu_heat was last integrated (task stopped) */
 	u16	cpu_heat;		/* residence-integrated heat for cpu_id [0, LAVD_SCALE] */
+
+	/* First observed execution node. Neither inherited nor changed on migration. */
+	s16	home_numa_id;
+	u8	home_llc_id;
+	struct soft_affinity_group __arena *soft_group;
 } __attribute__((aligned(CACHELINE_SIZE)));
 
 /*
@@ -1017,6 +1024,16 @@ struct pick_ctx {
 
 s32 find_cpu_in(const struct cpumask *src_mask, struct cpu_ctx *cpuc_cur);
 s32  pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle);
+
+extern const volatile bool enable_soft_partitioning;
+int soft_affinity_init(void);
+void soft_affinity_running(struct task_struct *p, task_ctx __arg_arena *taskc,
+			   struct cpu_ctx *cpuc);
+void soft_affinity_account(task_ctx __arg_arena *taskc, u64 runtime);
+void soft_affinity_exit(task_ctx __arg_arena *taskc);
+s32 soft_affinity_pick(struct pick_ctx *ctx);
+bool soft_affinity_cpu_home(task_ctx __arg_arena *taskc, s32 cpu);
+void soft_affinity_dump(task_ctx __arg_arena *taskc);
 
 bool consume_task(u64 cpdom_id);
 
