@@ -273,7 +273,7 @@ struct task_ctx {
 	u64	last_stopping_clk;	/* when cpu_heat was last integrated (task stopped) */
 	u16	cpu_heat;		/* residence-integrated heat for cpu_id [0, LAVD_SCALE] */
 
-	/* First observed execution node. Neither inherited nor changed on migration. */
+	/* Fixed home node, seeded from the NUMA hint or first observed execution. */
 	s16	home_numa_id;
 	u8	home_llc_id;
 	struct soft_affinity_group __arena *soft_group;
@@ -1026,6 +1026,7 @@ bool is_cpu_hinted_idle(struct cpu_ctx *cpuc);
 
 extern const volatile bool enable_soft_partitioning;
 int soft_affinity_init(void);
+void soft_affinity_init_task(struct task_struct *p, task_ctx __arg_arena *taskc);
 void soft_affinity_running(struct task_struct *p, task_ctx __arg_arena *taskc,
 			   struct cpu_ctx *cpuc);
 void soft_affinity_account(task_ctx __arg_arena *taskc, u64 runtime);

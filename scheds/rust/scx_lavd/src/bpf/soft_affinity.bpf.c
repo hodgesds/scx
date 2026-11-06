@@ -2,6 +2,7 @@
 /* Copyright (c) 2026 Meta Platforms, Inc. and affiliates. */
 
 #include <scx/common.bpf.h>
+#include <scx/numa.bpf.h>
 #include "intf.h"
 #include "lavd.bpf.h"
 #include "power.bpf.h"
@@ -47,6 +48,49 @@ lookup_group(struct soft_affinity_key *key)
 	u64 *ptr = bpf_map_lookup_elem(&soft_affinity_groups, key);
 
 	return ptr ? (struct soft_affinity_group __arena *)*ptr : NULL;
+}
+
+__hidden void soft_affinity_init_task(struct task_struct *p,
+				      task_ctx __arg_arena *taskc)
+{
+	struct cpu_ctx *cpuc;
+	s32 node;
+	int dom, llc = -1;
+	bool affinity = false;
+
+	node = scx_task_numa_node(p);
+	if (node < 0)
+		return;
+	cpuc = get_cpu_ctx_task(p);
+
+	/* Keep the current LLC if possible, otherwise prefer one allowed by affinity. */
+	bpf_for(dom, 0, nr_cpdoms) {
+		struct cpdom_ctx *cpdc;
+		struct bpf_cpumask *mask;
+		bool allowed;
+
+		if (dom >= LAVD_CPDOM_MAX_NR)
+			break;
+		cpdc = MEMBER_VPTR(cpdom_ctxs, [dom]);
+		mask = MEMBER_VPTR(cpdom_cpumask, [dom]);
+		if (!cpdc || !mask || !cpdc->is_valid ||
+		    cpdc->numa_id != node || bpf_cpumask_empty(cast_mask(mask)))
+			continue;
+		allowed = bpf_cpumask_intersects(cast_mask(mask), p->cpus_ptr);
+		if (llc < 0 || (!affinity && allowed)) {
+			llc = cpdc->llc_id;
+			affinity = allowed;
+		}
+		if (allowed && cpuc && cpuc->llc_id == cpdc->llc_id) {
+			llc = cpdc->llc_id;
+			break;
+		}
+	}
+	/* An unavailable hint or a CPU-less node leaves the first-run fallback. */
+	if (llc >= 0) {
+		taskc->home_numa_id = node;
+		taskc->home_llc_id = llc;
+	}
 }
 
 __hidden void soft_affinity_running(struct task_struct *p,
