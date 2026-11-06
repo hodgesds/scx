@@ -2250,6 +2250,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 
 	bpf_rcu_read_lock();
 	set_affinity_flags(taskc, p->cpus_ptr);
+	if (enable_soft_partitioning)
+		soft_affinity_init_task(p, taskc);
 	bpf_rcu_read_unlock();
 
 	if (is_ksoftirqd(p))

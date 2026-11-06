@@ -257,9 +257,10 @@ struct Opts {
     #[clap(long = "per-cpu-dsq", action = clap::ArgAction::SetTrue)]
     per_cpu_dsq: bool,
 
-    /// Prefer a process's utilization-sized LLC home on each task's first
-    /// observed execution node. Spill through normal LAVD placement when no
-    /// eligible home CPU is idle. This is an experimental feature.
+    /// Prefer a process's utilization-sized LLC home on each task's NUMA
+    /// balancing preferred node, falling back to memory-fault samples and then
+    /// its first observed execution node. Spill through normal LAVD placement
+    /// when no eligible home CPU is idle. This is an experimental feature.
     #[clap(long, action = clap::ArgAction::SetTrue)]
     soft_partitioning: bool,
 
