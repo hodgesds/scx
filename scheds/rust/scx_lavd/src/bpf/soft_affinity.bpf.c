@@ -6,9 +6,11 @@
 #include "intf.h"
 #include "lavd.bpf.h"
 #include "power.bpf.h"
+#include "util.bpf.h"
 #include <lib/spinlock.h>
 
 const volatile bool enable_soft_partitioning;
+const volatile u8 soft_affinity_slots;
 
 _Static_assert(LAVD_SOFT_LLC_WORDS == 2, "home snapshots require two LLC words");
 
@@ -34,6 +36,7 @@ static arena_spinlock_t __arena_global group_lock;
 static u64 next_group_id;
 static struct scx_urcu group_urcu;
 static struct scx_allocator group_allocator;
+static void home_llcs(task_ctx *taskc, u64 *lo, u64 *hi);
 
 __hidden int soft_affinity_init(void)
 {
@@ -50,16 +53,25 @@ lookup_group(struct soft_affinity_key *key)
 	return ptr ? (struct soft_affinity_group __arena *)*ptr : NULL;
 }
 
-static u32 llc_weight(u64 mask)
+static __always_inline bool history_try_lock(struct soft_llc_state __arena *state)
 {
-	mask -= (mask >> 1) & 0x5555555555555555ULL;
-	mask = (mask & 0x3333333333333333ULL) +
-	       ((mask >> 2) & 0x3333333333333333ULL);
-	mask = (mask + (mask >> 4)) & 0x0f0f0f0f0f0f0f0fULL;
-	return (mask * 0x0101010101010101ULL) >> 56;
+	/* Advisory samples can be dropped instead of spinning under an rq lock. */
+	return !READ_ONCE(state->lock) &&
+	       __sync_bool_compare_and_swap(&state->lock, 0, 1);
 }
 
-static s32 initial_home_llc(struct task_struct *p, s32 node)
+static __always_inline void history_unlock(struct soft_llc_state __arena *state)
+{
+	smp_store_release(&state->lock, 0);
+}
+
+static __attribute__((noinline)) void
+history_refresh(struct soft_llc_state __arena *history, u64 home_lo, u64 home_hi)
+{
+	soft_llc_refresh(history, home_lo, home_hi);
+}
+
+static s32 initial_home_llc(struct task_struct *p, s32 node, u8 *slots)
 {
 	u64 lo = 0, hi = 0, allowed_lo = 0, allowed_hi = 0;
 	u32 nr, nr_lo, slot, base;
@@ -96,10 +108,12 @@ static s32 initial_home_llc(struct task_struct *p, s32 node)
 		lo = allowed_lo;
 		hi = allowed_hi;
 	}
-	nr_lo = llc_weight(lo);
-	nr = nr_lo + llc_weight(hi);
+	nr_lo = soft_llc_count(lo);
+	nr = nr_lo + soft_llc_count(hi);
 	if (!nr || nr > LAVD_CPDOM_MAX_NR)
 		return -ENOENT;
+	if (!soft_affinity_slots)
+		*slots = min(nr, LAVD_SOFT_TASK_SLOTS);
 	/* Index the eligible LLCs, whose IDs can be sparse and span NUMA nodes. */
 	slot = (u32)p->tgid % nr;
 	if (slot < nr_lo) {
@@ -127,8 +141,31 @@ static s32 initial_home_llc(struct task_struct *p, s32 node)
 __hidden void soft_affinity_init_task(struct task_struct *p,
 				      task_ctx __arg_arena *taskc)
 {
+	struct soft_llc_state __arena *history = &taskc->llc_history;
+	struct task_struct *identity = p;
+	u64 address = 0;
+	u8 slots = soft_affinity_slots ? : LAVD_SOFT_TASK_SLOTS;
 	s32 node;
 	s32 llc;
+
+	/* Reset inherited history and retain only a hash of this task's address. */
+	history->scored = 0;
+	history->preferred_llcs[0] = 0;
+	history->preferred_llcs[1] = 0;
+	history->pending_runtime = 0;
+	/* A probe read converts the pointer to a scalar the verifier can hash. */
+	history->seed = bpf_probe_read_kernel(&address, sizeof(address), &identity) ?
+			bpf_get_prandom_u32() : soft_llc_hash(address);
+	history->epoch = bpf_ktime_get_ns() / LAVD_SOFT_EPOCH_NS;
+	history->lock = 0;
+	history->runtime_remainder = 0;
+	history->last_waker = 0;
+	history->last_wakee = 0;
+	history->waker_changes = 0;
+	history->wakee_changes = 0;
+	history->slots = slots;
+	history->preferred = LAVD_SOFT_LLC_UNSET;
+	history->preferred_score = 0;
 
 	/* Allocation failure leaves the initial LLC home usable without autosizing. */
 	taskc->soft_group_spare = scx_alloc(&group_allocator);
@@ -137,11 +174,12 @@ __hidden void soft_affinity_init_task(struct task_struct *p,
 	node = scx_task_numa_node(p);
 	if (node < 0)
 		goto unlock_out;
-	llc = initial_home_llc(p, node);
+	llc = initial_home_llc(p, node, &slots);
 	/* An unavailable hint or a CPU-less node leaves the first-run fallback. */
 	if (llc >= 0) {
 		taskc->home_numa_id = node;
 		taskc->home_llc_id = llc;
+		history->slots = slots;
 	}
 unlock_out:
 	bpf_rcu_read_unlock();
@@ -160,12 +198,14 @@ __hidden void soft_affinity_running(struct task_struct *p,
 		struct cpdom_ctx *cpdc =
 			MEMBER_VPTR(cpdom_ctxs, [cpuc->cpdom_id]);
 		s32 llc;
+		u8 slots = taskc->llc_history.slots;
 
 		if (!cpdc || !cpdc->is_valid)
 			return;
 		taskc->home_numa_id = cpdc->numa_id;
-		llc = initial_home_llc(p, cpdc->numa_id);
+		llc = initial_home_llc(p, cpdc->numa_id, &slots);
 		taskc->home_llc_id = llc >= 0 ? llc : cpuc->llc_id;
+		taskc->llc_history.slots = slots;
 	}
 	if (taskc->soft_group)
 		return;
@@ -211,8 +251,84 @@ __hidden void soft_affinity_account(task_ctx __arg_arena *taskc, u64 runtime)
 
 	bpf_rcu_read_lock();
 	group = READ_ONCE(taskc->soft_group);
-	if (group && runtime)
-		__sync_fetch_and_add(&group->runtime, runtime);
+	if (runtime) {
+		if (group)
+			__sync_fetch_and_add(&group->runtime, runtime);
+		__sync_fetch_and_add(&taskc->llc_history.pending_runtime, runtime);
+	}
+	bpf_rcu_read_unlock();
+}
+
+__hidden void soft_affinity_learn(task_ctx __arg_arena *taskc,
+				 struct cpu_ctx *cpuc)
+{
+	struct soft_llc_state __arena *history = &taskc->llc_history;
+	u64 home_lo, home_hi;
+	u64 runtime;
+	u32 epoch = bpf_ktime_get_ns() / LAVD_SOFT_EPOCH_NS;
+
+	bpf_rcu_read_lock();
+	home_llcs(taskc, &home_lo, &home_hi);
+	if (history_try_lock(history)) {
+		runtime = __sync_lock_test_and_set(&history->pending_runtime, 0);
+		if (history->preferred == LAVD_SOFT_LLC_UNSET)
+			history_refresh(history, home_lo, home_hi);
+		soft_llc_runtime(history, cpuc->llc_id, runtime, epoch);
+		history_refresh(history, home_lo, home_hi);
+		history_unlock(history);
+	}
+	bpf_rcu_read_unlock();
+}
+
+__hidden void soft_affinity_wake(struct task_struct *p,
+				task_ctx __arg_arena *wakee,
+				struct task_struct *waker)
+{
+	struct soft_llc_state __arena *from, *to;
+	struct cpu_ctx *cpuc;
+	task_ctx *waker_taskc;
+	u32 from_llc, to_llc, from_seed, to_seed;
+	u64 from_lo, from_hi, to_lo, to_hi;
+	u32 epoch = bpf_ktime_get_ns() / LAVD_SOFT_EPOCH_NS;
+
+	if (p == waker || is_kernel_task(p) || is_kernel_task(waker))
+		return;
+	bpf_rcu_read_lock();
+	waker_taskc = find_task_ctx(waker);
+	if (!waker_taskc)
+		goto out;
+	from = &waker_taskc->llc_history;
+	to = &wakee->llc_history;
+	from_seed = READ_ONCE(from->seed);
+	to_seed = READ_ONCE(to->seed);
+	home_llcs(waker_taskc, &from_lo, &from_hi);
+	home_llcs(wakee, &to_lo, &to_hi);
+	from_llc = READ_ONCE(from->preferred);
+	to_llc = READ_ONCE(to->preferred);
+	if (from_llc == LAVD_SOFT_LLC_UNSET) {
+		cpuc = get_cpu_ctx_task(waker);
+		if (!cpuc)
+			goto out;
+		from_llc = cpuc->llc_id;
+	}
+	if (to_llc == LAVD_SOFT_LLC_UNSET) {
+		cpuc = get_cpu_ctx_task(p);
+		if (!cpuc)
+			goto out;
+		to_llc = cpuc->llc_id;
+	}
+	/* Never nest task locks: reciprocal wakeups can arrive on different CPUs. */
+	if (history_try_lock(to)) {
+		soft_llc_wake(to, from_seed, from_llc, true, epoch);
+		history_refresh(to, to_lo, to_hi);
+		history_unlock(to);
+	}
+	if (history_try_lock(from)) {
+		soft_llc_wake(from, to_seed, to_llc, false, epoch);
+		history_refresh(from, from_lo, from_hi);
+		history_unlock(from);
+	}
+out:
 	bpf_rcu_read_unlock();
 }
 
@@ -256,6 +372,8 @@ static void home_llcs(task_ctx *taskc, u64 *lo, u64 *hi)
 	u8 initial = taskc->home_llc_id;
 
 	*lo = *hi = 0;
+	if (taskc->home_numa_id < 0)
+		return;
 	if (group) {
 		initial = group->initial_llc;
 		seq = smp_load_acquire(&group->seq);
@@ -275,6 +393,22 @@ static void home_llcs(task_ctx *taskc, u64 *lo, u64 *hi)
 	}
 }
 
+static u32 task_llcs(task_ctx *taskc, u64 home_lo, u64 home_hi, u64 *lo, u64 *hi)
+{
+	struct soft_llc_state __arena *history = &taskc->llc_history;
+	u32 preferred = READ_ONCE(history->preferred);
+
+	/* Racing updates are advisory; affinity and active masks are checked below. */
+	*lo = READ_ONCE(history->preferred_llcs[0]) & home_lo;
+	*hi = READ_ONCE(history->preferred_llcs[1]) & home_hi;
+	if (!(*lo | *hi)) {
+		*lo = home_lo;
+		*hi = home_hi;
+	}
+	return soft_llc_contains(*lo, *hi, preferred) ?
+	       preferred : LAVD_SOFT_LLC_UNSET;
+}
+
 __hidden bool soft_affinity_cpu_home(task_ctx __arg_arena *taskc, s32 cpu)
 {
 	struct cpu_ctx *cpuc = get_cpu_ctx_id(cpu);
@@ -287,6 +421,7 @@ __hidden bool soft_affinity_cpu_home(task_ctx __arg_arena *taskc, s32 cpu)
 	if (!cpdc || !cpdc->is_valid || cpdc->numa_id != taskc->home_numa_id)
 		return false;
 	home_llcs(taskc, &lo, &hi);
+	task_llcs(taskc, lo, hi, &lo, &hi);
 	return cpuc->llc_id < 64 ? lo & (1ULL << cpuc->llc_id) :
 				   hi & (1ULL << (cpuc->llc_id - 64));
 }
@@ -315,10 +450,11 @@ __hidden s32 soft_affinity_pick(struct pick_ctx *ctx, s32 *home_cpu)
 {
 	struct bpf_cpumask *home, *eligible, *scratch, *steady;
 	struct cpdom_ctx *cpdc;
-	u64 lo, hi;
+	u64 lo, hi, preferred_lo, preferred_hi, primary_lo, primary_hi;
+	u32 primary;
 	bool big, vulnerable;
 	s32 cpu;
-	int pass, dom, tier, scope;
+	int attempt, dom, tier, scope;
 
 	if (ctx->taskc->home_numa_id < 0 || !ctx->cpuc_cur)
 		return -ENOENT;
@@ -329,6 +465,9 @@ __hidden s32 soft_affinity_pick(struct pick_ctx *ctx, s32 *home_cpu)
 	if (!home || !eligible || !scratch)
 		return -ENOENT;
 	home_llcs(ctx->taskc, &lo, &hi);
+	primary = task_llcs(ctx->taskc, lo, hi, &preferred_lo, &preferred_hi);
+	primary_lo = primary < 64 ? 1ULL << primary : 0;
+	primary_hi = primary >= 64 && primary < 128 ? 1ULL << (primary - 64) : 0;
 	big = is_perf_cri(ctx->taskc);
 	cpdc = MEMBER_VPTR(cpdom_ctxs, [ctx->cpuc_cur->cpdom_id]);
 	vulnerable = cpdc &&
@@ -336,9 +475,25 @@ __hidden s32 soft_affinity_pick(struct pick_ctx *ctx, s32 *home_cpu)
 					      ctx->taskc->util_est) >=
 			     cpdc->vuln_thresh;
 
-	/* Prefer the matching core type, then allow the other type in the same home. */
-	bpf_for(pass, 0, 2)
+	/* Search the primary LLC, other preferences, then the group home per core type. */
+	bpf_for(attempt, 0, 6)
 	{
+		bool other_type = attempt >= 3;
+		u32 preference = attempt % 3;
+		u64 search_lo = lo, search_hi = hi;
+
+		if (!preference) {
+			search_lo = primary_lo;
+			search_hi = primary_hi;
+		} else if (preference == 1) {
+			if (preferred_lo == primary_lo && preferred_hi == primary_hi)
+				continue;
+			search_lo = preferred_lo;
+			search_hi = preferred_hi;
+		} else if (lo == preferred_lo && hi == preferred_hi) {
+			continue;
+		}
+
 		bpf_cpumask_clear(home);
 		bpf_for(dom, 0, nr_cpdoms)
 		{
@@ -351,11 +506,11 @@ __hidden s32 soft_affinity_pick(struct pick_ctx *ctx, s32 *home_cpu)
 			mask = MEMBER_VPTR(cpdom_cpumask, [dom]);
 			if (!cpdc || !mask || !cpdc->is_valid ||
 			    cpdc->numa_id != ctx->taskc->home_numa_id ||
-			    (!pass && cpdc->is_big != big))
+			    (!other_type && cpdc->is_big != big))
 				continue;
 			llc = cpdc->llc_id;
-			if (llc < 64 ? !(lo & (1ULL << llc)) :
-				       !(hi & (1ULL << (llc - 64))))
+			if (llc < 64 ? !(search_lo & (1ULL << llc)) :
+				       !(search_hi & (1ULL << (llc - 64))))
 				continue;
 			bpf_cpumask_or(home, cast_mask(home), cast_mask(mask));
 		}
@@ -459,7 +614,9 @@ int lavd_soft_affinity_cmd(struct soft_affinity_cmd *args)
 
 __hidden void soft_affinity_dump(task_ctx __arg_arena *taskc)
 {
-	u64 lo, hi;
+	struct soft_llc_state __arena *history = &taskc->llc_history;
+	u64 lo, hi, preferred_lo, preferred_hi, scored;
+	u32 preferred;
 
 	if (taskc->home_numa_id < 0) {
 		scx_bpf_dump("  \\_ home_numa: not observed\n");
@@ -469,6 +626,17 @@ __hidden void soft_affinity_dump(task_ctx __arg_arena *taskc)
 	home_llcs(taskc, &lo, &hi);
 	scx_bpf_dump("  \\_ home_numa: %d   home_llcs: %llx:%016llx\n",
 		     taskc->home_numa_id, hi, lo);
+	scored = READ_ONCE(history->scored);
+	preferred = soft_llc_choose(scored, READ_ONCE(history->slots),
+				    READ_ONCE(history->seed), READ_ONCE(history->preferred),
+				    lo, hi);
+	soft_llc_mask(scored, READ_ONCE(history->slots), preferred, lo, hi,
+		      &preferred_lo, &preferred_hi);
+	scx_bpf_dump("  \\_ preferred_llc: %u   preferred_llcs: %llx:%016llx\n",
+		     preferred, preferred_hi, preferred_lo);
+	scx_bpf_dump("  \\_ llc_scores: %016llx   slots: %u   waker_changes: %u   wakee_changes: %u\n",
+		     scored, READ_ONCE(history->slots),
+		     READ_ONCE(history->waker_changes), READ_ONCE(history->wakee_changes));
 	bpf_rcu_read_unlock();
 }
 

@@ -12,6 +12,7 @@
 #include <lib/sdt_task.h>
 #include <lib/atq.h>
 #include <lib/cgroup.h>
+#include "soft_affinity.h"
 
 /*
  * common macros
@@ -277,6 +278,7 @@ struct task_ctx {
 	struct soft_affinity_group __arena *soft_group;
 	/* Private reservation until running() publishes or joins a group. */
 	struct soft_affinity_group __arena *soft_group_spare;
+	struct soft_llc_state llc_history;
 } __attribute__((aligned(CACHELINE_SIZE)));
 
 /*
@@ -1028,11 +1030,22 @@ s32 find_cpu_in(const struct cpumask *src_mask, struct cpu_ctx *cpuc_cur);
 s32  pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle);
 
 extern const volatile bool enable_soft_partitioning;
+
+static __always_inline bool soft_affinity_active(void)
+{
+	/* Use normal placement once the online CPUs are nearly fully busy. */
+	return enable_soft_partitioning &&
+	       READ_ONCE(sys_stat.avg_util_wall) < LAVD_SLICE_BOOST_UTIL_WALL;
+}
+
 int soft_affinity_init(void);
 void soft_affinity_init_task(struct task_struct *p, task_ctx __arg_arena *taskc);
 void soft_affinity_running(struct task_struct *p, task_ctx __arg_arena *taskc,
 			   struct cpu_ctx *cpuc);
 void soft_affinity_account(task_ctx __arg_arena *taskc, u64 runtime);
+void soft_affinity_learn(task_ctx __arg_arena *taskc, struct cpu_ctx *cpuc);
+void soft_affinity_wake(struct task_struct *p, task_ctx __arg_arena *wakee,
+		       struct task_struct *waker);
 void soft_affinity_exit(task_ctx __arg_arena *taskc);
 s32 soft_affinity_pick(struct pick_ctx *ctx, s32 *home_cpu);
 bool soft_affinity_cpu_home(task_ctx __arg_arena *taskc, s32 cpu);

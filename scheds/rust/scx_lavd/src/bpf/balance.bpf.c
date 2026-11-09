@@ -628,8 +628,8 @@ static bool force_to_steal_task(struct cpdom_ctx *cpdomc)
 			if (!cpdomc_pick->is_valid)
 				continue;
 
-			/* Preserve LLC locality unless its domain is overloaded. */
-			if (enable_soft_partitioning &&
+			/* Preserve LLC locality until domain overload or system saturation. */
+			if (soft_affinity_active() &&
 			    cpdomc_pick->llc_id != cpdomc->llc_id &&
 			    !READ_ONCE(cpdomc_pick->is_stealee))
 				continue;

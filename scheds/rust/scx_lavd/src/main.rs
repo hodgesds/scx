@@ -264,6 +264,11 @@ struct Opts {
     #[clap(long, action = clap::ArgAction::SetTrue)]
     soft_partitioning: bool,
 
+    /// Number of scored LLCs per task (1-4). Zero selects from the eligible
+    /// LLC topology on the task's home NUMA node, capped at four.
+    #[clap(long, default_value = "0", value_parser = clap::value_parser!(u8).range(0..=4))]
+    soft_affinity_slots: u8,
+
     /// Enable CPU bandwidth control using cpu.max in cgroup v2.
     /// This is a highly experimental feature.
     #[clap(long = "enable-cpu-bw", action = clap::ArgAction::SetTrue)]
@@ -818,6 +823,7 @@ impl<'a> Scheduler<'a> {
         rodata.no_slice_boost = opts.no_slice_boost;
         rodata.per_cpu_dsq = opts.per_cpu_dsq;
         rodata.enable_soft_partitioning = opts.soft_partitioning;
+        rodata.soft_affinity_slots = opts.soft_affinity_slots;
         rodata.enable_cpu_bw = opts.enable_cpu_bw;
         // Replenishment wakes dispatch through the built-in idle tracking.
         rodata.bw_kick_builtin_idle = true;
@@ -1301,4 +1307,54 @@ fn main(mut opts: Opts) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod soft_affinity_tests {
+    use super::*;
+
+    #[test]
+    fn slot_option_is_bounded() {
+        for slots in ["0", "1", "2", "3", "4"] {
+            assert!(Opts::try_parse_from(["scx_lavd", "--soft-affinity-slots", slots]).is_ok());
+        }
+        assert!(Opts::try_parse_from(["scx_lavd", "--soft-affinity-slots", "5"]).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires BPF privileges and a kernel supporting LAVD; loads without attaching"]
+    fn load_soft_affinity_programs() -> Result<()> {
+        for slots in ["0", "4"] {
+            load_with_slots(slots)?;
+        }
+        Ok(())
+    }
+
+    fn load_with_slots(slots: &str) -> Result<()> {
+        let opts = Opts::try_parse_from([
+            "scx_lavd",
+            "--soft-partitioning",
+            "--soft-affinity-slots",
+            slots,
+            "--performance",
+            "--no-futex-boost",
+        ])?;
+        let mut storage = MaybeUninit::uninit();
+        let open_object = &mut storage;
+        let skel_builder = BpfSkelBuilder::default();
+        let open_opts = opts.libbpf.clone().into_bpf_open_opts();
+        let mut skel = scx_ops_open!(skel_builder, open_object, lavd_ops, open_opts)?;
+        let order = CpuOrder::new(opts.topology.as_ref(), opts.no_use_em)?;
+        Scheduler::init_cpus(&mut skel, &order);
+        Scheduler::init_cpdoms(&mut skel, &order);
+        Scheduler::init_globals(&mut skel, &opts, &order, 0)?;
+        scx_utils::resize_cgroup_bw(
+            skel.open_object_mut(),
+            opts.cpu_bw_max_cgroups,
+            opts.cpu_bw_max_tree_height,
+            order.nr_llcs,
+        )?;
+        let _skel = scx_ops_load!(skel, lavd_ops, uei)?;
+        Ok(())
+    }
 }

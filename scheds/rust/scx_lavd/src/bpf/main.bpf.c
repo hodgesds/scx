@@ -602,8 +602,12 @@ static void account_task_runtime(struct task_struct *p,
 	}
 
 	taskc->acc_runtime_wall += task_time_wall;
-	if (enable_soft_partitioning)
+	if (enable_soft_partitioning) {
 		soft_affinity_account(taskc, task_time_wall);
+		/* Dispatch refills only accumulate; subject callbacks learn locality. */
+		if (may_resolve)
+			soft_affinity_learn(taskc, cpuc);
+	}
 	taskc->acc_runtime_invr += task_time_invr;
 	taskc->svc_time_iwgt += task_time_iwgt;
 	taskc->last_measured_wall_clk = now;
@@ -1651,6 +1655,9 @@ void BPF_STRUCT_OPS(lavd_runnable, struct task_struct *p, u64 enq_flags)
 	waker = bpf_get_current_task_btf();
 	if (is_ksoftirqd(waker))
 		return;
+
+	if (enable_soft_partitioning)
+		soft_affinity_wake(p, p_taskc, waker);
 
 	if ((p->real_parent != waker->real_parent))
 		return;

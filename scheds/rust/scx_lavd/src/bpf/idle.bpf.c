@@ -761,6 +761,7 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 	s64 sticky_cpdom = -ENOENT;
 	struct cpdom_ctx *cpdc;
 	bool i_smt_empty;
+	bool prefer_home = soft_affinity_active();
 
 	/*
 	 * At the high level, the idle CPU selection policy considers the
@@ -848,7 +849,7 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 	if (warm_cpu_ns && ctx->prev_cpu >= 0 &&
 	    bpf_cpumask_test_cpu(ctx->prev_cpu, cast_mask(ctx->active)) &&
 	    bpf_cpumask_test_cpu(ctx->prev_cpu, ctx->p->cpus_ptr) &&
-	    (!enable_soft_partitioning || soft_affinity_cpu_home(ctx->taskc, ctx->prev_cpu))) {
+	    (!prefer_home || soft_affinity_cpu_home(ctx->taskc, ctx->prev_cpu))) {
 		if (scx_bpf_test_and_clear_cpu_idle(ctx->prev_cpu)) {
 			cpu = ctx->prev_cpu;
 			*is_idle = true;
@@ -868,7 +869,7 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 	}
 
 	/* Return from spill CPUs to the origin node when a home CPU is idle. */
-	if (enable_soft_partitioning) {
+	if (prefer_home) {
 		cpu = soft_affinity_pick(ctx, &home_cpu);
 		if (cpu >= 0) {
 			*is_idle = true;

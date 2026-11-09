@@ -58,14 +58,47 @@ group's demand. Otherwise place homes by relative load, accounting for each
 LLC's CPU count. Homes can overlap under saturation. `--virt-llc` can give
 finer homes on machines with large LLCs.
 
-Idle selection tries the home before normal LAVD placement, respecting task
-affinity, active and overflow CPUs, core type, and latency headroom. A busy
-home or an affinity mask that excludes it falls through to LAVD's normal CPU
-selection and balancing, anchored to a home CPU when one is eligible. A busy
+Within a process home, each task selects an initial LLC using a hash of its
+kernel task address. The seed is assigned once and does not depend on TID.
+Each task keeps up to four LLC scores in one 64-bit word. Each 16-bit entry
+contains a 7-bit LLC ID and a 9-bit saturating score. Scores combine measured
+runtime and successful wake interactions and decay lazily in 32 ms epochs.
+Partial runtime units carry forward, so short accounting intervals are not
+counted as full runs.
+
+Wake interactions update both tasks. Changes in wake partners approximate
+fanin and fanout and weaken each individual pull, while partners in the same
+LLC accumulate a common preference. History remains confined to the
+process's home when choosing CPUs. An alternative must exceed twice the
+current score plus a small margin before becoming the primary LLC.
+
+`--soft-affinity-slots=0` (the default) selects the number of scored entries
+from eligible LLCs on the task's home NUMA node, capped at four. Values 1-4
+override that choice. The full history record is 64 bytes per task. It
+reuses the shared topology masks and per-CPU scratch masks. No per-task CPU
+masks or lists of partner pointers are allocated. Writers use a nonblocking
+task lock and drop advisory wake samples under contention. Runtime pending
+the next tick or stopping callback stays in a counter. Tick, stopping, and
+wake updates cache a 128-bit LLC preference set. CPU selection reads the
+cached set without scanning scores or hashing.
+
+Idle selection tries the task's primary LLC, other strongly scored LLCs,
+and then the process home, respecting task affinity, active and overflow
+CPUs, core type, and latency headroom. A busy home or an affinity mask that
+excludes it falls through to LAVD's normal CPU selection and balancing,
+anchored to a home CPU when one is eligible. A busy
 home can therefore stay on its LLC until LAVD's overload balancing justifies
 spilling. CPU affinity is never changed, and migration never changes the home
 node. Pinned and migration-disabled tasks keep their normal
-placement. Scheduler task dumps report the home node and home LLC mask.
+placement. Scheduler task dumps report the home node, home and preferred
+LLC masks, packed scores, and changes in wake partners.
+
+When average wall-clock utilization across online CPUs reaches 95%, LAVD
+bypasses home selection and its force-stealing locality restriction. Normal
+LAVD placement and balancing take over until utilization falls below that
+threshold. The signal is smoothed by the 10 ms statistics updates, so filling
+a compacted active CPU set alone does not disable homes. Runtime accounting
+and home resizing continue during saturation.
 
 Runtime counters and homes live in arenas. Each task reserves a group
 allocation during sleepable initialization, then publishes or joins a group
