@@ -50,14 +50,85 @@ lookup_group(struct soft_affinity_key *key)
 	return ptr ? (struct soft_affinity_group __arena *)*ptr : NULL;
 }
 
+static u32 llc_weight(u64 mask)
+{
+	mask -= (mask >> 1) & 0x5555555555555555ULL;
+	mask = (mask & 0x3333333333333333ULL) +
+	       ((mask >> 2) & 0x3333333333333333ULL);
+	mask = (mask + (mask >> 4)) & 0x0f0f0f0f0f0f0f0fULL;
+	return (mask * 0x0101010101010101ULL) >> 56;
+}
+
+static s32 initial_home_llc(struct task_struct *p, s32 node)
+{
+	u64 lo = 0, hi = 0, allowed_lo = 0, allowed_hi = 0;
+	u32 nr, nr_lo, slot, base;
+	int dom, llc, i;
+
+	/* An LLC can have separate compute domains for different core types. */
+	bpf_for(dom, 0, nr_cpdoms) {
+		struct cpdom_ctx *cpdc;
+		struct bpf_cpumask *mask;
+		u64 bit;
+
+		if (dom >= LAVD_CPDOM_MAX_NR)
+			break;
+		cpdc = MEMBER_VPTR(cpdom_ctxs, [dom]);
+		mask = MEMBER_VPTR(cpdom_cpumask, [dom]);
+		if (!cpdc || !mask || !cpdc->is_valid || cpdc->numa_id != node ||
+		    cpdc->llc_id >= LAVD_CPDOM_MAX_NR ||
+		    bpf_cpumask_empty(cast_mask(mask)))
+			continue;
+		llc = cpdc->llc_id;
+		bit = 1ULL << (llc & 63);
+		if (llc < 64)
+			lo |= bit;
+		else
+			hi |= bit;
+		if (!bpf_cpumask_intersects(cast_mask(mask), p->cpus_ptr))
+			continue;
+		if (llc < 64)
+			allowed_lo |= bit;
+		else
+			allowed_hi |= bit;
+	}
+	if (allowed_lo | allowed_hi) {
+		lo = allowed_lo;
+		hi = allowed_hi;
+	}
+	nr_lo = llc_weight(lo);
+	nr = nr_lo + llc_weight(hi);
+	if (!nr || nr > LAVD_CPDOM_MAX_NR)
+		return -ENOENT;
+	/* Index the eligible LLCs, whose IDs can be sparse and span NUMA nodes. */
+	slot = (u32)p->tgid % nr;
+	if (slot < nr_lo) {
+		base = 0;
+	} else {
+		base = 64;
+		slot -= nr_lo;
+		lo = hi;
+	}
+	if (slot >= 64)
+		return -ENOENT;
+	/* Clear only the set bits preceding the selected ordinal. */
+	for (i = 0; i < 64 && can_loop; i++) {
+		if (!lo)
+			return -ENOENT;
+		if (!slot)
+			return base + ctzll(lo);
+		lo &= lo - 1;
+		slot--;
+	}
+	return -ENOENT;
+}
+
 /* Called from sleepable init_task, outside RCU and IRQ/preempt-disabled sections. */
 __hidden void soft_affinity_init_task(struct task_struct *p,
 				      task_ctx __arg_arena *taskc)
 {
-	struct cpu_ctx *cpuc;
 	s32 node;
-	int dom, llc = -1;
-	bool affinity = false;
+	s32 llc;
 
 	/* Allocation failure leaves the initial LLC home usable without autosizing. */
 	taskc->soft_group_spare = scx_alloc(&group_allocator);
@@ -66,31 +137,7 @@ __hidden void soft_affinity_init_task(struct task_struct *p,
 	node = scx_task_numa_node(p);
 	if (node < 0)
 		goto unlock_out;
-	cpuc = get_cpu_ctx_task(p);
-
-	/* Keep the current LLC if possible, otherwise prefer one allowed by affinity. */
-	bpf_for(dom, 0, nr_cpdoms) {
-		struct cpdom_ctx *cpdc;
-		struct bpf_cpumask *mask;
-		bool allowed;
-
-		if (dom >= LAVD_CPDOM_MAX_NR)
-			break;
-		cpdc = MEMBER_VPTR(cpdom_ctxs, [dom]);
-		mask = MEMBER_VPTR(cpdom_cpumask, [dom]);
-		if (!cpdc || !mask || !cpdc->is_valid ||
-		    cpdc->numa_id != node || bpf_cpumask_empty(cast_mask(mask)))
-			continue;
-		allowed = bpf_cpumask_intersects(cast_mask(mask), p->cpus_ptr);
-		if (llc < 0 || (!affinity && allowed)) {
-			llc = cpdc->llc_id;
-			affinity = allowed;
-		}
-		if (allowed && cpuc && cpuc->llc_id == cpdc->llc_id) {
-			llc = cpdc->llc_id;
-			break;
-		}
-	}
+	llc = initial_home_llc(p, node);
 	/* An unavailable hint or a CPU-less node leaves the first-run fallback. */
 	if (llc >= 0) {
 		taskc->home_numa_id = node;
@@ -112,11 +159,13 @@ __hidden void soft_affinity_running(struct task_struct *p,
 	if (taskc->home_numa_id < 0) {
 		struct cpdom_ctx *cpdc =
 			MEMBER_VPTR(cpdom_ctxs, [cpuc->cpdom_id]);
+		s32 llc;
 
 		if (!cpdc || !cpdc->is_valid)
 			return;
 		taskc->home_numa_id = cpdc->numa_id;
-		taskc->home_llc_id = cpuc->llc_id;
+		llc = initial_home_llc(p, cpdc->numa_id);
+		taskc->home_llc_id = llc >= 0 ? llc : cpuc->llc_id;
 	}
 	if (taskc->soft_group)
 		return;
@@ -262,7 +311,7 @@ static s32 pick_home_idle_cpu(struct pick_ctx *ctx, struct bpf_cpumask *mask,
 	return scx_bpf_pick_idle_cpu(cast_mask(mask), scope);
 }
 
-__hidden s32 soft_affinity_pick(struct pick_ctx *ctx)
+__hidden s32 soft_affinity_pick(struct pick_ctx *ctx, s32 *home_cpu)
 {
 	struct bpf_cpumask *home, *eligible, *scratch, *steady;
 	struct cpdom_ctx *cpdc;
@@ -336,6 +385,17 @@ __hidden s32 soft_affinity_pick(struct pick_ctx *ctx)
 					scope ? 0 : SCX_PICK_IDLE_CORE);
 				if (cpu >= 0)
 					return cpu;
+				/* Keep a busy home CPU as the anchor for overload balancing. */
+				if (*home_cpu < 0) {
+					if (ctx->prev_cpu >= 0 &&
+					    bpf_cpumask_test_cpu(ctx->prev_cpu, cast_mask(scratch)))
+						*home_cpu = ctx->prev_cpu;
+					else {
+						cpu = bpf_cpumask_any_distribute(cast_mask(scratch));
+						if (cpu >= 0 && cpu < nr_cpu_ids)
+							*home_cpu = cpu;
+					}
+				}
 			}
 		}
 	}

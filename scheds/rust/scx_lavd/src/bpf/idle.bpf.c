@@ -757,7 +757,7 @@ __hidden __noinline
 s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 {
 	const struct cpumask *idle_cpumask = NULL, *idle_smtmask = NULL;
-	s32 cpu = -ENOENT, sticky_cpu;
+	s32 cpu = -ENOENT, sticky_cpu, home_cpu = -ENOENT;
 	s64 sticky_cpdom = -ENOENT;
 	struct cpdom_ctx *cpdc;
 	bool i_smt_empty;
@@ -869,7 +869,7 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 
 	/* Return from spill CPUs to the origin node when a home CPU is idle. */
 	if (enable_soft_partitioning) {
-		cpu = soft_affinity_pick(ctx);
+		cpu = soft_affinity_pick(ctx, &home_cpu);
 		if (cpu >= 0) {
 			*is_idle = true;
 			goto unlock_out;
@@ -915,7 +915,28 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 	 */
 	ctx->sync_waker_cpu = -ENOENT;
 	ctx->is_task_big = is_perf_cri(ctx->taskc);
-	sticky_cpu = find_sticky_cpu_and_cpdom(ctx, &sticky_cpdom);
+	if (home_cpu >= 0 && can_run_on_cpu(ctx, home_cpu)) {
+		struct cpu_ctx *home_cpuc = get_cpu_ctx_id(home_cpu);
+
+		if (home_cpuc) {
+			sticky_cpu = home_cpu;
+			sticky_cpdom = home_cpuc->cpdom_id;
+			/* Anchor proximity and overflow expansion to the home LLC. */
+			ctx->prev_cpu = home_cpu;
+			if (is_sync_wakeup(ctx)) {
+				s32 waker_cpu = bpf_get_smp_processor_id();
+
+				if (soft_affinity_cpu_home(ctx->taskc, waker_cpu))
+					ctx->sync_waker_cpu = waker_cpu;
+			}
+		} else {
+			home_cpu = -ENOENT;
+			sticky_cpu = find_sticky_cpu_and_cpdom(ctx, &sticky_cpdom);
+		}
+	} else {
+		home_cpu = -ENOENT;
+		sticky_cpu = find_sticky_cpu_and_cpdom(ctx, &sticky_cpdom);
+	}
 
 	/*
 	 * If failed to find a sticky domain -- i.e., @p cannot run on previous
@@ -1088,6 +1109,10 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 	 * locality, hoping that the load imbalance (if it exists) will be
 	 * resolved by the load balancing mechanism.
 	 */
+	if (home_cpu >= 0) {
+		cpu = home_cpu;
+		goto unlock_out;
+	}
 	if (can_run_on_cpu(ctx, ctx->prev_cpu)) {
 		cpu = ctx->prev_cpu;
 		sticky_cpdom = -ENOENT;

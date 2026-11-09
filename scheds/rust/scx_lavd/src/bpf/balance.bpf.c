@@ -628,6 +628,12 @@ static bool force_to_steal_task(struct cpdom_ctx *cpdomc)
 			if (!cpdomc_pick->is_valid)
 				continue;
 
+			/* Preserve LLC locality unless its domain is overloaded. */
+			if (enable_soft_partitioning &&
+			    cpdomc_pick->llc_id != cpdomc->llc_id &&
+			    !READ_ONCE(cpdomc_pick->is_stealee))
+				continue;
+
 			dsq_id = pick_most_loaded_dsq(cpdomc_pick);
 			/*
 			 * Same defensive check as the try_to_steal_task
@@ -645,9 +651,8 @@ static bool force_to_steal_task(struct cpdom_ctx *cpdomc)
 			u64 task_load = no_fast_lb ? 0 : dsq_peek_task_load(dsq_id);
 
 			/*
-			 * Force steal is unconditional for work
-			 * conservation. Decrement budgets to keep
-			 * the accounting consistent.
+			 * Fill an idle CPU subject to the LLC locality check above.
+			 * Decrement budgets to keep the accounting consistent.
 			 */
 			if (consume_dsq(cpdomc_pick, dsq_id)) {
 				if (!no_fast_lb) {

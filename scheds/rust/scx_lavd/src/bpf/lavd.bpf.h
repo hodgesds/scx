@@ -1034,7 +1034,7 @@ void soft_affinity_running(struct task_struct *p, task_ctx __arg_arena *taskc,
 			   struct cpu_ctx *cpuc);
 void soft_affinity_account(task_ctx __arg_arena *taskc, u64 runtime);
 void soft_affinity_exit(task_ctx __arg_arena *taskc);
-s32 soft_affinity_pick(struct pick_ctx *ctx);
+s32 soft_affinity_pick(struct pick_ctx *ctx, s32 *home_cpu);
 bool soft_affinity_cpu_home(task_ctx __arg_arena *taskc, s32 cpu);
 void soft_affinity_dump(task_ctx __arg_arena *taskc);
 
