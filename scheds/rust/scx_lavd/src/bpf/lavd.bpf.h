@@ -275,6 +275,8 @@ struct task_ctx {
 	s16	home_numa_id;
 	u8	home_llc_id;
 	struct soft_affinity_group __arena *soft_group;
+	/* Private reservation until running() publishes or joins a group. */
+	struct soft_affinity_group __arena *soft_group_spare;
 } __attribute__((aligned(CACHELINE_SIZE)));
 
 /*

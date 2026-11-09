@@ -50,6 +50,7 @@ lookup_group(struct soft_affinity_key *key)
 	return ptr ? (struct soft_affinity_group __arena *)*ptr : NULL;
 }
 
+/* Called from sleepable init_task, outside RCU and IRQ/preempt-disabled sections. */
 __hidden void soft_affinity_init_task(struct task_struct *p,
 				      task_ctx __arg_arena *taskc)
 {
@@ -58,9 +59,13 @@ __hidden void soft_affinity_init_task(struct task_struct *p,
 	int dom, llc = -1;
 	bool affinity = false;
 
+	/* Allocation failure leaves the initial LLC home usable without autosizing. */
+	taskc->soft_group_spare = scx_alloc(&group_allocator);
+
+	bpf_rcu_read_lock();
 	node = scx_task_numa_node(p);
 	if (node < 0)
-		return;
+		goto unlock_out;
 	cpuc = get_cpu_ctx_task(p);
 
 	/* Keep the current LLC if possible, otherwise prefer one allowed by affinity. */
@@ -91,6 +96,8 @@ __hidden void soft_affinity_init_task(struct task_struct *p,
 		taskc->home_numa_id = node;
 		taskc->home_llc_id = llc;
 	}
+unlock_out:
+	bpf_rcu_read_unlock();
 }
 
 __hidden void soft_affinity_running(struct task_struct *p,
@@ -116,30 +123,17 @@ __hidden void soft_affinity_running(struct task_struct *p,
 
 	key.tgid = p->tgid;
 	key.numa_id = taskc->home_numa_id;
+	new = taskc->soft_group_spare;
 	{
 		guard(scx_spin_lock_irqsave)(&group_lock);
 		group = lookup_group(&key);
-		if (group) {
-			group->refs++;
-			taskc->soft_group = group;
-			return;
-		}
-	}
-
-	new = scx_alloc(&group_allocator);
-	if (!new)
-		return;
-	new->runtime = 0;
-	new->llcs[0] = new->llcs[1] = 0;
-	new->refs = 0;
-	new->seq = 0;
-	new->key = key;
-	new->initial_llc = taskc->home_llc_id;
-	{
-		guard(scx_spin_lock_irqsave)(&group_lock);
-		/* Another thread may have published the group while we allocated. */
-		group = lookup_group(&key);
-		if (!group) {
+		if (!group && new) {
+			new->runtime = 0;
+			new->llcs[0] = new->llcs[1] = 0;
+			new->refs = 0;
+			new->seq = 0;
+			new->key = key;
+			new->initial_llc = taskc->home_llc_id;
 			new->id = ++next_group_id;
 			ptr = (u64)new;
 			if (!bpf_map_update_elem(&soft_affinity_groups, &key,
@@ -151,9 +145,13 @@ __hidden void soft_affinity_running(struct task_struct *p,
 		if (group) {
 			group->refs++;
 			taskc->soft_group = group;
+			taskc->soft_group_spare = NULL;
 		}
 	}
-	/* Allocation failure or a full index only disables autosizing for this task. */
+	/* A full index keeps the reservation for a later publication attempt. */
+	if (!group)
+		return;
+	/* An unused reservation was never published and needs no grace period. */
 	if (new)
 		scx_free(&group_allocator, new);
 }
@@ -171,7 +169,7 @@ __hidden void soft_affinity_account(task_ctx __arg_arena *taskc, u64 runtime)
 
 __hidden void soft_affinity_exit(task_ctx __arg_arena *taskc)
 {
-	struct soft_affinity_group __arena *group;
+	struct soft_affinity_group __arena *group, *spare;
 	struct soft_affinity_key key;
 	bool retire = false;
 
@@ -180,6 +178,8 @@ __hidden void soft_affinity_exit(task_ctx __arg_arena *taskc)
 		guard(scx_spin_lock_irqsave)(&group_lock);
 		group = taskc->soft_group;
 		taskc->soft_group = NULL;
+		spare = taskc->soft_group_spare;
+		taskc->soft_group_spare = NULL;
 		if (group && !--group->refs) {
 			key = group->key;
 			if (bpf_map_delete_elem(&soft_affinity_groups, &key))
@@ -193,6 +193,9 @@ __hidden void soft_affinity_exit(task_ctx __arg_arena *taskc)
 	if (retire)
 		scx_urcu_free(&group_urcu, &group_allocator, group);
 	bpf_rcu_read_unlock();
+	/* The task can exit before running or while the group index is full. */
+	if (spare)
+		scx_free(&group_allocator, spare);
 }
 
 /* A racing resize falls back to the initial LLC, without retrying on a wakeup. */

@@ -2247,11 +2247,14 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 	taskc->home_numa_id = -1;
 	taskc->home_llc_id = 0;
 	taskc->soft_group = NULL;
+	taskc->soft_group_spare = NULL;
+
+	/* Arena allocation may sleep, so reserve before entering the RCU section. */
+	if (enable_soft_partitioning)
+		soft_affinity_init_task(p, taskc);
 
 	bpf_rcu_read_lock();
 	set_affinity_flags(taskc, p->cpus_ptr);
-	if (enable_soft_partitioning)
-		soft_affinity_init_task(p, taskc);
 	bpf_rcu_read_unlock();
 
 	if (is_ksoftirqd(p))
