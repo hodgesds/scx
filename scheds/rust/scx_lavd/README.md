@@ -62,7 +62,10 @@ selection and balancing. CPU affinity is never changed, and migration never
 changes the home node. Pinned and migration-disabled tasks keep their normal
 placement. Scheduler task dumps report the home node and home LLC mask.
 
-Runtime counters and homes live in arenas. Tasks cache their group pointers;
+Runtime counters and homes live in arenas. Each task reserves a group
+allocation during sleepable initialization, then publishes or joins a group
+on first execution. Unused reservations return to the allocator when a task
+joins an existing group or exits. Tasks cache their group pointers;
 userspace samples and resizes through BPF commands without dereferencing arena
 pointers. The last thread removes its group from the index, and RCU defers
 reclamation until outstanding readers finish. Group IDs reject resize commands
