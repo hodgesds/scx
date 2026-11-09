@@ -37,8 +37,8 @@ fn contains(mask: &LlcMask, llc: usize) -> bool {
     mask[llc / 64] & (1 << (llc % 64)) != 0
 }
 
-/// Allocate whole LLCs within each group's immutable origin node. Account for
-/// unequal LLC sizes and keep the existing home when normalized loads tie.
+/// Keep a home that can serve the group's demand, and allocate whole LLCs on
+/// the fixed NUMA node when it cannot. Account for unequal LLC sizes.
 fn plan_homes(groups: &[Group], llcs: &[Llc], interval_ns: u64) -> Vec<(u64, LlcMask)> {
     let interval_ns = interval_ns.max(1);
     let mut groups: Vec<_> = groups.iter().collect();
@@ -58,9 +58,17 @@ fn plan_homes(groups: &[Group], llcs: &[Llc], interval_ns: u64) -> Vec<(u64, Llc
             continue;
         }
         let want = group.delta.div_ceil(interval_ns).clamp(1, capacity);
+        // Use fractional CPU demand for placement, including sleeping groups.
+        let demand = (u128::from(group.delta) * 1000 / u128::from(interval_ns)).max(1);
+        let fits_home = |i: usize| {
+            contains(&group.home, llcs[i].id) && load[i] + demand <= u128::from(llcs[i].cpus) * 1000
+        };
         candidates.sort_by(|&i, &j| {
-            (load[i] * u128::from(llcs[j].cpus))
-                .cmp(&(load[j] * u128::from(llcs[i].cpus)))
+            fits_home(j)
+                .cmp(&fits_home(i))
+                .then_with(|| {
+                    (load[i] * u128::from(llcs[j].cpus)).cmp(&(load[j] * u128::from(llcs[i].cpus)))
+                })
                 .then_with(|| {
                     contains(&group.home, llcs[j].id).cmp(&contains(&group.home, llcs[i].id))
                 })
@@ -78,8 +86,6 @@ fn plan_homes(groups: &[Group], llcs: &[Llc], interval_ns: u64) -> Vec<(u64, Llc
                 break;
             }
         }
-        // Use fractional CPU demand for placement, including sleeping groups.
-        let demand = (u128::from(group.delta) * 1000 / u128::from(interval_ns)).max(1);
         for i in chosen {
             load[i] += demand * u128::from(llcs[i].cpus) / u128::from(home_capacity);
         }
@@ -251,6 +257,38 @@ mod tests {
         assert_eq!(
             plan_homes(&[group(1, 0, 0, [4, 0])], &llcs, SECOND),
             vec![(1, [4, 0])]
+        );
+    }
+
+    #[test]
+    fn an_idle_neighbor_does_not_move_a_home_with_spare_capacity() {
+        let llcs = [llc(0, 0, 4), llc(1, 0, 4)];
+        let groups = [group(1, 0, 2, [2, 0]), group(2, 0, 1, [2, 0])];
+        assert_eq!(
+            plan_homes(&groups, &llcs, SECOND),
+            vec![(1, [2, 0]), (2, [2, 0])]
+        );
+    }
+
+    #[test]
+    fn a_home_moves_when_the_current_llc_cannot_serve_its_demand() {
+        let llcs = [llc(0, 0, 4), llc(1, 0, 4)];
+        let groups = [group(1, 0, 3, [1, 0]), group(2, 0, 2, [1, 0])];
+        assert_eq!(
+            plan_homes(&groups, &llcs, SECOND),
+            vec![(1, [1, 0]), (2, [2, 0])]
+        );
+    }
+
+    #[test]
+    fn fractional_demand_keeps_a_home_despite_rounded_cpu_requests() {
+        let llcs = [llc(0, 0, 4), llc(1, 0, 4)];
+        let mut groups = [group(1, 0, 0, [1, 0]), group(2, 0, 0, [1, 0])];
+        groups[0].delta = SECOND * 38 / 10;
+        groups[1].delta = SECOND / 10;
+        assert_eq!(
+            plan_homes(&groups, &llcs, SECOND),
+            vec![(1, [1, 0]), (2, [1, 0])]
         );
     }
 

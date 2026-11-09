@@ -42,24 +42,29 @@ residency. If the fields or samples are unavailable, or the selected node has
 no online CPUs, LAVD records the NUMA node of the first CPU on which it
 observes the task running.
 
-The initial LLC home lies on the selected node, preferring the task's current
-LLC and then an LLC allowed by its CPU affinity. Threads with the same TGID
-and home node share an LLC home. Each task selects its own node during
-initialization or first execution. Exec and later migrations retain the node.
+The initial LLC home is selected by `TGID % number of eligible LLCs` on the
+selected node, using the eligible LLCs in ID order. Separate core types in an
+LLC count as one choice. LLCs allowed by task affinity are preferred. Threads
+with the same TGID and home node share an LLC home. Each task selects its node
+during initialization or first execution. Exec and later migrations retain
+the node.
 
 The mode requires the kernel's BPF local IRQ save/restore kfuncs to synchronize
 group membership between scheduler callbacks and userspace commands.
 
 Once a second, measured CPU runtime sizes each home to a set of whole LLCs on
-its home node. The allocator accounts for each LLC's CPU count, places homes
-by relative load, and keeps existing homes when loads tie. Homes can overlap
-under saturation. `--virt-llc` can give finer homes on machines with large LLCs.
+its home node. Keep an existing LLC while its planned load can serve the
+group's demand. Otherwise place homes by relative load, accounting for each
+LLC's CPU count. Homes can overlap under saturation. `--virt-llc` can give
+finer homes on machines with large LLCs.
 
 Idle selection tries the home before normal LAVD placement, respecting task
 affinity, active and overflow CPUs, core type, and latency headroom. A busy
 home or an affinity mask that excludes it falls through to LAVD's normal CPU
-selection and balancing. CPU affinity is never changed, and migration never
-changes the home node. Pinned and migration-disabled tasks keep their normal
+selection and balancing, anchored to a home CPU when one is eligible. A busy
+home can therefore stay on its LLC until LAVD's overload balancing justifies
+spilling. CPU affinity is never changed, and migration never changes the home
+node. Pinned and migration-disabled tasks keep their normal
 placement. Scheduler task dumps report the home node and home LLC mask.
 
 Runtime counters and homes live in arenas. Each task reserves a group
