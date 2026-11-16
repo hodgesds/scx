@@ -700,28 +700,30 @@ bool consume_task(u64 cpdom_id)
 	/*
 	 * Collect the DSQs this CPU may consume and take them in
 	 * lowest-vtime-first order. Each entry is seeded with its head-task
-	 * vtime, or U64_MAX when this CPU should not consume it (sorts last
-	 * and is skipped). can_consume_steady_dsq() gates the steady cpdom
-	 * DSQ on the steady/turbulent policy.
+	 * vtime. Track eligibility separately: U64_MAX can be a real deadline
+	 * or a racing empty peek, and neither can prevent a consumption attempt.
+	 * can_consume_steady_dsq() gates the steady cpdom DSQ on the
+	 * steady/turbulent policy.
 	 */
 	dsqs[0] = (struct dsq_entry){
-			cpu_dsq_id,
-			use_per_cpu_dsq() ?
-				peek_dsq_vtime(cpu_dsq_id) : U64_MAX };
+			.dsq_id = cpu_dsq_id,
+			.enabled = use_per_cpu_dsq() };
 	dsqs[1] = (struct dsq_entry){
-			cpdom_dsq_id,
-			(use_cpdom_dsq() && can_consume_steady_dsq(cpdomc)) ?
-				peek_dsq_vtime(cpdom_dsq_id) : U64_MAX };
+			.dsq_id = cpdom_dsq_id,
+			.enabled = use_cpdom_dsq() && can_consume_steady_dsq(cpdomc) };
 	dsqs[2] = (struct dsq_entry){
-			cpdom_turb_dsq_id,
-			use_cpdom_dsq() ?
-				peek_dsq_vtime(cpdom_turb_dsq_id) : U64_MAX };
+			.dsq_id = cpdom_turb_dsq_id,
+			.enabled = use_cpdom_dsq() };
+
+	for (i = 0; i < 3; i++)
+		dsqs[i].vtime = dsqs[i].enabled ?
+			peek_dsq_vtime(dsqs[i].dsq_id) : U64_MAX;
 
 	sort_dsqs(&dsqs[0], &dsqs[1], &dsqs[2]);
 
-	/* Consume in lowest-vtime-first order; U64_MAX vtime marks skip. */
+	/* A peek only orders attempts. Consumption decides whether work exists. */
 	for (i = 0; i < 3; i++) {
-		if (dsqs[i].vtime != U64_MAX &&
+		if (dsqs[i].enabled &&
 		    consume_dsq(cpdomc, dsqs[i].dsq_id)) {
 			return true;
 		}

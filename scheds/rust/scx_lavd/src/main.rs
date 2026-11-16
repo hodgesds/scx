@@ -16,6 +16,8 @@ mod cpu_order;
 use scx_utils::Topology;
 use scx_utils::init_libbpf_logging;
 mod stats;
+#[cfg(test)]
+mod vtime_tests;
 use std::ffi::CStr;
 use std::ffi::c_int;
 use std::mem;

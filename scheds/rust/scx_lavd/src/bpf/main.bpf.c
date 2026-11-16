@@ -284,7 +284,8 @@ static void advance_cur_logical_clk(struct task_struct *p)
 		/*
 		 * The clock should not go backward, so do nothing.
 		 */
-		if (vlc <= clc)
+		delta = lavd_vtime_delta(clc, vlc);
+		if (!delta)
 			return;
 
 		/*
@@ -292,7 +293,7 @@ static void advance_cur_logical_clk(struct task_struct *p)
 		 * advance the clock slower so other can jump in the run queue.
 		 */
 		nr_queued = max(sys_stat.nr_queued_task, 1);
-		delta = (vlc - clc) / nr_queued;
+		delta /= nr_queued;
 		new_clk = clc + delta;
 
 		ret_clc = __sync_val_compare_and_swap(&cur_logical_clk, clc, new_clk);
@@ -2157,6 +2158,9 @@ void BPF_STRUCT_OPS(lavd_enable, struct task_struct *p)
 	}
 
 	taskc->svc_time_iwgt = READ_ONCE(cur_svc_time_iwgt);
+	/* Older kernels retain virtual time across sched_ext instances. */
+	if (!scx_bpf_task_set_dsq_vtime(p, READ_ONCE(cur_logical_clk)))
+		scx_bpf_error("Failed to initialize virtual time for task %d", p->pid);
 }
 
 

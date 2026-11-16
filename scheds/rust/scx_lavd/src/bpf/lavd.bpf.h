@@ -12,6 +12,7 @@
 #include <lib/sdt_task.h>
 #include <lib/atq.h>
 #include <lib/cgroup.h>
+#include "vtime.h"
 
 /*
  * common macros
@@ -876,12 +877,6 @@ extern struct bpf_cpumask __kptr *ovrflw_cpumask; /* CPU mask for overflow CPUs 
 extern struct bpf_cpumask __kptr *steady_cpumask; /* CPU mask for non-turbulent (steady) CPUs */
 
 /* DSQ helpers. */
-
-struct dsq_entry {
-	u64 dsq_id;
-	u64 vtime;	/* head-task vtime, or U64_MAX when this CPU should
-			 * not consume this DSQ (sorts last, skipped). */
-};
 
 u64 peek_dsq_vtime(u64 dsq_id);
 void sort_dsqs(struct dsq_entry *a, struct dsq_entry *b, struct dsq_entry *c);

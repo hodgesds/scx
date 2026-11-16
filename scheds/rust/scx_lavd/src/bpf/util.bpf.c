@@ -476,11 +476,7 @@ __hidden
 void sort_dsqs(struct dsq_entry *a, struct dsq_entry *b,
 	       struct dsq_entry *c)
 {
-	struct dsq_entry t;
-
-	if (b->vtime < a->vtime) { t = *a; *a = *b; *b = t; }
-	if (c->vtime < b->vtime) { t = *b; *b = *c; *c = t; }
-	if (b->vtime < a->vtime) { t = *a; *a = *b; *b = t; }
+	lavd_sort_dsqs(a, b, c);
 }
 
 __hidden
