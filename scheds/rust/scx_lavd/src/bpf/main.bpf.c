@@ -2406,6 +2406,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 	taskc->home_llc_id = 0;
 	taskc->soft_group = NULL;
 	taskc->soft_group_spare = NULL;
+	taskc->soft_ipc_until = 0;
 
 	/* Arena allocation may sleep, so reserve before entering the RCU section. */
 	if (enable_soft_partitioning)

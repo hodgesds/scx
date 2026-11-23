@@ -231,7 +231,7 @@ struct task_ctx {
 	volatile u32	cpdom_id;		/* chosen compute domain id at ops.enqueue() */
 	volatile u32	suggested_cpu_id;	/* suggested CPU ID at ops.enqueue() and ops.select_cpu() */
 	volatile s32	pinned_cpu_id;		/* pinned CPU id. -ENOENT if not pinned or not runnable. */
-	u32	__pad0;
+	u32	soft_ipc_until;		/* epoch deadline for bypassing process homes */
 	u64	last_running_clk;	/* last time when scheduled in */
 	u64	run_freq;		/* scheduling frequency in a second */
 	u64	wait_freq;		/* waiting frequency in a second */
@@ -1037,7 +1037,16 @@ static __always_inline bool soft_affinity_active(void)
 	       READ_ONCE(sys_stat.avg_util_wall) < LAVD_SLICE_BOOST_UTIL_WALL;
 }
 
+static __always_inline bool soft_affinity_ipc_active(task_ctx *taskc)
+{
+	u32 until = READ_ONCE(taskc->soft_ipc_until);
+
+	return until && soft_ipc_active(until,
+				       bpf_ktime_get_ns() / LAVD_SOFT_EPOCH_NS);
+}
+
 int soft_affinity_init(void);
+bool soft_affinity_allow_pick(struct pick_ctx *ctx);
 void soft_affinity_init_task(struct task_struct *p, task_ctx __arg_arena *taskc);
 void soft_affinity_running(struct task_struct *p, task_ctx __arg_arena *taskc,
 			   struct cpu_ctx *cpuc);
@@ -1046,7 +1055,7 @@ void soft_affinity_learn(task_ctx __arg_arena *taskc, struct cpu_ctx *cpuc);
 void soft_affinity_wake(struct task_struct *p, task_ctx __arg_arena *wakee,
 		       struct task_struct *waker);
 void soft_affinity_exit(task_ctx __arg_arena *taskc);
-s32 soft_affinity_pick(struct pick_ctx *ctx, s32 *home_cpu);
+s32 soft_affinity_pick(struct pick_ctx *ctx, s64 *home_cpu);
 bool soft_affinity_cpu_home(task_ctx __arg_arena *taskc, s32 cpu);
 void soft_affinity_dump(task_ctx __arg_arena *taskc);
 

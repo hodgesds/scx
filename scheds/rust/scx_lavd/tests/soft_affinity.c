@@ -13,6 +13,30 @@ static struct soft_llc_state history(u8 slots)
 	};
 }
 
+static void test_ipc_backoff(void)
+{
+	u32 until = soft_ipc_deadline(100);
+
+	assert(!soft_ipc_active(0, 100));
+	assert(soft_ipc_active(until, 100));
+	assert(soft_ipc_active(until, 107));
+	assert(!soft_ipc_active(until, 108));
+	/* Another IPC wake extends the fallback; an old deadline stays expired. */
+	assert(soft_ipc_active(soft_ipc_deadline(107), 108));
+	assert(!soft_ipc_active(until, 1000000));
+	/* Both sides of the epoch wrap retain a bounded, nonzero deadline. */
+	for (u32 offset = 0; offset <= LAVD_SOFT_IPC_BACKOFF_EPOCHS; offset++) {
+		u32 epoch = (u32)-1 - offset;
+
+		until = soft_ipc_deadline(epoch);
+		assert(until);
+		assert(soft_ipc_active(until, epoch));
+		assert(soft_ipc_active(until, until - 1));
+		assert(!soft_ipc_active(until, until));
+		assert(!soft_ipc_active(until, until + 1));
+	}
+}
+
 static void test_packed_entries(void)
 {
 	struct soft_llc_state state = history(4);
@@ -193,6 +217,7 @@ static void test_evicted_incumbent_keeps_hysteresis(void)
 
 int main(void)
 {
+	test_ipc_backoff();
 	test_packed_entries();
 	test_slot_limits_and_replacement();
 	test_runtime_and_decay();

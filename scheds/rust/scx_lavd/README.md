@@ -66,11 +66,17 @@ runtime and successful wake interactions and decay lazily in 32 ms epochs.
 Partial runtime units carry forward, so short accounting intervals are not
 counted as full runs.
 
-Wake interactions update both tasks. Changes in wake partners approximate
-fanin and fanout and weaken each individual pull, while partners in the same
-LLC accumulate a common preference. History remains confined to the
-process's home when choosing CPUs. An alternative must exceed twice the
-current score plus a small margin before becoming the primary LLC.
+Wake interactions within a process update both tasks. Changes in wake
+partners approximate fanin and fanout and weaken each individual pull, while
+partners in the same LLC accumulate a common preference. History remains
+confined to the process's home when choosing CPUs. An alternative must exceed
+twice the current score plus a small margin before becoming the primary LLC.
+
+Cross-process wakeups suspend home placement and history learning for both
+tasks for about 256 ms after the last interaction. These tasks use ordinary
+LAVD placement and can be stolen across LLCs. Separate TGID homes cannot
+represent a shared IPC group and can pull its communicating tasks apart.
+Home preferences resume when the cross-process activity stops.
 
 `--soft-affinity-slots=0` (the default) selects the number of scored entries
 from eligible LLCs on the task's home NUMA node, capped at four. Values 1-4

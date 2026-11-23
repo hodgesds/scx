@@ -416,6 +416,17 @@ u64 __attribute__((noinline)) dsq_peek_task_load(u64 dsq_id)
 	return 0;
 }
 
+static __noinline bool dsq_preserve_soft_affinity(u64 dsq_id)
+{
+	struct task_struct *p = __COMPAT_scx_bpf_dsq_peek(dsq_id);
+	task_ctx *taskc;
+
+	if (!p)
+		return true;
+	taskc = find_task_ctx(p);
+	return !taskc || !soft_affinity_ipc_active(taskc);
+}
+
 u64 __attribute__((noinline)) pick_most_loaded_dsq(struct cpdom_ctx *cpdomc)
 {
 	u64 pick_dsq_id = -ENOENT;
@@ -654,18 +665,19 @@ static bool force_to_steal_task(struct cpdom_ctx *cpdomc)
 			    cpdomc_pick->numa_id != cpdomc->numa_id)
 				continue;
 
-			/* Preserve LLC locality until domain overload or system saturation. */
-			if (soft_affinity_active() &&
-			    cpdomc_pick->llc_id != cpdomc->llc_id &&
-			    !READ_ONCE(cpdomc_pick->is_stealee))
-				continue;
-
 			dsq_id = pick_most_loaded_dsq(cpdomc_pick);
 			/*
 			 * Same defensive check as the try_to_steal_task
 			 * path above.
 			 */
 			if ((s64)dsq_id < 0)
+				continue;
+
+			/* IPC tasks bypass both home selection and LLC stealing limits. */
+			if (soft_affinity_active() &&
+			    cpdomc_pick->llc_id != cpdomc->llc_id &&
+			    !READ_ONCE(cpdomc_pick->is_stealee) &&
+			    dsq_preserve_soft_affinity(dsq_id))
 				continue;
 
 			/*

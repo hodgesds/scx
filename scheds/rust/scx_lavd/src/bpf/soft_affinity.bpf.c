@@ -38,6 +38,34 @@ static struct scx_urcu group_urcu;
 static struct scx_allocator group_allocator;
 static void home_llcs(task_ctx *taskc, u64 *lo, u64 *hi);
 
+static __always_inline void note_ipc(task_ctx *taskc, u32 epoch)
+{
+	u32 old = READ_ONCE(taskc->soft_ipc_until);
+	u32 until = soft_ipc_deadline(epoch);
+
+	/* Refresh at most once per epoch. A racing advisory update can be lost. */
+	if (!soft_ipc_active(old, epoch) || (s32)(until - old) > 0)
+		__sync_bool_compare_and_swap(&taskc->soft_ipc_until, old, until);
+}
+
+__hidden __noinline bool soft_affinity_allow_pick(struct pick_ctx *ctx)
+{
+	struct task_struct *waker;
+
+	/* select_cpu() precedes runnable(): bypass the home on the first IPC wake. */
+	if ((ctx->wake_flags & SCX_WAKE_TTWU) &&
+	    !bpf_in_hardirq() && !bpf_in_serving_softirq() && !bpf_in_nmi()) {
+		waker = bpf_get_current_task_btf();
+		if (ctx->p->tgid != waker->tgid &&
+		    !(ctx->p->flags & PF_KTHREAD) && !is_kernel_task(waker)) {
+			note_ipc(ctx->taskc,
+				 bpf_ktime_get_ns() / LAVD_SOFT_EPOCH_NS);
+			return false;
+		}
+	}
+	return !soft_affinity_ipc_active(ctx->taskc);
+}
+
 __hidden int soft_affinity_init(void)
 {
 	return scx_alloc_init(&group_allocator,
@@ -254,7 +282,8 @@ __hidden void soft_affinity_account(task_ctx __arg_arena *taskc, u64 runtime)
 	if (runtime) {
 		if (group)
 			__sync_fetch_and_add(&group->runtime, runtime);
-		__sync_fetch_and_add(&taskc->llc_history.pending_runtime, runtime);
+		if (!soft_affinity_ipc_active(taskc))
+			__sync_fetch_and_add(&taskc->llc_history.pending_runtime, runtime);
 	}
 	bpf_rcu_read_unlock();
 }
@@ -267,6 +296,8 @@ __hidden void soft_affinity_learn(task_ctx __arg_arena *taskc,
 	u64 runtime;
 	u32 epoch = bpf_ktime_get_ns() / LAVD_SOFT_EPOCH_NS;
 
+	if (soft_ipc_active(READ_ONCE(taskc->soft_ipc_until), epoch))
+		return;
 	bpf_rcu_read_lock();
 	home_llcs(taskc, &home_lo, &home_hi);
 	if (history_try_lock(history)) {
@@ -295,7 +326,17 @@ __hidden void soft_affinity_wake(struct task_struct *p,
 		return;
 	bpf_rcu_read_lock();
 	waker_taskc = find_task_ctx(waker);
+	if (p->tgid != waker->tgid) {
+		/* Separate process homes would pull communicating peers apart. */
+		note_ipc(wakee, epoch);
+		if (waker_taskc)
+			note_ipc(waker_taskc, epoch);
+		goto out;
+	}
 	if (!waker_taskc)
+		goto out;
+	if (soft_ipc_active(READ_ONCE(wakee->soft_ipc_until), epoch) ||
+	    soft_ipc_active(READ_ONCE(waker_taskc->soft_ipc_until), epoch))
 		goto out;
 	from = &waker_taskc->llc_history;
 	to = &wakee->llc_history;
@@ -457,7 +498,7 @@ static s32 pick_home_idle_cpu(struct pick_ctx *ctx, struct bpf_cpumask *mask,
 	return -ENOENT;
 }
 
-__hidden s32 soft_affinity_pick(struct pick_ctx *ctx, s32 *home_cpu)
+__hidden s32 soft_affinity_pick(struct pick_ctx *ctx, s64 *home_cpu)
 {
 	struct bpf_cpumask *home, *eligible, *scratch, *steady;
 	struct cpdom_ctx *cpdc;
@@ -465,7 +506,7 @@ __hidden s32 soft_affinity_pick(struct pick_ctx *ctx, s32 *home_cpu)
 	u32 primary;
 	bool big, vulnerable;
 	s32 cpu;
-	int attempt, dom, tier, scope;
+	int attempt, dom;
 
 	if (ctx->taskc->home_numa_id < 0 || !ctx->cpuc_cur)
 		return -ENOENT;
@@ -532,39 +573,37 @@ __hidden s32 soft_affinity_pick(struct pick_ctx *ctx, s32 *home_cpu)
 		bpf_cpumask_and(eligible, cast_mask(eligible), cast_mask(home));
 
 		/* Fully idle cores precede SMT threads; steady CPUs precede turbulent ones. */
-		bpf_for(scope, 0, 2)
-		{
-			bpf_for(tier, 0, 2)
-			{
-				if (!tier && vulnerable && steady)
-					bpf_cpumask_and(scratch,
-							cast_mask(eligible),
-							cast_mask(steady));
-				else if (!tier)
-					bpf_cpumask_and(scratch,
-							cast_mask(home),
-							cast_mask(ctx->active));
-				else
-					bpf_cpumask_copy(scratch,
-							 cast_mask(eligible));
-				cpu = pick_home_idle_cpu(
-					ctx, scratch,
-					scope ? 0 : SCX_PICK_IDLE_CORE);
-				if (cpu >= 0)
-					return cpu;
-				/* Keep a busy home CPU as the anchor for overload balancing. */
-				if (*home_cpu < 0) {
-					if (ctx->prev_cpu >= 0 &&
-					    bpf_cpumask_test_cpu(ctx->prev_cpu, cast_mask(scratch)))
-						*home_cpu = ctx->prev_cpu;
-					else {
-						cpu = bpf_cpumask_any_distribute(cast_mask(scratch));
-						if (cpu >= 0 && cpu < nr_cpu_ids)
-							*home_cpu = cpu;
-					}
-				}
+		if (vulnerable && steady)
+			bpf_cpumask_and(scratch, cast_mask(eligible), cast_mask(steady));
+		else
+			bpf_cpumask_and(scratch, cast_mask(home), cast_mask(ctx->active));
+
+		/* Keep the first nonempty tier as the anchor if every idle search fails. */
+		if (*home_cpu < 0) {
+			const struct cpumask *anchor = bpf_cpumask_empty(cast_mask(scratch)) ?
+						      cast_mask(eligible) : cast_mask(scratch);
+
+			if (ctx->prev_cpu >= 0 && bpf_cpumask_test_cpu(ctx->prev_cpu, anchor))
+				*home_cpu = ctx->prev_cpu;
+			else {
+				cpu = bpf_cpumask_any_distribute(anchor);
+				if (cpu >= 0 && cpu < nr_cpu_ids)
+					*home_cpu = cpu;
 			}
 		}
+
+		cpu = pick_home_idle_cpu(ctx, scratch, SCX_PICK_IDLE_CORE);
+		if (cpu >= 0)
+			return cpu;
+		cpu = pick_home_idle_cpu(ctx, eligible, SCX_PICK_IDLE_CORE);
+		if (cpu >= 0)
+			return cpu;
+		cpu = pick_home_idle_cpu(ctx, scratch, 0);
+		if (cpu >= 0)
+			return cpu;
+		cpu = pick_home_idle_cpu(ctx, eligible, 0);
+		if (cpu >= 0)
+			return cpu;
 	}
 	return -ENOENT;
 }

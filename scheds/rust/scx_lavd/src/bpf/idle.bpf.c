@@ -953,11 +953,15 @@ __hidden __noinline
 s32 pick_idle_cpu(struct pick_ctx *ctx, bool extend_ovrflw, bool *is_idle)
 {
 	struct bpf_cpumask *i_smt;
-	s32 cpu = -ENOENT, sticky_cpu, home_cpu = -ENOENT;
-	s64 sticky_cpdom = -ENOENT;
+	s32 cpu = -ENOENT, sticky_cpu;
+	/* Older verifiers retain the negative sentinel only in a full-width slot. */
+	s64 sticky_cpdom = -ENOENT, home_cpu = -ENOENT;
 	struct cpdom_ctx *cpdc;
 	bool sticky_has_idle, nbr_busy = false;
 	bool prefer_home = soft_affinity_active();
+
+	if (prefer_home)
+		prefer_home = soft_affinity_allow_pick(ctx);
 
 	/*
 	 * At the high level, the idle CPU selection policy considers the

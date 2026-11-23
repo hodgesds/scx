@@ -19,7 +19,26 @@ enum {
 	LAVD_SOFT_EPOCH_NS = 32000000,
 	LAVD_SOFT_RUNTIME_UNIT_NS = 128000,
 	LAVD_SOFT_WAKE_SCORE = 8,
+	LAVD_SOFT_IPC_BACKOFF_EPOCHS = 8,
 };
+
+/* Process homes do not describe an IPC group spanning several TGIDs. */
+static __attribute__((always_inline)) inline bool
+soft_ipc_active(u32 until, u32 epoch)
+{
+	u32 remaining = until - epoch;
+
+	/* Zero is unset. Bound the difference so stale deadlines stay expired. */
+	return until && remaining &&
+	       remaining <= LAVD_SOFT_IPC_BACKOFF_EPOCHS + 1;
+}
+
+static __attribute__((always_inline)) inline u32 soft_ipc_deadline(u32 epoch)
+{
+	u32 until = epoch + LAVD_SOFT_IPC_BACKOFF_EPOCHS;
+
+	return until ? until : 1;
+}
 
 /*
  * Each scored entry occupies 16 bits: seven for the LLC and nine for its
